@@ -185,15 +185,26 @@ declare -A GROUP_ZH=(
     [keyring]="密钥环"
 )
 
-# AUR: 前缀表示该包需要用 AUR helper (yay) 安装
+declare -A GROUP_EN=(
+    [core]="Core"
+    [lock]="Lock/Idle"
+    [wallpaper]="Wallpaper"
+    [clip]="Clip/Screen"
+    [media]="Media/Bright"
+    [audio]="Audio"
+    [ime]="IME"
+    [fonts]="Fonts"
+    [keyring]="Keyring"
+)
+
 declare -A GROUP_PKGS=(
     [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome wl-clipboard libnotify zsh"
     [lock]="hyprlock hypridle"
-    [wallpaper]="awww AUR:waypaper"
+    [wallpaper]="awww waypaper"
     [clip]="copyq satty"
     [media]="playerctl brightnessctl"
     [audio]="pipewire-pulse wireplumber"
-    [ime]="fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime AUR:rime-ice-pinyin-git"
+    [ime]="fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git"
     [fonts]="ttf-jetbrains-mono-nerd wqy-zenhei"
     [keyring]="gnome-keyring"
 )
@@ -202,7 +213,7 @@ declare -A GROUP_PKGS=(
 declare -A PKG_GROUP=()
 for _g in "${GROUP_ORDER[@]}"; do
     for _p in ${GROUP_PKGS[$_g]:-}; do
-        PKG_GROUP["${_p#AUR:}"]="$_g"
+        PKG_GROUP["$_p"]="$_g"
     done
 done
 unset _g _p
@@ -233,8 +244,8 @@ declare -A RHEL_MANUAL=(
     [rime-ice-pinyin-git]="雾凇拼音需手动部署词库到 ~/.local/share/fcitx5/rime"
     [ly]="仅 Arch 提供；RHEL 系建议 gdm/sddm，或 tty 登录后执行 niri-session"
 )
-# 可用 pip 兜底安装的
-declare -A RHEL_PIP=(
+# 可用 pip 兜底安装的（Arch/RHEL 通用）
+declare -A PIP_PKGS=(
     [waypaper]=waypaper
 )
 
@@ -263,27 +274,19 @@ do_export() {
     log "$(_t "扫描已安装的 niri 套件软件包..." "Scanning installed niri suite packages...")"
     mkdir -p "$SNAP_PKGLIST"
     : > "$SNAP_PKGLIST/official.txt"
-    : > "$SNAP_PKGLIST/aur.txt"
 
     local missing=()
     for g in "${GROUP_ORDER[@]}"; do
         for raw in ${GROUP_PKGS[$g]:-}; do
-            local p="${raw#AUR:}"
-            if ! pacman -Qq "$p" &>/dev/null; then
-                missing+=("$p")
+            if ! pacman -Qq "$raw" &>/dev/null; then
+                missing+=("$raw")
                 continue
             fi
-            if [[ "$raw" == AUR:* ]] || pacman -Qqm "$p" &>/dev/null; then
-                echo "$p" >> "$SNAP_PKGLIST/aur.txt"
-            else
-                echo "$p" >> "$SNAP_PKGLIST/official.txt"
-            fi
+            echo "$raw" >> "$SNAP_PKGLIST/official.txt"
         done
     done
     sort -u -o "$SNAP_PKGLIST/official.txt" "$SNAP_PKGLIST/official.txt"
-    sort -u -o "$SNAP_PKGLIST/aur.txt" "$SNAP_PKGLIST/aur.txt"
-    info_kv "$(_t "官方仓库包" "Official pkgs")" "$(wc -l < "$SNAP_PKGLIST/official.txt") 个"
-    info_kv "$(_t "AUR 包" "AUR pkgs")" "$(wc -l < "$SNAP_PKGLIST/aur.txt") 个"
+    info_kv "$(_t "包清单" "Pkglist")" "$(wc -l < "$SNAP_PKGLIST/official.txt") 个"
     if [ ${#missing[@]} -gt 0 ]; then
         warn "$(_t "以下清单内软件包当前未安装，未写入快照:" "The following packages are not installed, not written to snapshot:")${missing[*]}"
     fi
@@ -535,25 +538,20 @@ stage_preflight() {
 
 # --- 4.2 应用选择 ---
 
-REPO_UNIVERSE=() AUR_UNIVERSE=()
+REPO_UNIVERSE=()
 
 load_app_universe() {
     # 优先使用 export 快照清单（用户可手改），否则回退到内置权威清单
-    local off="$BASE_DIR/pkglist/official.txt" aur="$BASE_DIR/pkglist/aur.txt"
-    if [ -s "$off" ] || [ -s "$aur" ]; then
+    local off="$BASE_DIR/pkglist/official.txt"
+    if [ -s "$off" ]; then
         log "$(_t "使用快照清单: pkglist/" "Using snapshot pkglist: pkglist/")"
-        [ -s "$off" ] && mapfile -t REPO_UNIVERSE < <(sed '/^\s*$/d' "$off")
-        [ -s "$aur" ] && mapfile -t AUR_UNIVERSE < <(sed '/^\s*$/d' "$aur")
+        mapfile -t REPO_UNIVERSE < <(sed '/^\s*$/d' "$off")
     else
         log "$(_t "未找到快照清单，使用内置 niri 套件清单。" "No snapshot pkglist, using built-in list.")"
         local g raw
         for g in "${GROUP_ORDER[@]}"; do
             for raw in ${GROUP_PKGS[$g]:-}; do
-                if [[ "$raw" == AUR:* ]]; then
-                    AUR_UNIVERSE+=("${raw#AUR:}")
-                else
-                    REPO_UNIVERSE+=("$raw")
-                fi
+                REPO_UNIVERSE+=("$raw")
             done
         done
     fi
@@ -561,7 +559,11 @@ load_app_universe() {
 
 group_tag() { # $1 = pkg
     local g="${PKG_GROUP[$1]:-}"
-    if [ -n "$g" ]; then echo "[${GROUP_ZH[$g]}]"; else echo "[快照]"; fi
+    if [ -n "$g" ]; then
+        [ "$TTY_MODE" = "1" ] && echo "[${GROUP_EN[$g]}]" || echo "[${GROUP_ZH[$g]}]"
+    else
+        [ "$TTY_MODE" = "1" ] && echo "[Snapshot]" || echo "[快照]"
+    fi
 }
 
 stage_apps_select() {
@@ -580,31 +582,18 @@ stage_apps_select() {
             [ "$_keep" -eq 1 ] && _tmp_arr+=("$_p")
         done
         REPO_UNIVERSE=("${_tmp_arr[@]}")
-        _tmp_arr=()
-        for _p in ${AUR_UNIVERSE[@]+"${AUR_UNIVERSE[@]}"}; do
-            local _keep=1 _ex
-            for _ex in "${_cn_exclude[@]}"; do
-                [ "$_p" = "$_ex" ] && { _keep=0; break; }
-            done
-            [ "$_keep" -eq 1 ] && _tmp_arr+=("$_p")
-        done
-        AUR_UNIVERSE=("${_tmp_arr[@]}")
     fi
 
     local lines=() p
     for p in ${REPO_UNIVERSE[@]+"${REPO_UNIVERSE[@]}"}; do
         lines+=("$p"$'\t'"$(group_tag "$p")")
     done
-    for p in ${AUR_UNIVERSE[@]+"${AUR_UNIVERSE[@]}"}; do
-        lines+=("AUR:$p"$'\t'"$(group_tag "$p")")
-    done
 
     # dry-run：跳过 fzf 交互，直接全选（与 fzf load:select-all 默认行为一致）
     if [ "$DRY_RUN" -eq 1 ]; then
         REPO_SEL=("${REPO_UNIVERSE[@]}")
-        AUR_SEL=("${AUR_UNIVERSE[@]}")
-        log "$(_t "[DRY-RUN] 自动全选所有应用: 仓库 ${#REPO_SEL[@]} 个, AUR ${#AUR_SEL[@]} 个" "[DRY-RUN] auto-selected all: ${#REPO_SEL[@]} repo, ${#AUR_SEL[@]} AUR")"
-        info_kv "$(_t "已选" "Selected")" "仓库 ${#REPO_SEL[@]} 个" "AUR ${#AUR_SEL[@]} 个"
+        log "$(_t "[DRY-RUN] 自动全选所有应用: ${#REPO_SEL[@]} 个" "[DRY-RUN] auto-selected all: ${#REPO_SEL[@]} packages")"
+        info_kv "$(_t "已选" "Selected")" "${#REPO_SEL[@]} 个" ""
         return 0
     fi
 
@@ -624,53 +613,41 @@ stage_apps_select() {
         return 1
     fi
 
-    REPO_SEL=() AUR_SEL=()
+    REPO_SEL=()
     local raw
     while IFS= read -r raw; do
         local name
         name=$(echo "$raw" | cut -f1 -d"$(printf '\t')" | xargs)
         [ -z "$name" ] && continue
-        if [[ "$name" == AUR:* ]]; then
-            AUR_SEL+=("${name#AUR:}")
-        else
-            REPO_SEL+=("$name")
-        fi
+        REPO_SEL+=("$name")
     done <<< "$selected"
-    info_kv "$(_t "已选" "Selected")" "仓库 ${#REPO_SEL[@]} 个" "AUR ${#AUR_SEL[@]} 个"
+    info_kv "$(_t "已选" "Selected")" "${#REPO_SEL[@]} 个" ""
     return 0
 }
 
 # --- 4.3 应用安装 ---
-
-setup_temp_sudo() {
-    [ "$DRY_RUN" -eq 1 ] && return 0
-    local f="/etc/sudoers.d/99_eilniri_installer"
-    echo "$TARGET_USER ALL=(ALL) NOPASSWD: ALL" > "$f"
-    chmod 440 "$f"
-    register_temp_path "$f"
-}
-
-ensure_yay() {
-    if command -v yay &>/dev/null; then return 0; fi
-    log "$(_t "安装 AUR helper: yay ..." "Installing AUR helper: yay ...")"
-    pm_install base-devel git || { error "$(_t "base-devel/git 安装失败。" "base-devel/git install failed.")"; return 1; }
-    local build_dir="/tmp/yay-bin-build-$$"
-    register_temp_path "$build_dir"
-    if [ "$DRY_RUN" -eq 0 ]; then
-        as_user git clone --depth 1 https://aur.archlinux.org/yay-bin.git "$build_dir" || return 1
-        ( cd "$build_dir" && as_user makepkg -si --noconfirm ) || return 1
-    else
-        DRY_PKGS+=("yay-bin (AUR helper)")
-        log "$(_t "[DRY-RUN] git clone yay-bin && makepkg -si" "[DRY-RUN] git clone yay-bin && makepkg -si")"
-        return 0
-    fi
-}
 
 install_arch() {
     local p
     # --- 仓库包: 批量装，失败则逐个隔离 ---
     local queue=()
     for p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        if [ -n "${PIP_PKGS[$p]:-}" ]; then
+            # pip 兜底安装
+            if [ "$DRY_RUN" -eq 1 ]; then
+                DRY_PKGS+=("$p (pip)")
+                continue
+            fi
+            pm_install python-pip
+            local per=0
+            exe as_user pip install --user "${PIP_PKGS[$p]}" || per=$?
+            if [ "$per" -eq 0 ]; then
+                INSTALLED_PKGS+=("$p (pip)")
+            else
+                MANUAL_ITEMS+=("$p —— pip 安装失败，请手动: pip install --user ${PIP_PKGS[$p]}")
+            fi
+            continue
+        fi
         if pkg_installed "$p"; then
             SKIPPED_PKGS+=("$p (已安装)")
         else
@@ -699,39 +676,16 @@ install_arch() {
             done
         fi
     fi
-
-    # --- AUR 包: 逐个装 + 重试 1 次 ---
-    if [ ${#AUR_SEL[@]} -gt 0 ]; then
-        ensure_yay || { FAILED_PKGS+=("${AUR_SEL[@]/#/aur:}"); return; }
-        for p in "${AUR_SEL[@]}"; do
-            if pkg_installed "$p"; then
-                SKIPPED_PKGS+=("$p (已安装)")
-                continue
-            fi
-            local ok=false i
-            for i in 0 1; do
-                [ "$i" -gt 0 ] && warn "重试 $i/1: $p"
-                local erc=0
-                exe as_user yay -S --noconfirm --needed "$p" || erc=$?
-                if [ "$erc" -eq 0 ]; then
-                    ok=true; INSTALLED_PKGS+=("$p"); break
-                elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
-                    ok=true; DRY_PKGS+=("$p"); break
-                fi
-            done
-            [ "$ok" = false ] && FAILED_PKGS+=("aur:$p")
-        done
-    fi
 }
 
 install_rhel() {
     local p name erc
-    local all=(${REPO_SEL[@]+"${REPO_SEL[@]}"} ${AUR_SEL[@]+"${AUR_SEL[@]}"})
+    local all=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
 
-    # pip 兜底前置检查（仅一次）：确保 python3-pip 与 pip3 在循环开始前就位
+    # pip 兜底前置检查
     local has_pip_target=0
     for p in "${all[@]}"; do
-        if [ -n "${RHEL_PIP[$p]:-}" ]; then has_pip_target=1; break; fi
+        if [ -n "${PIP_PKGS[$p]:-}" ]; then has_pip_target=1; break; fi
     done
     if [ "$has_pip_target" -eq 1 ]; then
         if [ "$DRY_RUN" -eq 1 ]; then
@@ -745,13 +699,11 @@ install_rhel() {
     fi
 
     for p in ${all[@]+"${all[@]}"}; do
-        # 1) 无对应包 -> 手动报告
         if [ -n "${RHEL_MANUAL[$p]:-}" ]; then
             MANUAL_ITEMS+=("$p —— ${RHEL_MANUAL[$p]}")
             continue
         fi
-        # 2) pip 兜底
-        if [ -n "${RHEL_PIP[$p]:-}" ]; then
+        if [ -n "${PIP_PKGS[$p]:-}" ]; then
             if [ "$DRY_RUN" -eq 1 ]; then
                 DRY_PKGS+=("$p (pip)")
                 continue
@@ -761,15 +713,14 @@ install_rhel() {
                 continue
             fi
             erc=0
-            exe as_user pip3 install --user "${RHEL_PIP[$p]}" || erc=$?
+            exe as_user pip3 install --user "${PIP_PKGS[$p]}" || erc=$?
             if [ "$erc" -eq 0 ]; then
                 INSTALLED_PKGS+=("$p (pip)")
             else
-                MANUAL_ITEMS+=("$p —— pip 安装失败，请手动: pip3 install --user ${RHEL_PIP[$p]}")
+                MANUAL_ITEMS+=("$p —— pip 安装失败，请手动: pip3 install --user ${PIP_PKGS[$p]}")
             fi
             continue
         fi
-        # 3) 翻译 + dnf 安装
         name="${RHEL_MAP[$p]:-$p}"
         if pkg_installed "$name"; then
             SKIPPED_PKGS+=("$name (已安装)")
@@ -1019,7 +970,7 @@ stage_verify() {
     local missing=()
 
     # 包对账
-    local all_sel=(${REPO_SEL[@]+"${REPO_SEL[@]}"} ${AUR_SEL[@]+"${AUR_SEL[@]}"})
+    local all_sel=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
     if [ ${#all_sel[@]} -gt 0 ]; then
         if [ "$DISTRO_FAMILY" = arch ]; then
             local m
@@ -1030,7 +981,7 @@ stage_verify() {
             for p in "${all_sel[@]}"; do
                 [ -n "${RHEL_MANUAL[$p]:-}" ] && continue
                 name="${RHEL_MAP[$p]:-$p}"
-                [ -n "${RHEL_PIP[$p]:-}" ] && continue
+                [ -n "${PIP_PKGS[$p]:-}" ] && continue
                 pkg_installed "$name" || missing+=("$name")
             done
         fi
@@ -1102,11 +1053,6 @@ do_restore() {
     stage_preflight
     ensure_fzf
     detect_target_user
-
-    # AUR 安装需要临时 sudo 权限（已在全局 cleanup 注册）
-    if [ "$DISTRO_FAMILY" = arch ]; then
-        setup_temp_sudo
-    fi
 
     if stage_apps_select; then
         stage_apps_install
