@@ -344,6 +344,29 @@ do_export() {
         fi
     fi
 
+    # --- 3.5 捕获并修复 niri-session（systemd import-environment 弃用警告）---
+    local NIRI_SESSION="$SNAP_CONFIG/.local/bin/niri-session"
+    local NIRI_DESKTOP="$SNAP_CONFIG/.local/share/applications/niri.desktop"
+    if [ -x /usr/bin/niri-session ]; then
+        mkdir -p "$(dirname "$NIRI_SESSION")" "$(dirname "$NIRI_DESKTOP")"
+        cp /usr/bin/niri-session "$NIRI_SESSION"
+        chmod +x "$NIRI_SESSION"
+        if grep -q 'systemctl --user import-environment$' "$NIRI_SESSION"; then
+            sed -i 's/systemctl --user import-environment$/systemctl --user import-environment WAYLAND_DISPLAY XDG_SESSION_TYPE DISPLAY XDG_CURRENT_DESKTOP/' "$NIRI_SESSION"
+            log "  [fix] niri-session: import-environment 已加显式变量列表"
+        fi
+        cat > "$NIRI_DESKTOP" <<'DESKTOP_EOF'
+[Desktop Entry]
+Name=Niri (fixed)
+Comment=Scrollable-tiling Wayland compositor
+Exec=niri-session
+Type=Application
+DesktopNames=niri
+DESKTOP_EOF
+        chmod +x "$NIRI_DESKTOP"
+        log "  [config] fixed niri-session + desktop entry"
+    fi
+
     section "$(_t "Export 完成" "Export Done")" "$(_t "快照已生成" "Snapshot Created")"
     info_kv "$(_t "包清单" "Pkglist")" "$SNAP_PKGLIST/"
     info_kv "$(_t "配置镜像" "Config Mirror")" "$SNAP_CONFIG/"
@@ -944,6 +967,25 @@ stage_configs() {
         name=$(basename "$item")
         deploy_one "$item" "$HOME_DIR/.config/$name" "$ts"
     done
+    # ~/.local/share/<name>（niri-session 修复版等）
+    for item in "$snap/.local/share"/*; do
+        name=$(basename "$item")
+        [ -d "$item" ] || continue
+        mkdir -p "$HOME_DIR/.local/share"
+        deploy_one "$item" "$HOME_DIR/.local/share/$name" "$ts"
+    done 2>/dev/null
+    # ~/.local/share/applications（自定义 desktop 文件）
+    for item in "$snap/.local/share/applications"/*; do
+        [ -f "$item" ] || continue
+        mkdir -p "$HOME_DIR/.local/share/applications"
+        deploy_one "$item" "$HOME_DIR/.local/share/applications/$(basename "$item")" "$ts"
+    done 2>/dev/null
+    # ~/.local/bin（修复版 niri-session 等）
+    for item in "$snap/.local/bin"/*; do
+        [ -f "$item" ] || continue
+        mkdir -p "$HOME_DIR/.local/bin"
+        deploy_one "$item" "$HOME_DIR/.local/bin/$(basename "$item")" "$ts"
+    done 2>/dev/null
     # 家目录散文件（如 .pam_environment）
     for item in "$snap"/.*; do
         name=$(basename "$item")
@@ -1130,6 +1172,30 @@ do_rollback() {
         exe cp -r "$item" "$target"
         exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
     done
+    # ~/.local/share/ 恢复（niri-session 修复版等）
+    for item in "$workdir"/home/*/.local/share/*/*; do
+        [ -f "$item" ] && continue
+        name=$(basename "$item")
+        local parent
+        parent=$(basename "$(dirname "$item")")
+        target="$HOME_DIR/.local/share/$parent/$name"
+        mkdir -p "$(dirname "$target")"
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            exe mv "$target" "$target.bak-$ts"
+        fi
+        exe cp -r "$item" "$target"
+        exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
+    done 2>/dev/null
+    for item in "$workdir"/home/*/.local/share/applications/*; do
+        [ -f "$item" ] || continue
+        target="$HOME_DIR/.local/share/applications/$(basename "$item")"
+        mkdir -p "$(dirname "$target")"
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            exe mv "$target" "$target.bak-$ts"
+        fi
+        exe cp "$item" "$target"
+        exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
+    done 2>/dev/null
     # 家目录散文件
     for item in "$workdir"/home/*/.*; do
         name=$(basename "$item")
