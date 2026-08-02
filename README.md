@@ -113,3 +113,104 @@ EilNiri/
 - 交互风格与视觉引擎：[SHORiN-KiWATA/shorin-arch-setup](https://github.com/SHORiN-KiWATA/shorin-arch-setup)
 - 快照回滚设计：[ech678/NyxNiri](https://github.com/ech678/NyxNiri)
 - 跨发行版思路：[nickjj/dotfriedrice](https://github.com/nickjj/dotfriedrice)
+
+
+---
+
+## English Version
+
+EilNiri — quickly set up a Niri desktop environment on a fresh **Arch** / **RHEL** system. Pre-compiled packages only, zero compilation, zero AUR builds.
+
+### Quick Start
+
+```bash
+./install.sh export                  # snapshot (normal user)
+sudo ./install.sh restore            # install (root)
+sudo ./install.sh rollback           # roll back config
+```
+
+### Commands
+
+| Command | Privilege | Description |
+|---|---|---|
+| `./install.sh export` | User | Capture snapshot |
+| `./install.sh export --keep-typos` | User | Skip typo fixes |
+| `sudo ./install.sh restore` | root | Install desktop (fzf interactive) |
+| `sudo ./install.sh restore --dry-run` | root | Preview only, no changes |
+| `sudo ./install.sh rollback` | root | Restore from backup snapshot |
+| `./install.sh --help` | - | Show help |
+
+### Included
+
+| Group | Default | Content |
+|---|---|---|
+| Core | ✅ | niri waybar mako fuzzel kitty polkit-gnome ... zsh |
+| Lock/Idle | ✅ | hyprlock hypridle |
+| Wallpaper | ✅ | awww, waypaper (pip) |
+| Clipboard/Screenshot | ✅ | copyq satty |
+| Media/Brightness | ✅ | playerctl brightnessctl |
+| Audio | ✅ | pipewire-pulse wireplumber |
+| Input Method | ✅ | fcitx5 + rime |
+| Fonts | ✅ | ttf-jetbrains-mono-nerd wqy-zenhei |
+| Keyring | ✅ | gnome-keyring |
+| Display Manager | ⬜ | ly (Arch only) |
+| Services | optional | bluetooth / libvirtd / power-profiles-daemon |
+
+Before fzf selection you are asked whether to install Chinese IME and font.
+
+### Restore Flow
+
+1. Pre-Flight: system update
+2. Target user detection: default UID 1000, 30s timeout
+3. Select apps (fzf) → install (batch, pip for waypaper)
+4. Enable services (fzf) → `systemctl enable --now`
+5. DM: ly (optional, default N)
+6. Snapshot: backup existing configs to `backups/`
+7. Deploy configs: existing files backed up as `.bak-TIMESTAMP`
+8. Summary: installed / skipped / failed / manual-list
+
+### RHEL Support
+
+- Auto package name translation
+- Missing RPM packages listed in manual install report
+- waypaper falls back to pip3
+
+### TTY Mode
+
+Automatically switches to English plain text in TTY:
+
+```bash
+TTY_MODE=1 sudo ./install.sh restore
+```
+
+### Output Structure
+
+```
+EilNiri/
+├── install.sh
+├── pkglist/          (official.txt, services.txt)
+├── config/           (config mirror)
+├── backups/          (rollback snapshots)
+└── .replicate_progress
+```
+
+### Requirements
+
+| | Arch | RHEL |
+|---|---|---|
+| Package manager | pacman | dnf |
+| fzf | Auto-installed | Auto-installed |
+| root | restore/rollback | restore/rollback |
+
+### Notes
+
+- Sensitive data excluded (~/.ssh, keyrings, tokens)
+- Wallpaper images not included
+- Resume: re-run skips completed stages
+- dry-run: no files written, no system changes
+- Temp files auto-cleaned on exit
+- Log: `~/.local/state/eilNiri/replicate.log`
+
+### References
+
+[SHORiN-KiWATA/shorin-arch-setup](https://github.com/SHORiN-KiWATA/shorin-arch-setup) · [ech678/NyxNiri](https://github.com/ech678/NyxNiri) · [nickjj/dotfriedrice](https://github.com/nickjj/dotfriedrice)
