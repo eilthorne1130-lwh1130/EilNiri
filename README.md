@@ -127,3 +127,4 @@ EilNiri/
 - 交互风格与视觉引擎：[SHORiN-KiWATA/shorin-arch-setup](https://github.com/SHORiN-KiWATA/shorin-arch-setup)
 - 快照回滚设计：[ech678/NyxNiri](https://github.com/ech678/NyxNiri)
 - 跨发行版思路：[nickjj/dotfriedrice](https://github.com/nickjj/dotfriedrice)
+在这里向他/她们表示感谢
