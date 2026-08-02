@@ -1,6 +1,6 @@
 # EilNiri
 
-在新装的 **Arch 系** / **RHEL 系** 系统上快速配置 Niri 桌面环境。全量预编译安装，零编译、零 AUR 构建。
+在新装的 **Arch 系** / **RHEL 系** 系统上一键配置 Niri 桌面环境。全量预编译安装，零编译、零 AUR 构建。自动适配显示器、输入法中文组件可选、服务自启、字体渲染、TTY 英文模式。
 
 ## 快速开始
 
@@ -10,7 +10,7 @@
 
 # 2. 把整个 EilNiri 目录带到新机器（git clone / U盘 任意方式）
 
-# 3. 在新机器安装（需要 root）
+# 3. 在新机器安装（需要 root，显示 EilNiri Logo）
 sudo ./install.sh restore
 
 # 4. 回滚配置
@@ -23,12 +23,14 @@ sudo ./install.sh rollback
 |---|---|---|
 | `./install.sh export` | 普通用户 | 采集快照（系统零改动） |
 | `./install.sh export --keep-typos` | 普通用户 | 保留配置原样，不修正已知笔误 |
-| `sudo ./install.sh restore` | root | 安装桌面环境（交互式 fzf 选择） |
+| `sudo ./install.sh restore` | root | 显示 Logo → 安装桌面环境（fzf 交互） |
 | `sudo ./install.sh restore --dry-run` | root | 预览模式，只打印不执行 |
 | `sudo ./install.sh rollback` | root | 从备份快照恢复配置 |
 | `./install.sh --help` | - | 查看帮助 |
 
 ## 包含内容
+
+### 应用分组（fzf 勾选，默认全选，使用前可选中文组件）
 
 | 分组 | 默认 | 内容 |
 |---|---|---|
@@ -44,50 +46,61 @@ sudo ./install.sh rollback
 | 显示管理器 | ⬜ | ly（仅 Arch，默认不装） |
 | 系统服务 | 可选 | bluetooth / libvirtd / power-profiles-daemon |
 
-交互方式：fzf 多选，使用前可选是否安装中文输入法和中文字体。
-
 ### 配置采集（export 复制进 `config/`）
 
-`~/.config/` 下：niri waybar mako（排 __pycache__）kitty hypr copyq satty waypaper fcitx5 fcitx environment.d xdg-desktop-portal gtk-3.0 gtk-4.0，家目录散文件：`.pam_environment`。
+`~/.config/` 下：niri waybar mako（排 __pycache__）kitty hypr copyq satty waypaper fcitx5 fcitx environment.d xdg-desktop-portal gtk-3.0 gtk-4.0 fontconfig，以及家目录 `.pam_environment`。
+
+额外捕获并修复 `/usr/bin/niri-session`（systemd 弃用警告）→ 存入 `config/.local/bin/`。
 
 敏感数据（~/.ssh、keyring、token）不进入快照。
 
-## restore 流程
+## restore 流程（共 10 步）
 
-1. **Pre-Flight**：Arch 系刷新 keyring + 系统更新；RHEL 系 `dnf upgrade --refresh`
+1. **Logo 展示** → **Pre-Flight**：pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新
 2. **目标用户检测**：默认 UID 1000，30s 超时可选创建新用户
-3. **选择安装**：是否装中文输入法+中文字体 → fzf 选择应用 → 批量安装（失败自动逐个隔离，waypaper 走 pip）
-4. **服务启用**：fzf 选择要启用的系统服务 → `systemctl enable --now`
+3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）
+4. **服务启用**：fzf 选择系统服务 → `systemctl enable --now`
 5. **显示管理器** ly（可选，默认 N）
-6. **配置快照**：部署前将已有配置打包至 `backups/`
-7. **配置部署**：已有文件自动备份为 `.bak-时间戳`
-8. **汇总报告**：已安装 / 已跳过 / 失败 / 需手动安装清单
+6. **配置快照**：部署前将已有配置打包至 `backups/`（tar.gz）
+7. **配置部署**：已有文件自动备份为 `.bak-时间戳` → PipeWire 用户服务自启 → zsh 设为默认 shell
+8. **硬件适配**：自动检测显示器输出名+分辨率 → 修复 niri config → 注释 waybar 硬件 sink → GPU 驱动提示
+9. **装后验证**：包对账 + 配置目录审计
+10. **汇总报告** → pacman 缓存清理
 
 ## RHEL 系支持
 
-- 包名自动翻译（`ttf-jetbrains-mono-nerd` → `jetbrains-mono-nerd-fonts`）
-- 部分包无 RPM 对应列入手动安装报告并给出建议
+- 包名自动翻译
+- 无 RPM 对应包列入手动安装报告
 - waypaper 走 pip3 兜底
+
+## 硬件自动适配
+
+| 适配项 | 说明 |
+|---|---|
+| 显示器输出名 | 读 `/sys/class/drm` 检测 → 替换 niri config 的 output 配置 |
+| 分辨率+刷新率 | 读首选 mode → 注入 config |
+| 多余输出 | 多屏配置自动注释为 `/-output` |
+| waybar sink | 硬件 ALSA sink 自动注释 |
+| GPU 检测 | `lspci` → info 显示显卡型号 |
+| niri-session | 修复 `import-environment` 弃用警告 |
 
 ## TTY 支持
 
-纯 TTY 下**自动切换英文纯文本**，避免中文乱码。
+纯 TTY 下自动切换英文纯文本，避免乱码。`TTY_MODE=1` 可手动强制：
 
 ```bash
-TTY_MODE=1 sudo ./install.sh restore   # 强制英文
+TTY_MODE=1 sudo ./install.sh restore
 ```
 
 ## 产物结构
 
 ```
 EilNiri/
-├── install.sh                # 主脚本
-├── pkglist/
-│   ├── official.txt          # 包清单（可手改）
-│   └── services.txt          # 服务清单
-├── config/                   # 配置镜像
-├── backups/                  # 回滚快照（tar.gz）
-├── .replicate_progress       # 断点续装状态
+├── install.sh
+├── pkglist/          (official.txt, services.txt)
+├── config/           (配置镜像 + .local/bin/niri-session)
+├── backups/          (回滚快照 tar.gz)
+├── .replicate_progress
 └── README.md
 ```
 
@@ -101,11 +114,12 @@ EilNiri/
 
 ## 注意事项
 
-- export 默认修正 niri 配置两处笔误，live 配置不受影响
-- 壁纸图片不在快照内，新机器需自行放置
+- 预编译安装，无需 base-devel / yay
+- export 默认修正 niri config 两处笔误，live 配置不受影响
+- 壁纸图片不在快照内
 - 中断恢复：重跑自动跳过已完成阶段，删除 `.replicate_progress` 可强制全量重跑
-- dry-run：不写任何文件，不对系统做任何改动
-- 临时文件在退出时自动清理
+- dry-run：不对系统做任何改动
+- 临时文件在退出时自动清理（sudoers、构建目录、解包目录）
 - 日志：`~/.local/state/eilNiri/replicate.log`，自动截断保留最近 800 行
 
 ## 参考
@@ -113,104 +127,3 @@ EilNiri/
 - 交互风格与视觉引擎：[SHORiN-KiWATA/shorin-arch-setup](https://github.com/SHORiN-KiWATA/shorin-arch-setup)
 - 快照回滚设计：[ech678/NyxNiri](https://github.com/ech678/NyxNiri)
 - 跨发行版思路：[nickjj/dotfriedrice](https://github.com/nickjj/dotfriedrice)
-
-
----
-
-## English Version
-
-EilNiri — quickly set up a Niri desktop environment on a fresh **Arch** / **RHEL** system. Pre-compiled packages only, zero compilation, zero AUR builds.
-
-### Quick Start
-
-```bash
-./install.sh export                  # snapshot (normal user)
-sudo ./install.sh restore            # install (root)
-sudo ./install.sh rollback           # roll back config
-```
-
-### Commands
-
-| Command | Privilege | Description |
-|---|---|---|
-| `./install.sh export` | User | Capture snapshot |
-| `./install.sh export --keep-typos` | User | Skip typo fixes |
-| `sudo ./install.sh restore` | root | Install desktop (fzf interactive) |
-| `sudo ./install.sh restore --dry-run` | root | Preview only, no changes |
-| `sudo ./install.sh rollback` | root | Restore from backup snapshot |
-| `./install.sh --help` | - | Show help |
-
-### Included
-
-| Group | Default | Content |
-|---|---|---|
-| Core | ✅ | niri waybar mako fuzzel kitty polkit-gnome ... zsh |
-| Lock/Idle | ✅ | hyprlock hypridle |
-| Wallpaper | ✅ | awww, waypaper (pip) |
-| Clipboard/Screenshot | ✅ | copyq satty |
-| Media/Brightness | ✅ | playerctl brightnessctl |
-| Audio | ✅ | pipewire-pulse wireplumber |
-| Input Method | ✅ | fcitx5 + rime |
-| Fonts | ✅ | ttf-jetbrains-mono-nerd wqy-zenhei |
-| Keyring | ✅ | gnome-keyring |
-| Display Manager | ⬜ | ly (Arch only) |
-| Services | optional | bluetooth / libvirtd / power-profiles-daemon |
-
-Before fzf selection you are asked whether to install Chinese IME and font.
-
-### Restore Flow
-
-1. Pre-Flight: system update
-2. Target user detection: default UID 1000, 30s timeout
-3. Select apps (fzf) → install (batch, pip for waypaper)
-4. Enable services (fzf) → `systemctl enable --now`
-5. DM: ly (optional, default N)
-6. Snapshot: backup existing configs to `backups/`
-7. Deploy configs: existing files backed up as `.bak-TIMESTAMP`
-8. Summary: installed / skipped / failed / manual-list
-
-### RHEL Support
-
-- Auto package name translation
-- Missing RPM packages listed in manual install report
-- waypaper falls back to pip3
-
-### TTY Mode
-
-Automatically switches to English plain text in TTY:
-
-```bash
-TTY_MODE=1 sudo ./install.sh restore
-```
-
-### Output Structure
-
-```
-EilNiri/
-├── install.sh
-├── pkglist/          (official.txt, services.txt)
-├── config/           (config mirror)
-├── backups/          (rollback snapshots)
-└── .replicate_progress
-```
-
-### Requirements
-
-| | Arch | RHEL |
-|---|---|---|
-| Package manager | pacman | dnf |
-| fzf | Auto-installed | Auto-installed |
-| root | restore/rollback | restore/rollback |
-
-### Notes
-
-- Sensitive data excluded (~/.ssh, keyrings, tokens)
-- Wallpaper images not included
-- Resume: re-run skips completed stages
-- dry-run: no files written, no system changes
-- Temp files auto-cleaned on exit
-- Log: `~/.local/state/eilNiri/replicate.log`
-
-### References
-
-[SHORiN-KiWATA/shorin-arch-setup](https://github.com/SHORiN-KiWATA/shorin-arch-setup) · [ech678/NyxNiri](https://github.com/ech678/NyxNiri) · [nickjj/dotfriedrice](https://github.com/nickjj/dotfriedrice)
