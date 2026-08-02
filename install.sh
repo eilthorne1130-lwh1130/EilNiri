@@ -568,6 +568,29 @@ stage_apps_select() {
     section "$(_t "应用选择" "App Selection")" "$(_t "TAB 切换 | 默认全选 | Ctrl-D 全不选 | Enter 确认" "TAB toggle | Select All | Ctrl-D deselect | Enter")"
     load_app_universe
 
+    # 中文组件选择
+    if ! confirm "$(_t "安装中文输入法（fcitx5+rime）和中文字体（wqy-zenhei）？[Y/n] (默认 Y, 15s):" "Install Chinese IME (fcitx5+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):")" "Y" 15; then
+        local _cn_exclude=(fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git wqy-zenhei)
+        local _tmp_arr=() _p
+        for _p in ${REPO_UNIVERSE[@]+"${REPO_UNIVERSE[@]}"}; do
+            local _keep=1 _ex
+            for _ex in "${_cn_exclude[@]}"; do
+                [ "$_p" = "$_ex" ] && { _keep=0; break; }
+            done
+            [ "$_keep" -eq 1 ] && _tmp_arr+=("$_p")
+        done
+        REPO_UNIVERSE=("${_tmp_arr[@]}")
+        _tmp_arr=()
+        for _p in ${AUR_UNIVERSE[@]+"${AUR_UNIVERSE[@]}"}; do
+            local _keep=1 _ex
+            for _ex in "${_cn_exclude[@]}"; do
+                [ "$_p" = "$_ex" ] && { _keep=0; break; }
+            done
+            [ "$_keep" -eq 1 ] && _tmp_arr+=("$_p")
+        done
+        AUR_UNIVERSE=("${_tmp_arr[@]}")
+    fi
+
     local lines=() p
     for p in ${REPO_UNIVERSE[@]+"${REPO_UNIVERSE[@]}"}; do
         lines+=("$p"$'\t'"$(group_tag "$p")")
