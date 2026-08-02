@@ -167,6 +167,22 @@ confirm() {
     [[ "$ans" =~ ^[Yy] ]]
 }
 
+show_logo() {
+    echo ""
+    echo -e "${H_PURPLE}"
+    cat <<'LOGO'
+  ███████╗ ██╗ ██╗        ███╗   ██╗ ██╗ ██████╗  ██╗
+  ██╔════╝ ██║ ██║        ████╗  ██║ ██║ ██╔══██╗ ██║
+  █████╗   ██║ ██║        ██╔██╗ ██║ ██║ ██████╔╝ ██║
+  ██╔══╝   ██║ ██║        ██║╚██╗██║ ██║ ██╔══██╗ ██║
+  ███████╗ ██║ ███████╗   ██║ ╚████║ ██║ ██║  ██║ ██║
+  ╚══════╝ ╚═╝ ╚══════╝   ╚═╝  ╚═══╝ ╚═╝ ╚═╝  ╚═╝ ╚═╝
+LOGO
+    echo -e "${NC}"
+    echo -e "       ${H_CYAN}Niri Desktop Environment — One-Click Setup${NC}"
+    echo ""
+}
+
 # ==============================================================================
 # 2. 数据区 —— niri 套件定义（唯一权威清单，export/restore 共用）
 # ==============================================================================
@@ -219,7 +235,7 @@ done
 unset _g _p
 
 # 配置采集白名单（~/.config 下的目录）+ 家目录散文件
-CONFIG_DIRS=(niri waybar mako kitty hypr copyq satty waypaper fcitx5 fcitx environment.d xdg-desktop-portal gtk-3.0 gtk-4.0)
+CONFIG_DIRS=(niri waybar mako kitty hypr copyq satty waypaper fcitx5 fcitx environment.d xdg-desktop-portal gtk-3.0 gtk-4.0 fontconfig)
 CONFIG_FILES=(.pam_environment)
 
 # 服务 -> 提供包 映射（export 时按 is-enabled 过滤后写入 services.txt）
@@ -545,6 +561,18 @@ stage_preflight() {
         return
     fi
     if [ "$DISTRO_FAMILY" = arch ]; then
+        # 并行下载加速
+        sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true
+        # Reflector 镜像优化（CN 时区→中国镜像，否则跳过）
+        local tz
+        tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+        if [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]]; then
+            if command -v reflector &>/dev/null; then
+                log "$(_t "检测到中国时区，刷新 CN 镜像..." "Detected CN timezone, refreshing CN mirrors...")"
+                exe reflector --country China --protocol https --sort rate --save /etc/pacman.d/mirrorlist --latest 10 2>/dev/null || \
+                    warn "$(_t "Reflector 失败，继续使用现有镜像。" "Reflector failed, using existing mirrors.")"
+            fi
+        fi
         exe pacman -Sy --noconfirm archlinux-keyring || warn "$(_t "keyring 刷新失败，继续尝试。" "keyring refresh failed, continuing.")"
         if ! exe pacman -Su --noconfirm; then
             error "$(_t "系统更新失败，请检查网络。" "System update failed. Check network.")"
@@ -995,11 +1023,140 @@ stage_configs() {
     done
     shopt -u nullglob dotglob
 
+    # PipeWire 用户服务自启（若已安装音频组）
+    local _pw=0
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        [ "$_p" = "pipewire-pulse" ] || [ "$_p" = "wireplumber" ] && _pw=1
+    done
+    if [ "$_pw" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+        log "$(_t "启用 PipeWire 用户服务..." "Enabling PipeWire user services...")"
+        as_user systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service 2>/dev/null || true
+    fi
+    # zsh 设为默认 shell（若已安装 zsh 且当前不是 zsh）
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        if [ "$_p" = "zsh" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != "/usr/bin/zsh" ]; then
+            exe chsh -s /usr/bin/zsh "$TARGET_USER" 2>/dev/null || warn "$(_t "zsh 设为默认 shell 失败" "Failed to set zsh as default shell")"
+            break
+        fi
+    done
+
     success "$(_t "配置部署完成。" "Config deploy complete.")"
     stage_mark configs
 }
 
-# --- 4.8 装后验证（对账 + 配置审计）---
+# --- 4.8 硬件适配（自动检测输出/分辨率）---
+
+stage_hardware_adapt() {
+    if stage_done hwadapt; then return; fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$(_t "[DRY-RUN] 跳过硬件适配。" "[DRY-RUN] Skipping hardware adapt.")"
+        stage_mark hwadapt
+        return
+    fi
+    if [ ! -d /sys/class/drm ] || [ -z "$(ls /sys/class/drm/card*-*/status 2>/dev/null)" ]; then
+        log "$(_t "无 DRM 设备，跳过硬件适配。" "No DRM device, skipping hardware adapt.")"
+        stage_mark hwadapt
+        return
+    fi
+
+    section "$(_t "硬件适配" "Hardware Adapt")" "$(_t "自动检测显示器" "Auto-detect display")"
+    local niri_cfg="$HOME_DIR/.config/niri/config.kdl"
+    local waybar_cfg="$HOME_DIR/.config/waybar/config"
+
+    # --- 1) 检测实际输出名 + 分辨率 ---
+    local detected_out="" detected_mode="" p
+    for p in /sys/class/drm/card*-*/status; do
+        [ "$(cat "$p" 2>/dev/null)" = "connected" ] || continue
+        local dir
+        dir=$(dirname "$p")
+        detected_out=$(basename "$dir" | sed 's/^card[0-9]-//')
+        detected_mode=$(head -1 "$dir/modes" 2>/dev/null)
+        [ -n "$detected_out" ] && break
+    done
+
+    if [ -z "$detected_out" ]; then
+        warn "$(_t "未检测到已连接的显示器，跳过适配。" "No connected display found, skipping adapt.")"
+        stage_mark hwadapt
+        return
+    fi
+
+    # 分辨率格式：1920x1080 → mode "1920x1080@60"
+    local mode_line=""
+    if [ -n "$detected_mode" ]; then
+        local w h refresh
+        w=$(echo "$detected_mode" | cut -dx -f1)
+        h=$(echo "$detected_mode" | cut -dx -f2)
+        refresh=$(head -1 "$dir/edid" 2>/dev/null | od -An -j12 -N1 -i 2>/dev/null | tr -d ' ')
+        [ -z "$refresh" ] && refresh=60
+        mode_line="mode \"${w}x${h}@${refresh}\""
+    fi
+
+    info_kv "$(_t "检测到输出" "Detected output")" "$detected_out" "${detected_mode:-?}"
+
+    # --- 2) 修复 niri config ---
+    if [ -f "$niri_cfg" ]; then
+        log "$(_t "适配 niri 输出配置..." "Adapting niri output config...")"
+        # 备份
+        cp "$niri_cfg" "$niri_cfg.bak-hw-$(date +%Y%m%d-%H%M%S)"
+
+        # 找到第一个活跃 output 块，替换输出名和 mode
+        local tmp
+        tmp=$(mktemp)
+        register_temp_path "$tmp"
+        local in_first_output=0 found_output=0
+        while IFS= read -r line; do
+            if [ "$found_output" -eq 0 ] && echo "$line" | grep -qP '^\s*output\s+"'; then
+                found_output=1
+                in_first_output=1
+                echo "output \"$detected_out\" {" >> "$tmp"
+                [ -n "$mode_line" ] && echo "    $mode_line" >> "$tmp"
+                continue
+            fi
+            if [ "$in_first_output" -eq 1 ]; then
+                # 跳过原 output 块内的 mode 行
+                if echo "$line" | grep -qP '^\s*mode\s+"'; then
+                    [ -z "$mode_line" ] && echo "$line" >> "$tmp"
+                    continue
+                fi
+                if echo "$line" | grep -qP '^\s*\}'; then
+                    in_first_output=0
+                    [ -n "$mode_line" ] && echo "}" >> "$tmp" || echo "}" >> "$tmp"
+                    continue
+                fi
+                # 跳过 output 块内的其他内容（留给新空块）
+                continue
+            fi
+            # 第二个及以后的 output 块注释掉
+            if [ "$found_output" -eq 1 ] && echo "$line" | grep -qP '^\s*output\s+"'; then
+                echo "/-output $(echo "$line" | sed 's/^\s*output\s*//')" >> "$tmp"
+                continue
+            fi
+            echo "$line" >> "$tmp"
+        done < "$niri_cfg"
+        mv "$tmp" "$niri_cfg"
+        exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$niri_cfg"
+        success "$(_t "niri 输出已适配" "niri output adapted")"
+    fi
+
+    # --- 3) 修复 waybar config 硬件 sink ---
+    if [ -f "$waybar_cfg" ]; then
+        if grep -q 'ignored-sinks' "$waybar_cfg" 2>/dev/null; then
+            sed -i 's/^\(\s*"ignored-sinks":[^]]*\]\)/\/* \1 *\//' "$waybar_cfg"
+            log "$(_t "waybar ignored-sinks 已注释" "waybar ignored-sinks commented")"
+        fi
+    fi
+
+    # GPU 驱动提示
+    if command -v lspci &>/dev/null; then
+        local gpu_info
+        gpu_info=$(lspci | grep -E -i 'vga|3d|display' 2>/dev/null | head -2)
+        [ -n "$gpu_info" ] && info_kv "$(_t "检测到 GPU" "GPU detected")" "$(echo "$gpu_info" | head -1 | cut -d: -f3- | xargs)" ""
+    fi
+
+    stage_mark hwadapt
+}
+
+# --- 4.9 装后验证（对账 + 配置审计）---
 
 stage_verify() {
     if stage_done verify; then return; fi
@@ -1049,7 +1206,7 @@ stage_verify() {
     stage_mark verify
 }
 
-# --- 4.9 汇总报告 ---
+# --- 4.10 汇总报告 ---
 
 print_summary() {
     section "$(_t "汇总报告" "Summary")" "$(_t "eilNiri restore" "eilNiri restore")"
@@ -1090,6 +1247,7 @@ do_restore() {
 
     section "$(_t "Restore" "Restore")" "$(_t "重现 niri 桌面环境" "Restore Niri Desktop")"
     [ "$DRY_RUN" -eq 1 ] && warn "$(_t "DRY-RUN 模式：只打印计划，不实际改动系统。" "DRY-RUN mode: printing plan only, no changes.")"
+    show_logo
 
     # 先更新系统（新机器包数据库旧，直接装 fzf 可能失败）
     stage_preflight
@@ -1103,7 +1261,10 @@ do_restore() {
     stage_dm
     stage_backup
     stage_configs
+    stage_hardware_adapt
     stage_verify
+    # 清理 pacman 缓存，释放磁盘空间
+    [ "$DISTRO_FAMILY" = arch ] && exe pacman -Sc --noconfirm 2>/dev/null || true
     print_summary
 }
 
