@@ -20,8 +20,8 @@
 #   交互风格与视觉引擎参考: https://github.com/SHORiN-KiWATA/shorin-arch-setup
 #   快照回滚设计参考:       https://github.com/ech678/NyxNiri
 # ==============================================================================
-
-set -uo pipefail
+echo "The author assumes no responsibility for any changes made to the server, computer, etc., and the author reserves the right of final interpretation.
+set -uo pipefail"
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_FILE="$BASE_DIR/.replicate_progress"
@@ -212,10 +212,9 @@ CONFIG_DIRS=(niri waybar mako kitty hypr copyq satty waypaper fcitx5 fcitx envir
 CONFIG_FILES=(.pam_environment)
 
 # 服务 -> 提供包 映射（export 时按 is-enabled 过滤后写入 services.txt）
-SVC_ORDER=(bluetooth.service dhcpcd.service libvirtd.service power-profiles-daemon.service)
+SVC_ORDER=(bluetooth.service libvirtd.service power-profiles-daemon.service)
 declare -A SVC_PROVIDER=(
     [bluetooth.service]=bluez
-    [dhcpcd.service]=dhcpcd
     [libvirtd.service]=libvirt
     [power-profiles-daemon.service]=power-profiles-daemon
 )
@@ -817,12 +816,8 @@ stage_services() {
             erc=0
             pm_install "$provider" || erc=$?
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
-                if [ "$provider" = dhcpcd ] && [ "$DISTRO_FAMILY" = rhel ]; then
-                    MANUAL_ITEMS+=("$(_t "dhcpcd —— RHEL 系建议使用 NetworkManager: systemctl enable --now NetworkManager" "dhcpcd not available on RHEL, try: systemctl enable --now NetworkManager")")
-                else
-                    FAILED_PKGS+=("svc-provider:$provider")
-                    any_failed=1
-                fi
+                FAILED_PKGS+=("svc-provider:$provider")
+                any_failed=1
                 continue
             fi
             [ "$erc" -eq "$DRY_RUN_RC" ] && DRY_PKGS+=("$provider")
@@ -835,12 +830,8 @@ stage_services() {
         elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
             DRY_SVCS+=("$unit")
         else
-            if [ "$unit" = dhcpcd.service ] && [ "$DISTRO_FAMILY" = rhel ]; then
-                MANUAL_ITEMS+=("$(_t "dhcpcd.service —— 不可用，建议: systemctl enable --now NetworkManager" "dhcpcd.service not available, try: systemctl enable --now NetworkManager")")
-            else
-                FAILED_PKGS+=("service:$unit")
-                any_failed=1
-            fi
+            FAILED_PKGS+=("service:$unit")
+            any_failed=1
         fi
         # libvirtd 附带 socket 一并启用（若存在）
         if [ "$unit" = libvirtd.service ]; then

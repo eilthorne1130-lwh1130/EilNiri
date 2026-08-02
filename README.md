@@ -44,7 +44,7 @@ sudo ./install.sh rollback
 | 字体 | ✅ | ttf-jetbrains-mono-nerd wqy-zenhei |
 | 密钥环 | ✅ | gnome-keyring |
 | 显示管理器 | ⬜ 可选 | ly（仅 Arch，默认不装，有 DM 冲突检测） |
-| 系统服务 | 勾选制 | bluetooth / dhcpcd / libvirtd / power-profiles-daemon（提供包缺失自动补装） |
+| 系统服务 | 勾选制 | bluetooth / libvirtd / power-profiles-daemon（提供包缺失自动补装） |
 
 交互方式：fzf 多选 —— **默认全选**，TAB 切换，Ctrl-A 全选，Ctrl-D 全不选，Enter 确认。
 
@@ -68,7 +68,15 @@ sudo ./install.sh rollback
 
 - 包名自动翻译（如 `ttf-jetbrains-mono-nerd` → `jetbrains-mono-nerd-fonts`、`pipewire-pulse` → `pipewire-pulseaudio`、`wqy-zenhei` → `wqy-zenhei-fonts`）
 - 部分包无 RPM 对应：waypaper 走 `pip3 install --user` 兜底；awww / satty / rime-ice / ly 等列入**末尾"需手动安装"报告**并给出建议
-- dhcpcd 不可用时提示改用 NetworkManager
+
+## TTY 支持
+
+在纯 TTY（linux console / 无 Wayland/X 的 SSH）下运行时**自动切换英文纯文本**，避免中文乱码。也可手动指定：
+
+```bash
+TTY_MODE=1 sudo ./install.sh restore   # 强制英文
+TTY_MODE=0 ./install.sh export          # 强制中文
+```
 
 ## 产物结构
 
@@ -176,7 +184,7 @@ sudo ./install.sh rollback
 | Fonts | ✅ | ttf-jetbrains-mono-nerd wqy-zenhei |
 | Keyring | ✅ | gnome-keyring |
 | Display manager | ⬜ Optional | ly (Arch only, not installed by default, has DM conflict detection) |
-| System services | Checkbox style | bluetooth / dhcpcd / libvirtd / power-profiles-daemon (missing provider packages auto-installed) |
+| System services | Checkbox style | bluetooth / libvirtd / power-profiles-daemon (missing provider packages auto-installed) |
 
 Interaction: fzf multi-select — **all selected by default**, TAB to toggle, Ctrl-A select all, Ctrl-D select none, Enter to confirm.
 
@@ -200,7 +208,15 @@ Under `~/.config/`: niri, waybar, mako (excluding `__pycache__`), kitty, hypr, c
 
 - Automatic package name translation (e.g. `ttf-jetbrains-mono-nerd` → `jetbrains-mono-nerd-fonts`, `pipewire-pulse` → `pipewire-pulseaudio`, `wqy-zenhei` → `wqy-zenhei-fonts`)
 - Some packages have no RPM equivalent: waypaper falls back to `pip3 install --user`; awww / satty / rime-ice / ly etc. are listed in the **"manual install required" report** at the end with suggestions
-- When dhcpcd is unavailable, prompts to switch to NetworkManager
+
+## TTY Support
+
+When running in a pure TTY (linux console / SSH without Wayland/X), **English plain text is automatically used** to avoid garbled Chinese. You can also set it manually:
+
+```bash
+TTY_MODE=1 sudo ./install.sh restore   # Force English
+TTY_MODE=0 ./install.sh export          # Force Chinese
+```
 
 ## Output Structure
 
