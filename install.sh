@@ -2,26 +2,27 @@
 # ==============================================================================
 # eilNiri - replicate.sh
 #
-#   把当前机器的 niri 桌面套件（软件包 + 桌面配置 + 系统服务）采集为快照，
-#   并在全新的 Arch 系 / RHEL 系 系统上一键重现。
+#   Collects this machine's niri desktop suite (packages + desktop config +
+#   system services) into a snapshot, then reproduces it one-click on a fresh
+#   Arch / RHEL / Debian family system.
 #
 #   Usage:
-#     ./replicate.sh export  [--keep-typos]   采集快照（普通用户运行，只读系统）
-#     ./replicate.sh restore [--dry-run]      在新系统重现（root 运行）
-#     ./replicate.sh rollback                 从已有快照回滚配置（root 运行）
+#     ./replicate.sh export  [--keep-typos]   create snapshot (normal user, read-only)
+#     ./replicate.sh restore [--dry-run]      restore on new system (root)
+#     ./replicate.sh rollback                 rollback config from snapshot (root)
 #     ./replicate.sh --help
 #
-#   快照产物（export 生成于本脚本所在目录）:
-#     pkglist/official.txt   官方仓库包
-#     pkglist/aur.txt        AUR 包
-#     pkglist/services.txt   已启用系统服务（格式: "unit 提供包"）
-#     config/                桌面配置镜像
+#   Snapshot outputs (export generates them next to this script):
+#     pkglist/official.txt   official repo packages
+#     pkglist/aur.txt        AUR packages
+#     pkglist/services.txt   enabled system services (format: "unit provider")
+#     config/                desktop config mirror
 #
-#   交互风格与视觉引擎参考: https://github.com/SHORiN-KiWATA/shorin-arch-setup
-#   快照回滚设计参考:       https://github.com/ech678/NyxNiri
+#   Interaction style & visual engine reference: https://github.com/SHORiN-KiWATA/shorin-arch-setup
+#   Snapshot rollback design reference:          https://github.com/ech678/NyxNiri
 # ==============================================================================
-echo "The author assumes no responsibility for any changes made to the server, computer, etc., and the author reserves the right of final interpretation.
-set -uo pipefail"
+echo "The author assumes no responsibility for any changes made to the server, computer, etc., and the author reserves the right of final interpretation."
+set -uo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_FILE="$BASE_DIR/.replicate_progress"
@@ -48,22 +49,12 @@ DRY_RUN=0
 KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
-# TTY 检测：无图形会话（linux console / ssh without X）时自动切英文纯文本
-# 若已通过环境变量 TTY_MODE 指定，则跳过自动检测
-if [ "${TTY_MODE:-unset}" = "unset" ]; then
-    if [ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] || [ "$TERM" = "linux" ]; then
-        TTY_MODE=1
-        NC=""; BOLD=""; DIM=""; H_RED=""; H_GREEN=""; H_YELLOW=""
-        H_BLUE=""; H_PURPLE=""; H_CYAN=""; H_WHITE=""; H_GRAY=""; H_MAGENTA=""
-        TICK="* "; CROSS="x "; WARN_I="! "; ARROW="> "
-    else
-        TTY_MODE=0
-    fi
-fi
-_t() { [ "$TTY_MODE" = "1" ] && echo "$2" || echo "$1"; }
+# Output is always English with ANSI colors (TTY/desktop detection removed).
+# _t always returns the English (2nd) argument; kept as a thin translation helper.
+_t() { echo "$2"; }
 
 # ==============================================================================
-# 1. 视觉引擎 (参考 00-utils.sh)
+# 1. Visual engine (see 00-utils.sh)
 # ==============================================================================
 
 export NC='\033[0m' BOLD='\033[1m' DIM='\033[2m'
@@ -76,7 +67,7 @@ export CROSS="${H_RED}✘${NC}"
 export WARN_I="${H_YELLOW}⚠${NC}"
 export ARROW="${H_CYAN}➜${NC}"
 
-# 日志目录：sudo 下 $HOME 是 /root，改用真实用户的 home（与 export 非 sudo 保持一致）
+# Log dir: under sudo $HOME is /root, so use the real user's home (same as non-sudo export)
 _LOG_USER="${SUDO_USER:-$USER}"
 _LOG_HOME="$HOME"
 if [ -n "$_LOG_USER" ] && [ "$_LOG_USER" != "root" ]; then
@@ -133,8 +124,8 @@ error() {
     write_log "ERROR" "$1"
 }
 
-# 核心命令执行器：可视化 + 日志 + dry-run 拦截
-# dry-run 下返回 99（DRY_RUN_RC）以便调用方区分"未实际安装"与"真成功"
+# Core command executor: visual + logging + dry-run interception
+# In dry-run it returns 99 (DRY_RUN_RC) so callers can distinguish "not actually installed" from "really succeeded"
 DRY_RUN_RC=99
 exe() {
     local full_command="$*"
@@ -157,8 +148,8 @@ exe() {
     fi
 }
 
-# 带超时的确认提示: confirm "问题" [默认Y|N] [超时秒]
-# 返回 0 = 是, 1 = 否
+# Confirmation prompt with timeout: confirm "question" [default Y|N] [timeout sec]
+# Returns 0 = yes, 1 = no
 confirm() {
     local prompt="$1" default="${2:-Y}" timeout="${3:-30}" ans
     echo -ne "   ${H_CYAN}${prompt} ${NC}"
@@ -184,22 +175,10 @@ LOGO
 }
 
 # ==============================================================================
-# 2. 数据区 —— niri 套件定义（唯一权威清单，export/restore 共用）
+# 2. Data section — niri suite definition (single source of truth for export/restore)
 # ==============================================================================
 
 GROUP_ORDER=(core lock wallpaper clip media audio ime fonts keyring)
-
-declare -A GROUP_ZH=(
-    [core]="核心组件"
-    [lock]="锁屏/空闲"
-    [wallpaper]="壁纸"
-    [clip]="剪贴板/截图"
-    [media]="媒体/亮度"
-    [audio]="音频"
-    [ime]="输入法"
-    [fonts]="字体"
-    [keyring]="密钥环"
-)
 
 declare -A GROUP_EN=(
     [core]="Core"
@@ -225,7 +204,7 @@ declare -A GROUP_PKGS=(
     [keyring]="gnome-keyring"
 )
 
-# pkg -> 分组 反查表（运行时构建）
+# pkg -> group reverse lookup table (built at runtime)
 declare -A PKG_GROUP=()
 for _g in "${GROUP_ORDER[@]}"; do
     for _p in ${GROUP_PKGS[$_g]:-}; do
@@ -234,60 +213,95 @@ for _g in "${GROUP_ORDER[@]}"; do
 done
 unset _g _p
 
-# 配置采集白名单（~/.config 下的目录）+ 家目录散文件
+# Config capture whitelist (~/.config dirs) + home dotfiles
 CONFIG_DIRS=(niri waybar mako kitty hypr copyq satty waypaper fcitx5 fcitx environment.d xdg-desktop-portal gtk-3.0 gtk-4.0 fontconfig)
 CONFIG_FILES=(.pam_environment)
 
-# 服务 -> 提供包 映射（export 时按 is-enabled 过滤后写入 services.txt）
+# service -> provider package mapping (filtered by is-enabled during export and written to services.txt)
 SVC_ORDER=(bluetooth.service libvirtd.service power-profiles-daemon.service)
 declare -A SVC_PROVIDER=(
     [bluetooth.service]=bluez
     [libvirtd.service]=libvirt
     [power-profiles-daemon.service]=power-profiles-daemon
 )
+# Debian-family service provider names (export snapshot records Arch names; remapped per family on restore)
+declare -A DEB_SVC_PROVIDER=(
+    [bluetooth.service]=bluez
+    [libvirtd.service]=libvirt-daemon-system
+    [power-profiles-daemon.service]=power-profiles-daemon
+)
 
-# --- Arch -> RHEL 系 翻译层 ---
-# 改名映射
+# --- Arch -> RHEL family translation layer ---
+# Rename mapping
 declare -A RHEL_MAP=(
     [ttf-jetbrains-mono-nerd]=jetbrains-mono-nerd-fonts
     [wqy-zenhei]=wqy-zenhei-fonts
     [pipewire-pulse]=pipewire-pulseaudio
 )
-# RHEL 系无官方包 -> 进"需手动安装"报告（值为原因/建议）
+# Packages with no official RPM -> go to the "manual install" report (value = reason/advice)
 declare -A RHEL_MANUAL=(
-    [awww]="无官方 RPM；可 cargo install --git https://github.com/LGFae/awww 或下载 release 二进制"
-    [satty]="无官方 RPM；可 cargo install satty"
-    [rime-ice-pinyin-git]="雾凇拼音需手动部署词库到 ~/.local/share/fcitx5/rime"
-    [ly]="仅 Arch 提供；RHEL 系建议 gdm/sddm，或 tty 登录后执行 niri-session"
+    [awww]="No official RPM; install with: cargo install --git https://github.com/LGFae/awww or download a release binary"
+    [satty]="No official RPM; install with: cargo install satty"
+    [rime-ice-pinyin-git]="Rime Ice (Lùsōng) dictionary must be deployed manually to ~/.local/share/fcitx5/rime"
+    [ly]="Only available on Arch; on RHEL use gdm/sddm, or run niri-session from tty"
 )
-# 可用 pip 兜底安装的（Arch/RHEL 通用）
+# RHEL family: extra hint when dnf install fails (available in Fedora official repo, but not on Rocky/Alma/CentOS Stream)
+declare -A RHEL_FAIL_HINT=(
+    [hyprlock]="Available in the Fedora official repo (dnf install hyprlock); on Rocky/Alma/CentOS try EPEL / Copr, or install the RPM from the Fedora repo manually"
+    [hypridle]="Available in the Fedora official repo (dnf install hypridle); on Rocky/Alma/CentOS try EPEL / Copr, or install the RPM from the Fedora repo manually"
+    [xwayland-satellite]="Available in the Fedora official repo (dnf install xwayland-satellite); on Rocky/Alma/CentOS try EPEL / Copr or build manually"
+)
+# --- Arch -> Debian family translation layer ---
+# Rename mapping
+declare -A DEB_MAP=(
+    [mako]=mako-notifier
+    [fcitx5-configtool]=fcitx5-config-qt
+    [ttf-jetbrains-mono-nerd]=fonts-jetbrains-mono
+    [wqy-zenhei]=fonts-wqy-zenhei
+    [libnotify]=libnotify-bin
+    [polkit-gnome]=polkit-gnome
+)
+# Packages with no official .deb -> go to the "manual install" report (value = reason/advice)
+declare -A DEB_MANUAL=(
+    [awww]="No official .deb; install with: cargo install --git https://github.com/LGFae/awww or download a release binary"
+    [satty]="No official .deb; install with: cargo install satty"
+    [rime-ice-pinyin-git]="Rime Ice (Lùsōng) dictionary must be deployed manually to ~/.local/share/fcitx5/rime"
+    [ly]="No ly package on Debian/Ubuntu; use gdm/sddm/lightdm, or run niri-session from tty"
+)
+# Debian family: extra hint when apt install fails (not in repo but may have an alternative)
+declare -A DEB_FAIL_HINT=(
+    [hyprlock]="Installable on Debian 13 via trixie-backports (apt-get install -t trixie-backports hyprlock); already in Ubuntu 26.04+ repos; otherwise build manually"
+    [hypridle]="Installable on Debian 13 via trixie-backports (apt-get install -t trixie-backports hypridle); already in Ubuntu 26.04+ repos; otherwise build manually"
+    [xwayland-satellite]="Not in Debian/Ubuntu stable repos; needs sid/testing or manual build"
+)
+# Packages installable via pip as a fallback (common to Arch/RHEL/Debian)
 declare -A PIP_PKGS=(
     [waypaper]=waypaper
 )
 
-# 汇总报告收集器
+# Summary report collectors
 INSTALLED_PKGS=() SKIPPED_PKGS=() FAILED_PKGS=() MANUAL_ITEMS=() ENABLED_SVCS=()
-DRY_PKGS=() DRY_SVCS=()  # dry-run 模式下"将执行"的项，分开汇总避免虚高
+DRY_PKGS=() DRY_SVCS=()  # items "that would be executed" in dry-run mode; kept separate to avoid inflated counts
 
 # ==============================================================================
-# 3. export 模式 —— 采集快照（普通用户运行；只扫描+复制，不改系统）
+# 3. export mode — collect snapshot (run as normal user; only scan+copy, no system changes)
 # ==============================================================================
 
 do_export() {
     init_logger
     if [ "$EUID" -eq 0 ]; then
-        error "$(_t "export 需要以【普通用户】运行（要读取你的 ~/.config），不要用 sudo。" "export must run as normal user (needs ~/.config), do not use sudo.")"
+        error "$(_t "export must run as normal user (needs ~/.config), do not use sudo." "export must run as normal user (needs ~/.config), do not use sudo.")"
         exit 1
     fi
 
     local SNAP_PKGLIST="$BASE_DIR/pkglist"
     local SNAP_CONFIG="$BASE_DIR/config"
 
-    section "Export" "$(_t "采集 niri 套件快照" "Collect Niri Suite Snapshot")"
-    info_kv "$(_t "快照目录" "Snapshot Dir")" "$BASE_DIR"
+    section "Export" "$(_t "Collect Niri Suite Snapshot" "Collect Niri Suite Snapshot")"
+    info_kv "$(_t "Snapshot Dir" "Snapshot Dir")" "$BASE_DIR"
 
-    # --- 3.1 包清单 ---
-    log "$(_t "扫描已安装的 niri 套件软件包..." "Scanning installed niri suite packages...")"
+    # --- 3.1 package list ---
+    log "$(_t "Scanning installed niri suite packages..." "Scanning installed niri suite packages...")"
     mkdir -p "$SNAP_PKGLIST"
     : > "$SNAP_PKGLIST/official.txt"
 
@@ -302,13 +316,13 @@ do_export() {
         done
     done
     sort -u -o "$SNAP_PKGLIST/official.txt" "$SNAP_PKGLIST/official.txt"
-    info_kv "$(_t "包清单" "Pkglist")" "$(wc -l < "$SNAP_PKGLIST/official.txt") 个"
+    info_kv "$(_t "Pkglist" "Pkglist")" "$(wc -l < "$SNAP_PKGLIST/official.txt") packages"
     if [ ${#missing[@]} -gt 0 ]; then
-        warn "$(_t "以下清单内软件包当前未安装，未写入快照:" "The following packages are not installed, not written to snapshot:")${missing[*]}"
+        warn "$(_t "The following packages are not installed, not written to snapshot:" "The following packages are not installed, not written to snapshot:")${missing[*]}"
     fi
 
-    # --- 3.2 服务清单 ---
-    log "$(_t "扫描已启用的系统服务..." "Scanning enabled system services...")"
+    # --- 3.2 service list ---
+    log "$(_t "Scanning enabled system services..." "Scanning enabled system services...")"
     : > "$SNAP_PKGLIST/services.txt"
     for unit in "${SVC_ORDER[@]}"; do
         if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
@@ -316,10 +330,10 @@ do_export() {
             log "  $(_t "[enabled]" "[enabled]") $unit"
         fi
     done
-    info_kv "$(_t "服务" "Services")" "$(wc -l < "$SNAP_PKGLIST/services.txt") 项"
+    info_kv "$(_t "Services" "Services")" "$(wc -l < "$SNAP_PKGLIST/services.txt") services"
 
-    # --- 3.3 配置镜像 ---
-    log "$(_t "复制桌面配置（白名单）..." "Copying desktop config (whitelist)...")"
+    # --- 3.3 config mirror ---
+    log "$(_t "Copying desktop config (whitelist)..." "Copying desktop config (whitelist)...")"
     rm -rf "$SNAP_CONFIG"
     mkdir -p "$SNAP_CONFIG/.config"
 
@@ -328,7 +342,7 @@ do_export() {
             cp -r "$HOME/.config/$d" "$SNAP_CONFIG/.config/$d"
             log "  $(_t "[config]" "[config]") ~/.config/$d"
         else
-            warn "  $(_t "[skip]" "[skip]") ~/.config/$d 不存在"
+            warn "  $(_t "[skip]" "[skip]") ~/.config/$d does not exist"
         fi
     done
     for f in "${CONFIG_FILES[@]}"; do
@@ -338,10 +352,10 @@ do_export() {
         fi
     done
 
-    # 清理无用的缓存目录（不进入快照）
+    # Remove useless cache directories (not part of snapshot)
     rm -rf "$SNAP_CONFIG/.config/mako/__pycache__" 2>/dev/null
 
-    # --- 3.4 修正快照副本中的已知笔误（不碰 live 配置）---
+    # --- 3.4 fix known typos in the snapshot copy (never touch live config) ---
     local NIRI_KDL="$SNAP_CONFIG/.config/niri/config.kdl"
     if [ -f "$NIRI_KDL" ] && [ "$KEEP_TYPOS" -eq 0 ]; then
         local fixed=()
@@ -354,13 +368,13 @@ do_export() {
             fixed+=("polkit-gnome-authenntication -> polkit-gnome-authentication")
         fi
         if [ ${#fixed[@]} -gt 0 ]; then
-            warn "$(_t "已在快照副本中修正配置笔误（live 配置未改动；--keep-typos 可关闭此行为）:" "Fixed typos in snapshot copy (live config unchanged; --keep-typos to disable):")"
+            warn "$(_t "Fixed typos in snapshot copy (live config unchanged; --keep-typos to disable):" "Fixed typos in snapshot copy (live config unchanged; --keep-typos to disable):")"
             for fx in "${fixed[@]}"; do echo -e "     ${H_YELLOW}· $fx${NC}"; done
             write_log "FIX" "${fixed[*]}"
         fi
     fi
 
-    # --- 3.5 捕获并修复 niri-session（systemd import-environment 弃用警告）---
+    # --- 3.5 capture & fix niri-session (systemd import-environment deprecation warning) ---
     local NIRI_SESSION="$SNAP_CONFIG/.local/bin/niri-session"
     local NIRI_DESKTOP="$SNAP_CONFIG/.local/share/applications/niri.desktop"
     if [ -x /usr/bin/niri-session ]; then
@@ -369,7 +383,7 @@ do_export() {
         chmod +x "$NIRI_SESSION"
         if grep -q 'systemctl --user import-environment$' "$NIRI_SESSION"; then
             sed -i 's/systemctl --user import-environment$/systemctl --user import-environment WAYLAND_DISPLAY XDG_SESSION_TYPE DISPLAY XDG_CURRENT_DESKTOP/' "$NIRI_SESSION"
-            log "  [fix] niri-session: import-environment 已加显式变量列表"
+            log "  [fix] niri-session: import-environment now has an explicit variable list"
         fi
         cat > "$NIRI_DESKTOP" <<'DESKTOP_EOF'
 [Desktop Entry]
@@ -383,25 +397,25 @@ DESKTOP_EOF
         log "  [config] fixed niri-session + desktop entry"
     fi
 
-    section "$(_t "Export 完成" "Export Done")" "$(_t "快照已生成" "Snapshot Created")"
-    info_kv "$(_t "包清单" "Pkglist")" "$SNAP_PKGLIST/"
-    info_kv "$(_t "配置镜像" "Config Mirror")" "$SNAP_CONFIG/"
-    log "下一步: 把整个 eilNiri 目录带到新机器，运行 ${BOLD}sudo ./replicate.sh restore${NC}"
+    section "$(_t "Export Done" "Export Done")" "$(_t "Snapshot Created" "Snapshot Created")"
+    info_kv "$(_t "Pkglist" "Pkglist")" "$SNAP_PKGLIST/"
+    info_kv "$(_t "Config Mirror" "Config Mirror")" "$SNAP_CONFIG/"
+    log "Next: copy the eilNiri directory to the new machine and run ${BOLD}sudo ./replicate.sh restore${NC}"
 }
 
 # ==============================================================================
-# 4. restore 模式 —— 在新系统重现（root 运行）
+# 4. restore mode — reproduce desktop on new system (run as root)
 # ==============================================================================
 
-DISTRO_FAMILY=""   # arch | rhel
+DISTRO_FAMILY=""   # arch | rhel | debian
 TARGET_USER=""
 HOME_DIR=""
 
-# --- 4.0 基础 ---
+# --- 4.0 basics ---
 
 check_root() {
     if [ "$EUID" -ne 0 ]; then
-        error "$(_t "restore 需要 root 权限，请使用: sudo ./replicate.sh restore" "restore requires root. Use: sudo ./replicate.sh restore")"
+        error "$(_t "restore requires root. Use: sudo ./replicate.sh restore" "restore requires root. Use: sudo ./replicate.sh restore")"
         exit 1
     fi
 }
@@ -415,78 +429,79 @@ detect_distro() {
     case " $id $id_like " in
         *arch*|*manjaro*|*endeavouros*) DISTRO_FAMILY=arch ;;
         *rhel*|*fedora*|*centos*)       DISTRO_FAMILY=rhel ;;
+        *debian*|*ubuntu*|*mint*|*pop*) DISTRO_FAMILY=debian ;;
         *)
-            error "无法识别的发行版 (ID=$id ID_LIKE=$id_like)。仅支持 Arch 系与 RHEL 系。"
+            error "Unrecognized distribution (ID=$id ID_LIKE=$id_like). Only Arch / RHEL / Debian families are supported."
             exit 1
             ;;
     esac
-    info_kv "$(_t "发行版家族" "Distro")" "$DISTRO_FAMILY" "(ID=$id)"
+    info_kv "$(_t "Distro" "Distro")" "$DISTRO_FAMILY" "(ID=$id)"
 }
 
-pkg_installed() { # $1 = 包名
-    if [ "$DISTRO_FAMILY" = arch ]; then
-        pacman -Qi "$1" &>/dev/null
-    else
-        rpm -q "$1" &>/dev/null
-    fi
+pkg_installed() { # $1 = package name
+    case "$DISTRO_FAMILY" in
+        arch)   pacman -Qi "$1" &>/dev/null ;;
+        rhel)   rpm -q "$1" &>/dev/null ;;
+        debian) dpkg -s "$1" &>/dev/null ;;
+    esac
 }
 
-pm_install() { # $@ = 包名
-    if [ "$DISTRO_FAMILY" = arch ]; then
-        exe pacman -S --noconfirm --needed "$@"
-    else
-        exe dnf install -y "$@"
-    fi
+pm_install() { # $@ = package names
+    case "$DISTRO_FAMILY" in
+        arch)   exe pacman -S --noconfirm --needed "$@" ;;
+        rhel)   exe dnf install -y "$@" ;;
+        debian) exe apt-get install -y "$@" ;;
+    esac
 }
 
 as_user() {
     runuser -u "$TARGET_USER" -- "$@"
 }
 
-# 断点续装（dry-run 不读写进度文件）
+# Resume support (dry-run does not read/write the progress file)
 stage_done() { [ "$DRY_RUN" -eq 1 ] && return 1; grep -qx "$1" "$STATE_FILE" 2>/dev/null; }
 stage_mark() { [ "$DRY_RUN" -eq 1 ] && return 0; echo "$1" >> "$STATE_FILE"; }
 
-# 目标用户检测（参考 detect_target_user，简化版）
+# Target user detection (simplified detect_target_user)
 detect_target_user() {
     local uid1000
     uid1000=$(awk -F: '$3 == 1000 {print $1}' /etc/passwd | head -n 1)
     mapfile -t HUMAN_USERS < <(awk -F: '$3 >= 1000 && $3 < 60000 {print $1}' /etc/passwd)
 
-    # dry-run：跳过交互，直接选 UID 1000 / 第一个普通用户
+    # dry-run: skip interaction, auto-pick UID 1000 / first regular user
     if [ "$DRY_RUN" -eq 1 ]; then
         if [ ${#HUMAN_USERS[@]} -gt 0 ]; then
             TARGET_USER="${uid1000:-${HUMAN_USERS[0]}}"
-            log "$(_t "[DRY-RUN] 自动选择目标用户:" "[DRY-RUN] auto-selecting target user: ") $TARGET_USER"
+            log "$(_t "[DRY-RUN] auto-selecting target user: " "[DRY-RUN] auto-selecting target user: ") $TARGET_USER"
         else
             TARGET_USER="eilniri-dryrun"
-            log "$(_t "[DRY-RUN] 未检测到普通用户，使用占位用户名:" "[DRY-RUN] no regular users found, using placeholder: ") $TARGET_USER"
+            log "$(_t "[DRY-RUN] no regular users found, using placeholder: " "[DRY-RUN] no regular users found, using placeholder: ") $TARGET_USER"
         fi
         HOME_DIR=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
         [ -z "$HOME_DIR" ] && HOME_DIR="/home/$TARGET_USER"
         export TARGET_USER HOME_DIR
-        info_kv "$(_t "目标用户" "Target User")" "$TARGET_USER" "($HOME_DIR)"
+        info_kv "$(_t "Target User" "Target User")" "$TARGET_USER" "($HOME_DIR)"
         return
     fi
 
     if [ ${#HUMAN_USERS[@]} -gt 0 ]; then
         local default_user="${uid1000:-${HUMAN_USERS[0]}}"
-        echo -e "   ${H_YELLOW}$(_t ">>> 检测到已有用户，选择配置部署目标:" ">>> Existing users found, select target:")${NC}"
+        echo -e "   ${H_YELLOW}$(_t ">>> Existing users found, select target:" ">>> Existing users found, select target:")${NC}"
         local i
         for i in "${!HUMAN_USERS[@]}"; do
             local mark=""
             [ "${HUMAN_USERS[$i]}" = "$default_user" ] && mark="${H_CYAN}*${NC}"
             echo -e "       [$((i+1))] ${mark}${HUMAN_USERS[$i]}"
         done
-        echo -e "       [0] ${H_GREEN}$(_t "创建新用户 ++" "Create New User ++")${NC}"
+        echo -e "       [0] ${H_GREEN}$(_t "Create New User ++" "Create New User ++")${NC}"
 
         local idx
         while true; do
-            echo -ne "   ${H_CYAN}$(_t "输入序号 [0-${#HUMAN_USERS[@]}] (默认 ${default_user}, 30s 超时): " "Enter number [0-${#HUMAN_USERS[@]}] (default ${default_user}, 30s timeout): ")${NC}"
+            echo -ne "   ${H_CYAN}$(_t "Enter number [0-${#HUMAN_USERS[@]}] (default ${default_user}, 30s timeout): " "Enter number [0-${#HUMAN_USERS[@]}] (default ${default_user}, 30s timeout): ")${NC}"
             if ! read -t 30 -r idx; then
                 echo ""
                 TARGET_USER="$default_user"
-                log "$(_t "超时，自动选择默认用户:" "Timeout, auto-selecting: ")$TARGET_USER"
+                log "$(_t "Timeout, auto-selecting: " "Timeout, auto-selecting: ")$TARGET_USER"
                 break
             fi
             if [ -z "$idx" ]; then TARGET_USER="$default_user"; break; fi
@@ -495,46 +510,46 @@ detect_target_user() {
                 TARGET_USER="${HUMAN_USERS[$((idx-1))]}"
                 break
             fi
-            warn "$(_t "无效输入。" "Invalid input.")"
+            warn "$(_t "Invalid input." "Invalid input.")"
         done
     fi
 
     if [ -z "$TARGET_USER" ]; then
         local new_user
         while true; do
-            echo -ne "   ${H_GREEN}$(_t "输入要创建的新用户名: " "Enter new username: ")${NC} "
+            echo -ne "   ${H_GREEN}$(_t "Enter new username: " "Enter new username: ")${NC} "
             read -r new_user
             if [[ "$new_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
                 if exe useradd -m -s /bin/bash "$new_user"; then
                     TARGET_USER="$new_user"
-                    warn "请随后用 passwd $new_user 设置密码。"
+                    warn "Set a password later with: passwd $new_user"
                     break
                 fi
-                warn "$(_t "用户创建失败（可能已存在），请重试。" "User creation failed (may already exist), retry.")"
+                warn "$(_t "User creation failed (may already exist), retry." "User creation failed (may already exist), retry.")"
                 continue
             fi
-            warn "$(_t "用户名格式非法。" "Invalid username format.")"
+            warn "$(_t "Invalid username format." "Invalid username format.")"
         done
     fi
 
     HOME_DIR=$(getent passwd "$TARGET_USER" | cut -d: -f6)
-    # dry-run 下新用户尚未真正创建，getent 为空时回退默认家目录路径
+    # in dry-run the new user is not created yet; fall back to the default home path when getent is empty
     [ -z "$HOME_DIR" ] && HOME_DIR="/home/$TARGET_USER"
     export TARGET_USER HOME_DIR
-    info_kv "$(_t "目标用户" "Target User")" "$TARGET_USER" "($HOME_DIR)"
+    info_kv "$(_t "Target User" "Target User")" "$TARGET_USER" "($HOME_DIR)"
 }
 
 ensure_fzf() {
     if command -v fzf &>/dev/null; then return 0; fi
-    log "$(_t "安装交互菜单依赖: fzf ..." "Installing interactive menu dependency: fzf ...")"
+    log "$(_t "Installing interactive menu dependency: fzf ..." "Installing interactive menu dependency: fzf ...")"
     local _saved_dry="$DRY_RUN"
-    DRY_RUN=0  # fzf 是交互前提，必须实际装（即使在 --dry-run 下）
-    pm_install fzf || { error "$(_t "fzf 安装失败，无法继续。" "fzf install failed, cannot continue.")"; exit 1; }
+    DRY_RUN=0  # fzf is required for interaction, so install it even in --dry-run
+    pm_install fzf || { error "$(_t "fzf install failed, cannot continue." "fzf install failed, cannot continue.")"; exit 1; }
     DRY_RUN="$_saved_dry"
 }
 
-# fzf 多选（参考 99-apps.sh：默认全选 / TAB 切换 / Ctrl-A 全选 / Ctrl-D 全不选）
-#  stdin: "字段1\t字段2" 行；stdout: 用户选中的行
+# fzf multi-select (see 99-apps.sh: select all by default / TAB toggle / Ctrl-A select all / Ctrl-D deselect all)
+#  stdin: lines of "field1\tfield2"; stdout: lines selected by the user
 fzf_multi() {
     fzf --multi --layout=reverse --border=rounded --margin=1,2 \
         --delimiter=$'\t' --with-nth=1,2 \
@@ -544,7 +559,7 @@ fzf_multi() {
         --header="$1"
 }
 
-# fzf 单选（回滚等场景：不预选，TAB/Ctrl-D 无意义）
+# fzf single-select (rollback etc.: nothing preselected, TAB/Ctrl-D meaningless)
 fzf_single() {
     fzf --layout=reverse --border=rounded --margin=1,2 \
         --delimiter=$'\t' --with-nth=1,2 \
@@ -555,50 +570,72 @@ fzf_single() {
 # --- 4.1 Pre-flight ---
 
 stage_preflight() {
-    section "$(_t "Pre-Flight" "Pre-Flight")" "$(_t "系统更新" "System Update")"
+    section "$(_t "Pre-Flight" "Pre-Flight")" "$(_t "System Update" "System Update")"
     if stage_done preflight; then
-        log "$(_t "Pre-flight 已完成，跳过（删除 .replicate_progress 可强制重跑）。" "Pre-flight done, skipping (delete .replicate_progress to force rerun).")"
+        log "$(_t "Pre-flight done, skipping (delete .replicate_progress to force rerun)." "Pre-flight done, skipping (delete .replicate_progress to force rerun).")"
         return
     fi
-    if [ "$DISTRO_FAMILY" = arch ]; then
-        # 并行下载加速
-        sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true
-        # Reflector 镜像优化（CN 时区→中国镜像，否则跳过）
-        local tz
-        tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
-        if [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]]; then
-            if command -v reflector &>/dev/null; then
-                log "$(_t "检测到中国时区，刷新 CN 镜像..." "Detected CN timezone, refreshing CN mirrors...")"
-                exe reflector --country China --protocol https --sort rate --save /etc/pacman.d/mirrorlist --latest 10 2>/dev/null || \
-                    warn "$(_t "Reflector 失败，继续使用现有镜像。" "Reflector failed, using existing mirrors.")"
+    case "$DISTRO_FAMILY" in
+        arch)
+            # Parallel download speedup
+            sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true
+            # Reflector mirror optimization (CN timezone -> China mirrors, otherwise skip)
+            local tz
+            tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+            if [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]]; then
+                if command -v reflector &>/dev/null; then
+                    log "$(_t "Detected CN timezone, refreshing CN mirrors..." "Detected CN timezone, refreshing CN mirrors...")"
+                    exe reflector --country China --protocol https --sort rate --save /etc/pacman.d/mirrorlist --latest 10 2>/dev/null || \
+                        warn "$(_t "Reflector failed, using existing mirrors." "Reflector failed, using existing mirrors.")"
+                fi
             fi
-        fi
-        exe pacman -Sy --noconfirm archlinux-keyring || warn "$(_t "keyring 刷新失败，继续尝试。" "keyring refresh failed, continuing.")"
-        if ! exe pacman -Su --noconfirm; then
-            error "$(_t "系统更新失败，请检查网络。" "System update failed. Check network.")"
-            exit 1
-        fi
-    else
-        if ! exe dnf -y upgrade --refresh; then
-            warn "$(_t "系统更新未完全成功，继续尝试安装。" "System update partially failed, continuing.")"
-        fi
-    fi
-    success "$(_t "系统已就绪。" "System ready.")"
+            exe pacman -Sy --noconfirm archlinux-keyring || warn "$(_t "keyring refresh failed, continuing." "keyring refresh failed, continuing.")"
+            if [ "$DRY_RUN" -eq 1 ]; then
+                log "$(_t "[DRY-RUN] Skipping system upgrade." "[DRY-RUN] Skipping system upgrade.")"
+            elif ! exe pacman -Su --noconfirm; then
+                error "$(_t "System update failed. Check network." "System update failed. Check network.")"
+                exit 1
+            fi
+            ;;
+        rhel)
+            if [ "$DRY_RUN" -eq 1 ]; then
+                log "$(_t "[DRY-RUN] Skipping system upgrade." "[DRY-RUN] Skipping system upgrade.")"
+            elif ! exe dnf -y upgrade --refresh; then
+                warn "$(_t "System update partially failed, continuing." "System update partially failed, continuing.")"
+            fi
+            ;;
+        debian)
+            # Refresh package index first (a fresh system may have no cache); also ensure curl/tar are available (niri download dependency)
+            if [ "$DRY_RUN" -eq 1 ]; then
+                log "$(_t "[DRY-RUN] Skipping apt update/upgrade." "[DRY-RUN] Skipping apt update/upgrade.")"
+                DRY_PKGS+=("curl tar")
+            else
+                if ! exe apt-get update; then
+                    warn "$(_t "apt-get update failed, continuing." "apt-get update failed, continuing.")"
+                fi
+                if ! exe apt-get -y upgrade; then
+                    warn "$(_t "System update partially failed, continuing." "System update partially failed, continuing.")"
+                fi
+                pm_install curl tar
+            fi
+            ;;
+    esac
+    success "$(_t "System ready." "System ready.")"
     stage_mark preflight
 }
 
-# --- 4.2 应用选择 ---
+# --- 4.2 app selection ---
 
 REPO_UNIVERSE=()
 
 load_app_universe() {
-    # 优先使用 export 快照清单（用户可手改），否则回退到内置权威清单
+    # Prefer the export snapshot list (user-editable), otherwise fall back to the built-in authoritative list
     local off="$BASE_DIR/pkglist/official.txt"
     if [ -s "$off" ]; then
-        log "$(_t "使用快照清单: pkglist/" "Using snapshot pkglist: pkglist/")"
+        log "$(_t "Using snapshot pkglist: pkglist/" "Using snapshot pkglist: pkglist/")"
         mapfile -t REPO_UNIVERSE < <(sed '/^\s*$/d' "$off")
     else
-        log "$(_t "未找到快照清单，使用内置 niri 套件清单。" "No snapshot pkglist, using built-in list.")"
+        log "$(_t "No snapshot pkglist, using built-in list." "No snapshot pkglist, using built-in list.")"
         local g raw
         for g in "${GROUP_ORDER[@]}"; do
             for raw in ${GROUP_PKGS[$g]:-}; do
@@ -611,18 +648,18 @@ load_app_universe() {
 group_tag() { # $1 = pkg
     local g="${PKG_GROUP[$1]:-}"
     if [ -n "$g" ]; then
-        [ "$TTY_MODE" = "1" ] && echo "[${GROUP_EN[$g]}]" || echo "[${GROUP_ZH[$g]}]"
+        echo "[${GROUP_EN[$g]}]"
     else
-        [ "$TTY_MODE" = "1" ] && echo "[Snapshot]" || echo "[快照]"
+        echo "[Snapshot]"
     fi
 }
 
 stage_apps_select() {
-    section "$(_t "应用选择" "App Selection")" "$(_t "TAB 切换 | 默认全选 | Ctrl-D 全不选 | Enter 确认" "TAB toggle | Select All | Ctrl-D deselect | Enter")"
+    section "$(_t "App Selection" "App Selection")" "$(_t "TAB toggle | Select All | Ctrl-D deselect | Enter" "TAB toggle | Select All | Ctrl-D deselect | Enter")"
     load_app_universe
 
-    # 中文组件选择
-    if ! confirm "$(_t "安装中文输入法（fcitx5+rime）和中文字体（wqy-zenhei）？[Y/n] (默认 Y, 15s):" "Install Chinese IME (fcitx5+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):")" "Y" 15; then
+    # Chinese component selection
+    if ! confirm "$(_t "Install Chinese IME (fcitx5+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):" "Install Chinese IME (fcitx5+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):")" "Y" 15; then
         local _cn_exclude=(fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git wqy-zenhei)
         local _tmp_arr=() _p
         for _p in ${REPO_UNIVERSE[@]+"${REPO_UNIVERSE[@]}"}; do
@@ -640,27 +677,27 @@ stage_apps_select() {
         lines+=("$p"$'\t'"$(group_tag "$p")")
     done
 
-    # dry-run：跳过 fzf 交互，直接全选（与 fzf load:select-all 默认行为一致）
+    # dry-run: skip fzf interaction, select everything (same as the fzf load:select-all default)
     if [ "$DRY_RUN" -eq 1 ]; then
         REPO_SEL=("${REPO_UNIVERSE[@]}")
-        log "$(_t "[DRY-RUN] 自动全选所有应用: ${#REPO_SEL[@]} 个" "[DRY-RUN] auto-selected all: ${#REPO_SEL[@]} packages")"
-        info_kv "$(_t "已选" "Selected")" "${#REPO_SEL[@]} 个" ""
+        log "$(_t "[DRY-RUN] auto-selected all: ${#REPO_SEL[@]} packages" "[DRY-RUN] auto-selected all: ${#REPO_SEL[@]} packages")"
+        info_kv "$(_t "Selected" "Selected")" "${#REPO_SEL[@]} packages" ""
         return 0
     fi
 
-    # 空清单守卫：fzf 空输入会返回非零且无提示，直接跳过避免误报"用户中止"
+    # Empty list guard: fzf with empty input returns non-zero silently, so skip to avoid a false "user aborted"
     if [ ${#lines[@]} -eq 0 ]; then
-        warn "$(_t "可用软件包列表为空，跳过应用安装阶段。" "Package list is empty, skipping app install.")"
+        warn "$(_t "Package list is empty, skipping app install." "Package list is empty, skipping app install.")"
         return 1
     fi
 
     local selected
-    selected=$(printf "%s\n" "${lines[@]}" | fzf_multi " 选择要安装的 niri 套件应用 ") || {
-        error "$(_t "用户中止选择。" "User aborted selection.")"
+    selected=$(printf "%s\n" "${lines[@]}" | fzf_multi " Select niri suite apps to install ") || {
+        error "$(_t "User aborted selection." "User aborted selection.")"
         exit 130
     }
     if [ -z "$selected" ]; then
-        warn "$(_t "未选择任何应用，跳过安装阶段。" "No apps selected, skipping install.")"
+        warn "$(_t "No apps selected, skipping install." "No apps selected, skipping install.")"
         return 1
     fi
 
@@ -672,19 +709,19 @@ stage_apps_select() {
         [ -z "$name" ] && continue
         REPO_SEL+=("$name")
     done <<< "$selected"
-    info_kv "$(_t "已选" "Selected")" "${#REPO_SEL[@]} 个" ""
+    info_kv "$(_t "Selected" "Selected")" "${#REPO_SEL[@]} packages" ""
     return 0
 }
 
-# --- 4.3 应用安装 ---
+# --- 4.3 app install ---
 
 install_arch() {
     local p
-    # --- 仓库包: 批量装，失败则逐个隔离 ---
+    # --- repo packages: batch install, fall back to per-package isolation on failure ---
     local queue=()
     for p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
         if [ -n "${PIP_PKGS[$p]:-}" ]; then
-            # pip 兜底安装
+            # pip fallback install
             if [ "$DRY_RUN" -eq 1 ]; then
                 DRY_PKGS+=("$p (pip)")
                 continue
@@ -695,12 +732,12 @@ install_arch() {
             if [ "$per" -eq 0 ]; then
                 INSTALLED_PKGS+=("$p (pip)")
             else
-                MANUAL_ITEMS+=("$p —— pip 安装失败，请手动: pip install --user ${PIP_PKGS[$p]}")
+                MANUAL_ITEMS+=("$p — pip install failed, do it manually: pip install --user ${PIP_PKGS[$p]}")
             fi
             continue
         fi
         if pkg_installed "$p"; then
-            SKIPPED_PKGS+=("$p (已安装)")
+            SKIPPED_PKGS+=("$p (already installed)")
         else
             queue+=("$p")
         fi
@@ -713,7 +750,7 @@ install_arch() {
         elif [ "$rc" -eq "$DRY_RUN_RC" ]; then
             DRY_PKGS+=("${queue[@]}")
         else
-            warn "$(_t "批量安装失败，切换为逐个安装以隔离问题包..." "Batch install failed, switching to individual installs...")"
+            warn "$(_t "Batch install failed, switching to individual installs..." "Batch install failed, switching to individual installs...")"
             for p in "${queue[@]}"; do
                 local prc=0
                 pm_install "$p" || prc=$?
@@ -733,7 +770,7 @@ install_rhel() {
     local p name erc
     local all=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
 
-    # pip 兜底前置检查
+    # pip fallback pre-check
     local has_pip_target=0
     for p in "${all[@]}"; do
         if [ -n "${PIP_PKGS[$p]:-}" ]; then has_pip_target=1; break; fi
@@ -745,13 +782,13 @@ install_rhel() {
             pm_install python3-pip
         fi
         if [ "$DRY_RUN" -eq 0 ] && ! command -v pip3 &>/dev/null; then
-            MANUAL_ITEMS+=("python3-pip —— pip3 未安装，请先: sudo dnf install python3-pip")
+            MANUAL_ITEMS+=("python3-pip — pip3 not installed, run: sudo dnf install python3-pip")
         fi
     fi
 
     for p in ${all[@]+"${all[@]}"}; do
         if [ -n "${RHEL_MANUAL[$p]:-}" ]; then
-            MANUAL_ITEMS+=("$p —— ${RHEL_MANUAL[$p]}")
+            MANUAL_ITEMS+=("$p — ${RHEL_MANUAL[$p]}")
             continue
         fi
         if [ -n "${PIP_PKGS[$p]:-}" ]; then
@@ -760,7 +797,7 @@ install_rhel() {
                 continue
             fi
             if ! command -v pip3 &>/dev/null; then
-                MANUAL_ITEMS+=("$p —— pip3 未安装，请先: sudo dnf install python3-pip")
+                MANUAL_ITEMS+=("$p — pip3 not installed, run: sudo dnf install python3-pip")
                 continue
             fi
             erc=0
@@ -768,13 +805,13 @@ install_rhel() {
             if [ "$erc" -eq 0 ]; then
                 INSTALLED_PKGS+=("$p (pip)")
             else
-                MANUAL_ITEMS+=("$p —— pip 安装失败，请手动: pip3 install --user ${PIP_PKGS[$p]}")
+                MANUAL_ITEMS+=("$p — pip install failed, do it manually: pip3 install --user ${PIP_PKGS[$p]}")
             fi
             continue
         fi
         name="${RHEL_MAP[$p]:-$p}"
         if pkg_installed "$name"; then
-            SKIPPED_PKGS+=("$name (已安装)")
+            SKIPPED_PKGS+=("$name (already installed)")
             continue
         fi
         erc=0
@@ -784,47 +821,263 @@ install_rhel() {
         elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
             DRY_PKGS+=("$name")
         else
-            FAILED_PKGS+=("dnf:$name")
+            if [ "$p" = "niri" ]; then
+                warn "$(_t "No niri package in dnf (common outside Fedora), falling back to official prebuilt/source install..." "No niri package in dnf (common outside Fedora), falling back to official prebuilt/source install...")"
+                install_niri_binary
+            elif [ -n "${RHEL_FAIL_HINT[$p]:-}" ]; then
+                MANUAL_ITEMS+=("$name — not available in repo. ${RHEL_FAIL_HINT[$p]}")
+            else
+                FAILED_PKGS+=("dnf:$name")
+            fi
+        fi
+    done
+}
+
+# --- niri install (common to Debian family and non-Fedora RHEL family; these repos have no niri) ---
+# Strategy: 1) official prebuilt binary (if this release provides it) 2) offline cargo build from the official vendored source archive 3) manual report
+# Fedora's official repo already has niri, so dnf succeeds and this is never reached
+NIRI_GH="https://github.com/niri-wm/niri/releases"
+
+# niri system build dependencies (Debian/Ubuntu names, per the official niri Packaging docs)
+NIRI_BUILD_DEPS=(build-essential pkg-config curl tar \
+    libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev wayland-protocols \
+    libinput-dev libdisplay-info-dev libudev-dev libseat-dev \
+    libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
+    libpipewire-0.3-dev libdbus-1-dev \
+    libxcb-composite0-dev libxcb-ewmh-dev libxcb-icccm4-dev libxcb-randr0-dev \
+    libxcb-xfixes0-dev libxcb-present-dev libxcb-render-util0-dev libxcb-res0-dev \
+    libxcb-shape0-dev libxcb-util-dev libxcb-xkb-dev libxcb-xinerama0-dev)
+# niri system build dependencies (RHEL/Fedora names; some need EPEL/CRB — fall back to the manual report when missing)
+NIRI_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config curl tar \
+    libxkbcommon-devel libxkbcommon-x11-devel libwayland-devel wayland-protocols-devel \
+    libinput-devel display-info-devel systemd-devel libseat-devel \
+    mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel \
+    pipewire-devel dbus-devel \
+    libxcb-devel xcb-util-devel xcb-util-wm-devel xcb-util-image-devel xcb-util-renderutil-devel xcb-util-keysyms-devel)
+
+# Ensure a usable Rust toolchain (use rustup for the latest stable when the distro version is too old)
+ensure_rust() {
+    if command -v cargo &>/dev/null && cargo --version 2>/dev/null | awk -F'[ .]' '{ if ($2 < 1 || ($2 == 1 && $3 < 85)) exit 1 }'; then
+        return 0
+    fi
+    log "$(_t "System Rust too old or missing, installing rustup toolchain..." "System Rust too old or missing, installing rustup toolchain...")"
+    if ! command -v rustup &>/dev/null; then
+        exe bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable' || return 1
+    fi
+    export PATH="$HOME/.cargo/bin:$PATH"
+    command -v cargo >/dev/null
+}
+
+install_niri_binary() {
+    if command -v niri >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("niri (already installed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("niri (official prebuilt or source build)")
+        return "$DRY_RUN_RC"
+    fi
+
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch=x86_64 ;;
+        aarch64) arch=aarch64 ;;
+        *)
+            MANUAL_ITEMS+=("niri — unsupported architecture $(uname -m), install manually: $NIRI_GH")
+            return 1
+            ;;
+    esac
+
+    # Resolve the latest version (GitHub API)
+    local ver url tmp work srcdir d
+    ver=$(curl -fsSL https://api.github.com/repos/niri-wm/niri/releases/latest 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/')
+    if [ -z "$ver" ]; then
+        MANUAL_ITEMS+=("niri — could not fetch latest version (network or GitHub API restricted), install manually: $NIRI_GH")
+        return 1
+    fi
+    tmp=$(mktemp)
+    work=$(mktemp -d)
+    register_temp_path "$tmp"
+    register_temp_path "$work"
+
+    # --- Strategy 1: official prebuilt binary (only some releases provide it; instant install if publishing resumes) ---
+    url="$NIRI_GH/download/v${ver}/niri-${ver}-${arch}-linux-gnu.tar.xz"
+    if curl -fsL --retry 2 -o "$tmp" "$url" 2>/dev/null; then
+        log "$(_t "Downloading niri $ver ($arch) official prebuilt binary..." "Downloading niri $ver ($arch) official prebuilt binary...")"
+        if tar xJf "$tmp" -C "$work" 2>/dev/null && [ -d "$work/bin" ]; then
+            exe install -Dm755 -t /usr/local/bin "$work"/bin/*
+            [ -d "$work/share" ] && exe cp -r "$work"/share/. /usr/local/share/
+            if [ -x /usr/local/bin/niri ]; then
+                INSTALLED_PKGS+=("niri (official prebuilt $ver)")
+                success "$(_t "niri $ver installed" "niri $ver installed")"
+                return 0
+            fi
+        fi
+        warn "$(_t "Prebuilt package unusable, falling back to source build." "Prebuilt package unusable, falling back to source build.")"
+    fi
+
+    # --- Strategy 2: offline build from the official vendored source archive (published by upstream for offline builds) ---
+    log "$(_t "No prebuilt binary for this version, building from official vendored source (10-20 min)..." "No prebuilt binary for this version, building from official vendored source (10-20 min)...")"
+    url="$NIRI_GH/download/v${ver}/niri-${ver}-vendored-dependencies.tar.xz"
+    if ! curl -fL --retry 3 -o "$tmp" "$url" 2>/dev/null; then
+        MANUAL_ITEMS+=("niri — source archive download failed, install manually: $NIRI_GH")
+        return 1
+    fi
+    if ! tar xJf "$tmp" -C "$work" 2>/dev/null; then
+        MANUAL_ITEMS+=("niri — source archive extraction failed, install manually: $url")
+        return 1
+    fi
+
+    # Locate the source root (top level may be the source directly or wrapped in a version dir)
+    srcdir="$work"
+    for d in "$work"/*/; do
+        [ -f "$d/Cargo.toml" ] && { srcdir="$d"; break; }
+    done
+
+    # Install build dependencies + Rust toolchain
+    if ! ensure_rust; then
+        MANUAL_ITEMS+=("niri — Rust toolchain install failed, build manually: $NIRI_GH")
+        return 1
+    fi
+    local bdeps_rc=0
+    if [ "$DISTRO_FAMILY" = debian ]; then
+        exe apt-get install -y "${NIRI_BUILD_DEPS[@]}" || bdeps_rc=$?
+    else
+        exe dnf install -y "${NIRI_BUILD_DEPS_RHEL[@]}" || bdeps_rc=$?
+    fi
+    if [ "$bdeps_rc" -ne 0 ]; then
+        MANUAL_ITEMS+=("niri — build dependencies install failed, build manually: $NIRI_GH")
+        return 1
+    fi
+
+    log "$(_t "Building niri offline (vendored deps), please wait..." "Building niri offline (vendored deps), please wait...")"
+    if ! (cd "$srcdir" && cargo build --release); then
+        MANUAL_ITEMS+=("niri — build failed, build manually or wait for an official prebuilt: $NIRI_GH")
+        return 1
+    fi
+
+    # Install (following the file layout from the official Packaging docs)
+    if [ -f "$srcdir/target/release/niri" ]; then
+        exe install -Dm755 "$srcdir/target/release/niri" /usr/local/bin/niri
+        exe install -Dm755 "$srcdir/resources/niri-session" /usr/local/bin/niri-session 2>/dev/null || true
+        exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/local/share/wayland-sessions/niri.desktop 2>/dev/null || true
+        exe install -Dm644 "$srcdir/resources/niri-portals.conf" /usr/local/share/xdg-desktop-portal/niri-portals.conf 2>/dev/null || true
+        INSTALLED_PKGS+=("niri (source build $ver)")
+        success "$(_t "niri $ver built from source" "niri $ver built from source")"
+        return 0
+    fi
+
+    MANUAL_ITEMS+=("niri — build output missing, install manually: $NIRI_GH")
+    return 1
+}
+
+install_debian() {
+    local p name erc
+    local all=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
+
+    # pip fallback pre-check
+    local has_pip_target=0
+    for p in "${all[@]}"; do
+        if [ -n "${PIP_PKGS[$p]:-}" ]; then has_pip_target=1; break; fi
+    done
+    if [ "$has_pip_target" -eq 1 ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            DRY_PKGS+=("python3-pip")
+        else
+            pm_install python3-pip
+        fi
+        if [ "$DRY_RUN" -eq 0 ] && ! command -v pip3 &>/dev/null; then
+            MANUAL_ITEMS+=("python3-pip — pip3 not installed, run: sudo apt-get install python3-pip")
+        fi
+    fi
+
+    for p in ${all[@]+"${all[@]}"}; do
+        # niri: not in official repos, use prebuilt/source install
+        if [ "$p" = "niri" ]; then
+            install_niri_binary
+            continue
+        fi
+        if [ -n "${DEB_MANUAL[$p]:-}" ]; then
+            MANUAL_ITEMS+=("$p — ${DEB_MANUAL[$p]}")
+            continue
+        fi
+        if [ -n "${PIP_PKGS[$p]:-}" ]; then
+            if [ "$DRY_RUN" -eq 1 ]; then
+                DRY_PKGS+=("$p (pip)")
+                continue
+            fi
+            if ! command -v pip3 &>/dev/null; then
+                MANUAL_ITEMS+=("$p — pip3 not installed, run: sudo apt-get install python3-pip")
+                continue
+            fi
+            erc=0
+            # PEP 668 (externally-managed-environment) requires --break-system-packages
+            exe as_user pip3 install --user --break-system-packages "${PIP_PKGS[$p]}" || erc=$?
+            if [ "$erc" -eq 0 ]; then
+                INSTALLED_PKGS+=("$p (pip)")
+            else
+                MANUAL_ITEMS+=("$p — pip install failed, do it manually: pip3 install --user --break-system-packages ${PIP_PKGS[$p]}")
+            fi
+            continue
+        fi
+        name="${DEB_MAP[$p]:-$p}"
+        if pkg_installed "$name"; then
+            SKIPPED_PKGS+=("$name (already installed)")
+            continue
+        fi
+        erc=0
+        pm_install "$name" || erc=$?
+        if [ "$erc" -eq 0 ]; then
+            INSTALLED_PKGS+=("$name")
+        elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
+            DRY_PKGS+=("$name")
+        else
+            if [ -n "${DEB_FAIL_HINT[$p]:-}" ]; then
+                MANUAL_ITEMS+=("$name — not available in repo. ${DEB_FAIL_HINT[$p]}")
+            else
+                FAILED_PKGS+=("apt:$name")
+            fi
         fi
     done
 }
 
 stage_apps_install() {
     if stage_done apps; then
-        log "$(_t "应用安装阶段已完成，跳过。" "App install stage done, skipping.")"
+        log "$(_t "App install stage done, skipping." "App install stage done, skipping.")"
         return
     fi
-    section "$(_t "应用安装" "App Install")" "$DISTRO_FAMILY 系"
-    if [ "$DISTRO_FAMILY" = arch ]; then
-        install_arch
-    else
-        install_rhel
-    fi
+    section "$(_t "App Install" "App Install")" "$DISTRO_FAMILY family"
+    case "$DISTRO_FAMILY" in
+        arch)   install_arch ;;
+        rhel)   install_rhel ;;
+        debian) install_debian ;;
+    esac
     stage_mark apps
 }
 
-# --- 4.4 系统服务 ---
+# --- 4.4 system services ---
 
 stage_services() {
     if stage_done services; then
-        log "$(_t "服务启用阶段已完成，跳过。" "Service stage done, skipping.")"
+        log "$(_t "Service stage done, skipping." "Service stage done, skipping.")"
         return
     fi
     local svc_file="$BASE_DIR/pkglist/services.txt"
     if [ ! -s "$svc_file" ]; then
-        warn "$(_t "未找到 services.txt，跳过服务启用。" "services.txt not found, skipping.")"
+        warn "$(_t "services.txt not found, skipping." "services.txt not found, skipping.")"
         return
     fi
 
-    section "$(_t "服务启用" "Services")" "$(_t "选择要启用的系统服务" "Select services to enable")"
+    section "$(_t "Services" "Services")" "$(_t "Select services to enable" "Select services to enable")"
     local selected
-    selected=$(awk '{print $1 "\t提供包: " $2}' "$svc_file" | \
-        fzf_multi " 选择要启用的服务 ") || {
-        warn "$(_t "用户取消服务选择，跳过服务启用。" "User cancelled service selection, skipping.")"
+    selected=$(awk '{print $1 "\tprovider: " $2}' "$svc_file" | \
+        fzf_multi " Select services to enable ") || {
+        warn "$(_t "User cancelled service selection, skipping." "User cancelled service selection, skipping.")"
         return
     }
     if [ -z "$selected" ]; then
-        warn "$(_t "未选择任何服务。" "No services selected.")"
+        warn "$(_t "No services selected." "No services selected.")"
         return
     fi
 
@@ -834,10 +1087,14 @@ stage_services() {
         unit=$(echo "$line" | cut -f1 -d"$(printf '\t')" | xargs)
         [ -z "$unit" ] && continue
         provider=$(grep -m1 "^$unit " "$svc_file" | awk '{print $2}')
+        # provider names in the export snapshot are Arch names; remap per family for Debian
+        if [ "$DISTRO_FAMILY" = debian ] && [ -n "${DEB_SVC_PROVIDER[$unit]:-}" ]; then
+            provider="${DEB_SVC_PROVIDER[$unit]}"
+        fi
 
-        # 提供包未装则补装
+        # install the provider package if it is missing
         if [ -n "$provider" ] && ! pkg_installed "$provider"; then
-            log "$(_t "补装服务提供包:" "Installing service provider: ")$provider"
+            log "$(_t "Installing service provider: " "Installing service provider: ")$provider"
             erc=0
             pm_install "$provider" || erc=$?
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
@@ -858,7 +1115,7 @@ stage_services() {
             FAILED_PKGS+=("service:$unit")
             any_failed=1
         fi
-        # libvirtd 附带 socket 一并启用（若存在）
+        # also enable the sockets that ship with libvirtd (if present)
         if [ "$unit" = libvirtd.service ]; then
             for sock in libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket virtlogd.socket virtlockd.socket; do
                 exe systemctl enable "$sock" 2>/dev/null || true
@@ -866,15 +1123,15 @@ stage_services() {
         fi
     done <<< "$selected"
 
-    # 只有本阶段无失败时才标记完成；否则留给下次重试
+    # mark complete only when this stage had no failures; otherwise leave it for the next run to retry
     if [ "$any_failed" -eq 0 ]; then
         stage_mark services
     else
-        warn "$(_t "服务启用阶段存在失败，未标记完成，下次运行将重试。" "Service stage has failures, not marked complete. Will retry.")"
+        warn "$(_t "Service stage has failures, not marked complete. Will retry." "Service stage has failures, not marked complete. Will retry.")"
     fi
 }
 
-# --- 4.5 显示管理器 ly（仅 Arch，默认不装）---
+# --- 4.5 display manager ly (Arch only, not installed by default) ---
 
 stage_dm() {
     if stage_done dm; then return; fi
@@ -883,7 +1140,7 @@ stage_dm() {
         return
     fi
 
-    section "$(_t "显示管理器" "Display Manager")" "$(_t "ly（可选）" "ly (optional)")"
+    section "$(_t "Display Manager" "Display Manager")" "$(_t "ly (optional)" "ly (optional)")"
     local known_dms=(gdm sddm lightdm lxdm ly greetd plasma-login-manager lemurs)
     local dm found=""
     for dm in "${known_dms[@]}"; do
@@ -891,37 +1148,37 @@ stage_dm() {
     done
 
     if [ -n "$found" ]; then
-        info_kv "$(_t "DM 冲突" "DM Conflict")" "$found" "已存在，跳过 ly"
+        info_kv "$(_t "DM Conflict" "DM Conflict")" "$found" "exists, skip ly"
     elif [ "$DRY_RUN" -eq 1 ]; then
-        # dry-run：跳过交互默认 N；告知用户若想装可去掉 --dry-run
-        log "$(_t "[DRY-RUN] 跳过 ly 安装（默认 N）。若需实际安装，请去掉 --dry-run 重跑。" "[DRY-RUN] skipping ly (default N). Remove --dry-run to install.")"
+        # dry-run: skip interaction with default N; tell the user to remove --dry-run to actually install
+        log "$(_t "[DRY-RUN] skipping ly (default N). Remove --dry-run to install." "[DRY-RUN] skipping ly (default N). Remove --dry-run to install.")"
         DRY_SVCS+=("ly@tty1")
-    elif confirm "$(_t "安装并启用 ly 显示管理器？[y/N] (默认 N, 20s):" "Install & enable ly DM? [y/N] (default N, 20s):")" "N" 20; then
+    elif confirm "$(_t "Install & enable ly DM? [y/N] (default N, 20s):" "Install & enable ly DM? [y/N] (default N, 20s):")" "N" 20; then
         if pm_install ly && exe systemctl enable ly@tty1; then
             ENABLED_SVCS+=("ly@tty1")
         else
             FAILED_PKGS+=("dm:ly")
         fi
     else
-        log "$(_t "跳过 ly。无显示管理器时，tty 登录后执行 niri-session 即可进桌面。" "Skipping ly. Without DM, run niri-session from tty.")"
+        log "$(_t "Skipping ly. Without DM, run niri-session from tty." "Skipping ly. Without DM, run niri-session from tty.")"
     fi
     stage_mark dm
 }
 
-# --- 4.6 配置快照（部署前备份）---
+# --- 4.6 config snapshot (backup before deploy) ---
 
 stage_backup() {
     if stage_done backup; then return; fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "$(_t "[DRY-RUN] 跳过配置备份阶段。" "[DRY-RUN] Skipping config backup.")"
+        log "$(_t "[DRY-RUN] Skipping config backup." "[DRY-RUN] Skipping config backup.")"
         stage_mark backup
         return
     fi
 
-    section "$(_t "配置快照" "Config Snapshot")" "$(_t "部署前创建回滚点" "Create rollback point before deploy")"
+    section "$(_t "Config Snapshot" "Config Snapshot")" "$(_t "Create rollback point before deploy" "Create rollback point before deploy")"
     local snap_cfg="$BASE_DIR/config"
     if [ ! -d "$snap_cfg/.config" ]; then
-        warn "$(_t "未找到 config/ 配置镜像，跳过备份。" "config/ mirror not found, skipping backup.")"
+        warn "$(_t "config/ mirror not found, skipping backup." "config/ mirror not found, skipping backup.")"
         stage_mark backup
         return
     fi
@@ -931,7 +1188,7 @@ stage_backup() {
     local tgz="$BACKUP_DIR/snapshot-$ts.tar.gz"
     mkdir -p "$BACKUP_DIR"
 
-    # 收集将被打包覆盖的现有配置路径
+    # collect existing config paths that will be overwritten and packed
     local targets=()
     shopt -s nullglob dotglob
     local item name
@@ -947,26 +1204,26 @@ stage_backup() {
     shopt -u nullglob dotglob
 
     if [ ${#targets[@]} -eq 0 ]; then
-        log "$(_t "没有已有配置需要备份（目标为空），跳过。" "No existing config to backup, skipping.")"
-    elif confirm "$(_t "备份当前已有配置到快照以备回滚？[Y/n] (默认 Y, 15s):" "Backup current config to snapshot? [Y/n] (default Y, 15s):")" "Y" 15; then
+        log "$(_t "No existing config to backup, skipping." "No existing config to backup, skipping.")"
+    elif confirm "$(_t "Backup current config to snapshot? [Y/n] (default Y, 15s):" "Backup current config to snapshot? [Y/n] (default Y, 15s):")" "Y" 15; then
         if exe tar czf "$tgz" -C / "${targets[@]#/}" 2>/dev/null; then
-            success "$(_t "快照已保存:" "Snapshot saved: ") $tgz"
-            info_kv "$(_t "备份项数" "Backup Items")" "${#targets[@]} 个"
+            success "$(_t "Snapshot saved: " "Snapshot saved: ") $tgz"
+            info_kv "$(_t "Backup Items" "Backup Items")" "${#targets[@]} items"
         else
-            warn "$(_t "快照创建失败，将继续部署（无回滚点）。" "Snapshot creation failed, continuing without rollback point.")"
+            warn "$(_t "Snapshot creation failed, continuing without rollback point." "Snapshot creation failed, continuing without rollback point.")"
         fi
     else
-        log "$(_t "跳过备份，继续部署。" "Skipping backup, continuing.")"
+        log "$(_t "Skipping backup, continuing." "Skipping backup, continuing.")"
     fi
     stage_mark backup
 }
 
-# --- 4.7 配置部署 ---
+# --- 4.7 config deploy ---
 
-deploy_one() { # $1 = 源路径, $2 = 目标路径
+deploy_one() { # $1 = source path, $2 = destination path
     local src="$1" dst="$2" ts="$3"
     if [ -e "$dst" ] || [ -L "$dst" ]; then
-        log "$(_t "备份已有:" "Backup existing: ")$dst -> $dst.bak-$ts"
+        log "$(_t "Backup existing: " "Backup existing: ")$dst -> $dst.bak-$ts"
         exe mv "$dst" "$dst.bak-$ts"
     fi
     exe cp -r "$src" "$dst"
@@ -975,16 +1232,16 @@ deploy_one() { # $1 = 源路径, $2 = 目标路径
 
 stage_configs() {
     if stage_done configs; then
-        log "$(_t "配置部署阶段已完成，跳过。" "Config deploy stage done, skipping.")"
+        log "$(_t "Config deploy stage done, skipping." "Config deploy stage done, skipping.")"
         return
     fi
     local snap="$BASE_DIR/config"
     if [ ! -d "$snap" ]; then
-        warn "$(_t "未找到 config/ 配置镜像，跳过部署。" "config/ mirror not found, skipping deploy.")"
+        warn "$(_t "config/ mirror not found, skipping deploy." "config/ mirror not found, skipping deploy.")"
         return
     fi
 
-    section "$(_t "配置部署" "Config Deploy")" "目标: $HOME_DIR"
+    section "$(_t "Config Deploy" "Config Deploy")" "Target: $HOME_DIR"
     local ts
     ts=$(date +%Y%m%d-%H%M%S)
 
@@ -995,26 +1252,26 @@ stage_configs() {
         name=$(basename "$item")
         deploy_one "$item" "$HOME_DIR/.config/$name" "$ts"
     done
-    # ~/.local/share/<name>（niri-session 修复版等）
+    # ~/.local/share/<name> (fixed niri-session etc.)
     for item in "$snap/.local/share"/*; do
         name=$(basename "$item")
         [ -d "$item" ] || continue
         mkdir -p "$HOME_DIR/.local/share"
         deploy_one "$item" "$HOME_DIR/.local/share/$name" "$ts"
     done 2>/dev/null
-    # ~/.local/share/applications（自定义 desktop 文件）
+    # ~/.local/share/applications (custom desktop files)
     for item in "$snap/.local/share/applications"/*; do
         [ -f "$item" ] || continue
         mkdir -p "$HOME_DIR/.local/share/applications"
         deploy_one "$item" "$HOME_DIR/.local/share/applications/$(basename "$item")" "$ts"
     done 2>/dev/null
-    # ~/.local/bin（修复版 niri-session 等）
+    # ~/.local/bin (fixed niri-session etc.)
     for item in "$snap/.local/bin"/*; do
         [ -f "$item" ] || continue
         mkdir -p "$HOME_DIR/.local/bin"
         deploy_one "$item" "$HOME_DIR/.local/bin/$(basename "$item")" "$ts"
     done 2>/dev/null
-    # 家目录散文件（如 .pam_environment）
+    # home dotfiles (e.g. .pam_environment)
     for item in "$snap"/.*; do
         name=$(basename "$item")
         [[ "$name" = "." || "$name" = ".." || "$name" = ".config" ]] && continue
@@ -1023,47 +1280,47 @@ stage_configs() {
     done
     shopt -u nullglob dotglob
 
-    # PipeWire 用户服务自启（若已安装音频组）
+    # enable PipeWire user services (if the audio group was installed)
     local _pw=0
     for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
         [ "$_p" = "pipewire-pulse" ] || [ "$_p" = "wireplumber" ] && _pw=1
     done
     if [ "$_pw" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
-        log "$(_t "启用 PipeWire 用户服务..." "Enabling PipeWire user services...")"
+        log "$(_t "Enabling PipeWire user services..." "Enabling PipeWire user services...")"
         as_user systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service 2>/dev/null || true
     fi
-    # zsh 设为默认 shell（若已安装 zsh 且当前不是 zsh）
+    # set zsh as the default shell (if zsh is installed and is not already the shell)
     for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
         if [ "$_p" = "zsh" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != "/usr/bin/zsh" ]; then
-            exe chsh -s /usr/bin/zsh "$TARGET_USER" 2>/dev/null || warn "$(_t "zsh 设为默认 shell 失败" "Failed to set zsh as default shell")"
+            exe chsh -s /usr/bin/zsh "$TARGET_USER" 2>/dev/null || warn "$(_t "Failed to set zsh as default shell" "Failed to set zsh as default shell")"
             break
         fi
     done
 
-    success "$(_t "配置部署完成。" "Config deploy complete.")"
+    success "$(_t "Config deploy complete." "Config deploy complete.")"
     stage_mark configs
 }
 
-# --- 4.8 硬件适配（自动检测输出/分辨率）---
+# --- 4.8 hardware adapt (auto-detect output/resolution) ---
 
 stage_hardware_adapt() {
     if stage_done hwadapt; then return; fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "$(_t "[DRY-RUN] 跳过硬件适配。" "[DRY-RUN] Skipping hardware adapt.")"
+        log "$(_t "[DRY-RUN] Skipping hardware adapt." "[DRY-RUN] Skipping hardware adapt.")"
         stage_mark hwadapt
         return
     fi
     if [ ! -d /sys/class/drm ] || [ -z "$(ls /sys/class/drm/card*-*/status 2>/dev/null)" ]; then
-        log "$(_t "无 DRM 设备，跳过硬件适配。" "No DRM device, skipping hardware adapt.")"
+        log "$(_t "No DRM device, skipping hardware adapt." "No DRM device, skipping hardware adapt.")"
         stage_mark hwadapt
         return
     fi
 
-    section "$(_t "硬件适配" "Hardware Adapt")" "$(_t "自动检测显示器" "Auto-detect display")"
+    section "$(_t "Hardware Adapt" "Hardware Adapt")" "$(_t "Auto-detect display" "Auto-detect display")"
     local niri_cfg="$HOME_DIR/.config/niri/config.kdl"
     local waybar_cfg="$HOME_DIR/.config/waybar/config"
 
-    # --- 1) 检测实际输出名 + 分辨率 ---
+    # --- 1) detect the actual output name + resolution ---
     local detected_out="" detected_mode="" p
     for p in /sys/class/drm/card*-*/status; do
         [ "$(cat "$p" 2>/dev/null)" = "connected" ] || continue
@@ -1075,12 +1332,12 @@ stage_hardware_adapt() {
     done
 
     if [ -z "$detected_out" ]; then
-        warn "$(_t "未检测到已连接的显示器，跳过适配。" "No connected display found, skipping adapt.")"
+        warn "$(_t "No connected display found, skipping adapt." "No connected display found, skipping adapt.")"
         stage_mark hwadapt
         return
     fi
 
-    # 分辨率格式：1920x1080 → mode "1920x1080@60"
+    # resolution format: 1920x1080 -> mode "1920x1080@60"
     local mode_line=""
     if [ -n "$detected_mode" ]; then
         local w h refresh
@@ -1091,15 +1348,15 @@ stage_hardware_adapt() {
         mode_line="mode \"${w}x${h}@${refresh}\""
     fi
 
-    info_kv "$(_t "检测到输出" "Detected output")" "$detected_out" "${detected_mode:-?}"
+    info_kv "$(_t "Detected output" "Detected output")" "$detected_out" "${detected_mode:-?}"
 
-    # --- 2) 修复 niri config ---
+    # --- 2) fix niri config ---
     if [ -f "$niri_cfg" ]; then
-        log "$(_t "适配 niri 输出配置..." "Adapting niri output config...")"
-        # 备份
+        log "$(_t "Adapting niri output config..." "Adapting niri output config...")"
+        # backup
         cp "$niri_cfg" "$niri_cfg.bak-hw-$(date +%Y%m%d-%H%M%S)"
 
-        # 找到第一个活跃 output 块，替换输出名和 mode
+        # find the first active output block and replace its name and mode
         local tmp
         tmp=$(mktemp)
         register_temp_path "$tmp"
@@ -1113,7 +1370,7 @@ stage_hardware_adapt() {
                 continue
             fi
             if [ "$in_first_output" -eq 1 ]; then
-                # 跳过原 output 块内的 mode 行
+                # skip mode lines inside the original output block
                 if echo "$line" | grep -qP '^\s*mode\s+"'; then
                     [ -z "$mode_line" ] && echo "$line" >> "$tmp"
                     continue
@@ -1123,10 +1380,10 @@ stage_hardware_adapt() {
                     [ -n "$mode_line" ] && echo "}" >> "$tmp" || echo "}" >> "$tmp"
                     continue
                 fi
-                # 跳过 output 块内的其他内容（留给新空块）
+                # skip other content inside the output block (left for the new empty block)
                 continue
             fi
-            # 第二个及以后的 output 块注释掉
+            # comment out the 2nd and later output blocks
             if [ "$found_output" -eq 1 ] && echo "$line" | grep -qP '^\s*output\s+"'; then
                 echo "/-output $(echo "$line" | sed 's/^\s*output\s*//')" >> "$tmp"
                 continue
@@ -1135,40 +1392,40 @@ stage_hardware_adapt() {
         done < "$niri_cfg"
         mv "$tmp" "$niri_cfg"
         exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$niri_cfg"
-        success "$(_t "niri 输出已适配" "niri output adapted")"
+        success "$(_t "niri output adapted" "niri output adapted")"
     fi
 
-    # --- 3) 修复 waybar config 硬件 sink ---
+    # --- 3) fix the hardware sink in waybar config ---
     if [ -f "$waybar_cfg" ]; then
         if grep -q 'ignored-sinks' "$waybar_cfg" 2>/dev/null; then
             sed -i 's/^\(\s*"ignored-sinks":[^]]*\]\)/\/* \1 *\//' "$waybar_cfg"
-            log "$(_t "waybar ignored-sinks 已注释" "waybar ignored-sinks commented")"
+            log "$(_t "waybar ignored-sinks commented" "waybar ignored-sinks commented")"
         fi
     fi
 
-    # GPU 驱动提示
+    # GPU driver hint
     if command -v lspci &>/dev/null; then
         local gpu_info
         gpu_info=$(lspci | grep -E -i 'vga|3d|display' 2>/dev/null | head -2)
-        [ -n "$gpu_info" ] && info_kv "$(_t "检测到 GPU" "GPU detected")" "$(echo "$gpu_info" | head -1 | cut -d: -f3- | xargs)" ""
+        [ -n "$gpu_info" ] && info_kv "$(_t "GPU detected" "GPU detected")" "$(echo "$gpu_info" | head -1 | cut -d: -f3- | xargs)" ""
     fi
 
     stage_mark hwadapt
 }
 
-# --- 4.9 装后验证（对账 + 配置审计）---
+# --- 4.9 post-install verification (package audit + config audit) ---
 
 stage_verify() {
     if stage_done verify; then return; fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "$(_t "[DRY-RUN] 跳过验证阶段。" "[DRY-RUN] Skipping verification.")"
+        log "$(_t "[DRY-RUN] Skipping verification." "[DRY-RUN] Skipping verification.")"
         return
     fi
 
-    section "$(_t "验证" "Verification")" "$(_t "安装对账 & 配置审计" "Install Audit & Config Audit")"
+    section "$(_t "Verification" "Verification")" "$(_t "Install Audit & Config Audit" "Install Audit & Config Audit")"
     local missing=()
 
-    # 包对账
+    # package audit
     local all_sel=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
     if [ ${#all_sel[@]} -gt 0 ]; then
         if [ "$DISTRO_FAMILY" = arch ]; then
@@ -1178,66 +1435,76 @@ stage_verify() {
         else
             local p name
             for p in "${all_sel[@]}"; do
-                [ -n "${RHEL_MANUAL[$p]:-}" ] && continue
-                name="${RHEL_MAP[$p]:-$p}"
                 [ -n "${PIP_PKGS[$p]:-}" ] && continue
+                # niri may be installed via dnf/prebuilt/source; check by PATH (common to Debian/RHEL)
+                if [ "$p" = "niri" ]; then
+                    command -v niri >/dev/null 2>&1 || missing+=("niri")
+                    continue
+                fi
+                if [ "$DISTRO_FAMILY" = rhel ]; then
+                    [ -n "${RHEL_MANUAL[$p]:-}" ] && continue
+                    name="${RHEL_MAP[$p]:-$p}"
+                else
+                    [ -n "${DEB_MANUAL[$p]:-}" ] && continue
+                    name="${DEB_MAP[$p]:-$p}"
+                fi
                 pkg_installed "$name" || missing+=("$name")
             done
         fi
     fi
     if [ ${#missing[@]} -gt 0 ]; then
-        warn "$(_t "以下所选包未能装上:" "Selected packages failed to install:")"
+        warn "$(_t "Selected packages failed to install:" "Selected packages failed to install:")"
         for p in "${missing[@]}"; do echo -e "     ${H_RED}->${NC} ${H_YELLOW}$p${NC}"; done
     else
-        success "$(_t "所选软件包对账通过。" "Package audit passed.")"
+        success "$(_t "Package audit passed." "Package audit passed.")"
     fi
 
-    # 配置审计
+    # config audit
     local cfg_errors=0 d
     for d in niri waybar kitty mako hypr; do
         if [ -e "$HOME_DIR/.config/$d" ]; then
             log "  [OK] $HOME_DIR/.config/$d"
         else
-            echo -e "     ${H_RED}->${NC} ${H_YELLOW}$HOME_DIR/.config/$d 缺失${NC}"
+            echo -e "     ${H_RED}->${NC} ${H_YELLOW}$HOME_DIR/.config/$d missing${NC}"
             cfg_errors=$((cfg_errors+1))
         fi
     done
-    [ "$cfg_errors" -eq 0 ] && success "$(_t "配置审计通过。" "Config audit passed.")" || warn "$cfg_errors 个关键配置目录缺失。"
+    [ "$cfg_errors" -eq 0 ] && success "$(_t "Config audit passed." "Config audit passed.")" || warn "$cfg_errors critical config directories missing."
     stage_mark verify
 }
 
-# --- 4.10 汇总报告 ---
+# --- 4.10 summary report ---
 
 print_summary() {
-    section "$(_t "汇总报告" "Summary")" "$(_t "eilNiri restore" "eilNiri restore")"
-    info_kv "$(_t "已安装包" "Installed")" "${#INSTALLED_PKGS[@]} 个"
-    info_kv "$(_t "已跳过" "Skipped")" "${#SKIPPED_PKGS[@]} 个"
-    info_kv "$(_t "已启用服务" "Enabled Services")" "${#ENABLED_SVCS[@]} 项"
+    section "$(_t "Summary" "Summary")" "$(_t "eilNiri restore" "eilNiri restore")"
+    info_kv "$(_t "Installed" "Installed")" "${#INSTALLED_PKGS[@]} packages"
+    info_kv "$(_t "Skipped" "Skipped")" "${#SKIPPED_PKGS[@]} packages"
+    info_kv "$(_t "Enabled Services" "Enabled Services")" "${#ENABLED_SVCS[@]} services"
     if [ ${#ENABLED_SVCS[@]} -gt 0 ]; then
         printf "     ${DIM}%s${NC}\n" "${ENABLED_SVCS[@]}"
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        info_kv "$(_t "[DRY-RUN] 将装包" "[DRY-RUN] Will install")" "${#DRY_PKGS[@]} 个"
+        info_kv "$(_t "[DRY-RUN] Will install" "[DRY-RUN] Will install")" "${#DRY_PKGS[@]} packages"
         if [ ${#DRY_PKGS[@]} -gt 0 ]; then
             printf "     ${DIM}%s${NC}\n" "${DRY_PKGS[@]}"
         fi
-        info_kv "$(_t "[DRY-RUN] 将启用服务" "[DRY-RUN] Will enable services")" "${#DRY_SVCS[@]} 项"
+        info_kv "$(_t "[DRY-RUN] Will enable services" "[DRY-RUN] Will enable services")" "${#DRY_SVCS[@]} services"
         if [ ${#DRY_SVCS[@]} -gt 0 ]; then
             printf "     ${DIM}%s${NC}\n" "${DRY_SVCS[@]}"
         fi
     fi
     if [ ${#FAILED_PKGS[@]} -gt 0 ]; then
-        warn "失败 ${#FAILED_PKGS[@]} 项:"
+        warn "Failed ${#FAILED_PKGS[@]} items:"
         printf "     ${H_RED}->${NC} %s\n" "${FAILED_PKGS[@]}"
     fi
     if [ ${#MANUAL_ITEMS[@]} -gt 0 ]; then
-        warn "需手动安装 ${#MANUAL_ITEMS[@]} 项:"
+        warn "Manual install needed (${#MANUAL_ITEMS[@]}):"
         printf "     ${H_YELLOW}->${NC} %s\n" "${MANUAL_ITEMS[@]}"
     fi
     echo ""
-    info_kv "$(_t "日志" "Log")" "$TEMP_LOG_FILE"
-    info_kv "$(_t "进度文件" "Progress File")" "$STATE_FILE" "(全部完成后可删除)"
-    echo -e "   ${H_YELLOW}>>> 建议重启系统后进入 niri 桌面。${NC}"
+    info_kv "$(_t "Log" "Log")" "$TEMP_LOG_FILE"
+    info_kv "$(_t "Progress File" "Progress File")" "$STATE_FILE" "(delete after everything completes)"
+    echo -e "   ${H_YELLOW}>>> It is recommended to reboot and enter the niri desktop. ${NC}"
 }
 
 do_restore() {
@@ -1245,11 +1512,11 @@ do_restore() {
     check_root
     detect_distro
 
-    section "$(_t "Restore" "Restore")" "$(_t "重现 niri 桌面环境" "Restore Niri Desktop")"
-    [ "$DRY_RUN" -eq 1 ] && warn "$(_t "DRY-RUN 模式：只打印计划，不实际改动系统。" "DRY-RUN mode: printing plan only, no changes.")"
+    section "$(_t "Restore" "Restore")" "$(_t "Restore Niri Desktop" "Restore Niri Desktop")"
+    [ "$DRY_RUN" -eq 1 ] && warn "$(_t "DRY-RUN mode: printing plan only, no changes." "DRY-RUN mode: printing plan only, no changes.")"
     show_logo
 
-    # 先更新系统（新机器包数据库旧，直接装 fzf 可能失败）
+    # update the system first (a fresh machine has a stale package db, so installing fzf directly may fail)
     stage_preflight
     ensure_fzf
     detect_target_user
@@ -1263,7 +1530,7 @@ do_restore() {
     stage_configs
     stage_hardware_adapt
     stage_verify
-    # 清理 pacman 缓存，释放磁盘空间
+    # clean the pacman cache to free disk space
     [ "$DISTRO_FAMILY" = arch ] && exe pacman -Sc --noconfirm 2>/dev/null || true
     print_summary
 }
@@ -1274,16 +1541,16 @@ do_rollback() {
     detect_distro
     detect_target_user
 
-    section "$(_t "Rollback" "Rollback")" "$(_t "配置回滚" "Config Rollback")"
+    section "$(_t "Rollback" "Rollback")" "$(_t "Config Rollback" "Config Rollback")"
     if [ ! -d "$BACKUP_DIR" ]; then
-        error "未找到任何快照（$BACKUP_DIR 不存在）。"
+        error "No snapshots found ($BACKUP_DIR does not exist)."
         exit 1
     fi
 
     local snapshots=()
     mapfile -t snapshots < <(find "$BACKUP_DIR" -maxdepth 1 -name 'snapshot-*.tar.gz' -printf '%T@ %f\n' 2>/dev/null | sort -rn | awk '{print $2}')
     if [ ${#snapshots[@]} -eq 0 ]; then
-        error "$(_t "未找到任何快照文件。" "No snapshot files found.")"
+        error "$(_t "No snapshot files found." "No snapshot files found.")"
         exit 1
     fi
 
@@ -1296,20 +1563,20 @@ do_rollback() {
 
     ensure_fzf
     local selected
-    selected=$(printf "%s\n" "${lines[@]}" | fzf_single " 选择要恢复的快照 ") || {
-        warn "$(_t "用户取消。" "User cancelled.")"
+    selected=$(printf "%s\n" "${lines[@]}" | fzf_single " Select snapshot to restore ") || {
+        warn "$(_t "User cancelled." "User cancelled.")"
         return
     }
     if [ -z "$selected" ]; then
-        warn "$(_t "未选择快照。" "No snapshot selected.")"
+        warn "$(_t "No snapshot selected." "No snapshot selected.")"
         return
     fi
     local snapshot
     snapshot=$(echo "$selected" | cut -f1 -d"$(printf '\t')" | head -1)
 
-    section "$(_t "恢复中" "Restoring")" "$snapshot"
-    if ! confirm "$(_t "确认从快照 ${snapshot} 恢复配置？[y/N] (默认 N, 15s):" "Confirm restore from snapshot ${snapshot}? [y/N] (default N, 15s):")" "N" 15; then
-        log "$(_t "取消回滚。" "Rollback cancelled.")"
+    section "$(_t "Restoring" "Restoring")" "$snapshot"
+    if ! confirm "$(_t "Confirm restore from snapshot ${snapshot}? [y/N] (default N, 15s):" "Confirm restore from snapshot ${snapshot}? [y/N] (default N, 15s):")" "N" 15; then
+        log "$(_t "Rollback cancelled." "Rollback cancelled.")"
         return
     fi
 
@@ -1320,7 +1587,7 @@ do_rollback() {
     workdir=$(mktemp -d)
     register_temp_path "$workdir"
 
-    exe tar xzf "$tgz" -C "$workdir" || { error "$(_t "解包快照失败。" "Failed to extract snapshot.")"; exit 1; }
+    exe tar xzf "$tgz" -C "$workdir" || { error "$(_t "Failed to extract snapshot." "Failed to extract snapshot.")"; exit 1; }
 
     local item name target
     shopt -s nullglob dotglob
@@ -1333,7 +1600,7 @@ do_rollback() {
         exe cp -r "$item" "$target"
         exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
     done
-    # ~/.local/share/ 恢复（niri-session 修复版等）
+    # restore ~/.local/share/ (fixed niri-session etc.)
     for item in "$workdir"/home/*/.local/share/*/*; do
         [ -f "$item" ] && continue
         name=$(basename "$item")
@@ -1357,7 +1624,7 @@ do_rollback() {
         exe cp "$item" "$target"
         exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
     done 2>/dev/null
-    # 家目录散文件
+    # home dotfiles
     for item in "$workdir"/home/*/.*; do
         name=$(basename "$item")
         [[ "$name" = "." || "$name" = ".." ]] && continue
@@ -1371,7 +1638,7 @@ do_rollback() {
     done
     shopt -u nullglob dotglob
 
-    success "配置已从快照 $snapshot 恢复。原有配置备份为 .bak-$ts"
+    success "Config restored from snapshot $snapshot. Previous config backed up as .bak-$ts"
 }
 
 # ==============================================================================
@@ -1379,7 +1646,6 @@ do_rollback() {
 # ==============================================================================
 
 usage() {
-    if [ "$TTY_MODE" = "1" ]; then
     cat <<'EOF'
 eilNiri replicate.sh — niri desktop environment replication tool
 
@@ -1396,30 +1662,9 @@ Options:
 Workflow:
   1. On current Arch machine:   ./replicate.sh export
   2. Bring the eilNiri dir to new machine (git / USB / rsync)
-  3. On new machine (Arch/RHEL): sudo ./replicate.sh restore
+  3. On new machine (Arch/RHEL/Debian): sudo ./replicate.sh restore
   4. Rollback config:            sudo ./replicate.sh rollback
 EOF
-    else
-    cat <<'EOF'
-eilNiri replicate.sh —— niri 桌面环境复制工具
-
-用法:
-  ./replicate.sh export  [--keep-typos]   采集快照（普通用户，只读系统不改动）
-  ./replicate.sh restore [--dry-run]      在新系统重现桌面（需 root）
-  ./replicate.sh rollback                 从已有快照回滚配置（需 root）
-  ./replicate.sh --help                   显示本帮助
-
-选项:
-  --dry-run      restore 只打印将执行的操作，不实际安装/启用/部署
-  --keep-typos   export 时保留配置原样，不修正已知笔误
-
-流程:
-  1. 在当前 Arch 机器:   ./replicate.sh export
-  2. 把整个 eilNiri 目录带到新机器（git / U盘均可）
-  3. 在新机器(Arch/RHEL系): sudo ./replicate.sh restore
-  4. 回滚配置:           sudo ./replicate.sh rollback
-EOF
-    fi
 }
 
 main() {
@@ -1430,7 +1675,7 @@ main() {
             --dry-run)      DRY_RUN=1 ;;
             --keep-typos)   KEEP_TYPOS=1 ;;
             -h|--help)      usage; exit 0 ;;
-            *) error "$(_t "未知参数:" "Unknown argument: ") $arg"; usage; exit 1 ;;
+            *) error "$(_t "Unknown argument: " "Unknown argument: ") $arg"; usage; exit 1 ;;
         esac
     done
 

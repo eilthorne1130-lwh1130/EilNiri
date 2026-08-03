@@ -1,6 +1,6 @@
 # EilNiri
 
-在新装的 **Arch 系** / **RHEL 系** 系统上一键配置 Niri 桌面环境。全量预编译安装，零编译、零 AUR 构建。自动适配显示器、输入法中文组件可选、服务自启、字体渲染、TTY 英文模式。
+在新装的 **Arch 系** / **RHEL 系** / **Debian 系**（Debian/Ubuntu）系统上一键配置 Niri 桌面环境。Arch 系与 Fedora 全量预编译安装、零 AUR 构建；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上，niri 自动走官方预编译二进制或官方 vendored 源码离线编译。自动适配显示器、输入法中文组件可选、服务自启、字体渲染。
 
 ## 快速开始
 
@@ -10,7 +10,7 @@
 
 # 2. 把整个 EilNiri 目录带到新机器（git clone / U盘 任意方式）
 
-# 3. 在新机器安装（需要 root，显示 EilNiri Logo）
+# 3. 在新机器安装（需要 root，Arch/RHEL/Debian 系自动识别，显示 EilNiri Logo）
 sudo ./install.sh restore
 
 # 4. 回滚配置
@@ -56,7 +56,7 @@ sudo ./install.sh rollback
 
 ## restore 流程（共 10 步）
 
-1. **Logo 展示** → **Pre-Flight**：pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新
+1. **Logo 展示** → **Pre-Flight**：Arch 系（pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新）；RHEL 系（dnf upgrade）；Debian 系（apt-get update + upgrade，确保 curl/tar）
 2. **目标用户检测**：默认 UID 1000，30s 超时可选创建新用户
 3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）
 4. **服务启用**：fzf 选择系统服务 → `systemctl enable --now`
@@ -69,9 +69,30 @@ sudo ./install.sh rollback
 
 ## RHEL 系支持
 
-- 包名自动翻译
+- 包名自动翻译（如 `ttf-jetbrains-mono-nerd` → `jetbrains-mono-nerd-fonts`）
 - 无 RPM 对应包列入手动安装报告
 - waypaper 走 pip3 兜底
+- **Fedora**：niri / hyprlock / hypridle / xwayland-satellite 官方仓库都有，`dnf` 直接装
+- **Rocky / Alma / CentOS Stream**：这些包默认仓库没有——niri 自动回退官方预编译/源码编译安装；hyprlock/hypridle/xwayland-satellite 给出 EPEL / Copr / 手动指引
+
+## Debian 系支持（Debian 12/13 / Ubuntu 24.04+）
+
+- **包名自动翻译**：
+
+| Arch 包名 | Debian/Ubuntu 包名 |
+|---|---|
+| mako | mako-notifier |
+| fcitx5-configtool | fcitx5-config-qt |
+| ttf-jetbrains-mono-nerd | fonts-jetbrains-mono |
+| wqy-zenhei | fonts-wqy-zenhei |
+| libnotify | libnotify-bin |
+| polkit-gnome | polkit-gnome |
+
+- **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若该版本未发布预编译包（官方现已只发源码包），自动装 Rust 工具链 + 构建依赖，用官方 `vendored-dependencies` 源码包离线 `cargo build` 编译（约 10-20 分钟）；两者都失败才列入"需手动安装"报告。
+- **hyprlock / hypridle / xwayland-satellite**：Debian/Ubuntu 稳定仓库没有（仅 Debian 13 backports、testing、Ubuntu 26.04+ 有前两者）。restore 会先尝试 apt 安装，失败则给出 backports / 手动编译提示。
+- **PEP 668**：waypaper 的 pip 安装自动加 `--break-system-packages`（Debian/Ubuntu 默认阻止系统级 pip）。
+- **服务提供包**：`libvirtd.service` 的提供包按家族映射（Debian 为 `libvirt-daemon-system`）。
+- awww / satty / rime-ice / ly 无官方 .deb，列入"需手动安装"报告。
 
 ## 硬件自动适配
 
@@ -83,14 +104,6 @@ sudo ./install.sh rollback
 | waybar sink | 硬件 ALSA sink 自动注释 |
 | GPU 检测 | `lspci` → info 显示显卡型号 |
 | niri-session | 修复 `import-environment` 弃用警告 |
-
-## TTY 支持
-
-纯 TTY 下自动切换英文纯文本，避免乱码。`TTY_MODE=1` 可手动强制：
-
-```bash
-TTY_MODE=1 sudo ./install.sh restore
-```
 
 ## 产物结构
 
@@ -106,19 +119,19 @@ EilNiri/
 
 ## 系统要求
 
-| | Arch 系 | RHEL 系 |
-|---|---|---|
-| 包管理 | pacman | dnf |
-| fzf | 自动安装 | 自动安装 |
-| root | restore/rollback 需要 | restore/rollback 需要 |
+| | Arch 系 | RHEL 系 | Debian 系 |
+|---|---|---|---|
+| 包管理 | pacman | dnf | apt-get |
+| fzf | 自动安装 | 自动安装 | 自动安装 |
+| root | restore/rollback 需要 | restore/rollback 需要 | restore/rollback 需要 |
 
 ## 注意事项
 
-- 预编译安装，无需 base-devel / yay
+- Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 可能需要离线源码编译（约 10-20 分钟）
 - export 默认修正 niri config 两处笔误，live 配置不受影响
 - 壁纸图片不在快照内
 - 中断恢复：重跑自动跳过已完成阶段，删除 `.replicate_progress` 可强制全量重跑
-- dry-run：不对系统做任何改动
+- dry-run：不对系统做任何改动（唯一例外：fzf 是交互前提，dry-run 下也会实际安装）
 - 临时文件在退出时自动清理（sudoers、构建目录、解包目录）
 - 日志：`~/.local/state/eilNiri/replicate.log`，自动截断保留最近 800 行
 
