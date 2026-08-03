@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# eilNiri - replicate.sh
+# eilNiri - install.sh
 #
 #   Collects this machine's niri desktop suite (packages + desktop config +
 #   system services) into a snapshot, then reproduces it one-click on a fresh
 #   Arch / RHEL / Debian family system.
 #
 #   Usage:
-#     ./replicate.sh export  [--keep-typos]   create snapshot (normal user, read-only)
-#     ./replicate.sh restore [--dry-run]      restore on new system (root)
-#     ./replicate.sh rollback                 rollback config from snapshot (root)
-#     ./replicate.sh --help
+#     ./install.sh export  [--keep-typos]   create snapshot (normal user, read-only)
+#     ./install.sh restore [--dry-run]      restore on new system (root)
+#     ./install.sh rollback                 rollback config from snapshot (root)
+#     ./install.sh --help
 #
 #   Snapshot outputs (export generates them next to this script):
 #     pkglist/official.txt   official repo packages
@@ -400,7 +400,7 @@ DESKTOP_EOF
     section "$(_t "Export Done" "Export Done")" "$(_t "Snapshot Created" "Snapshot Created")"
     info_kv "$(_t "Pkglist" "Pkglist")" "$SNAP_PKGLIST/"
     info_kv "$(_t "Config Mirror" "Config Mirror")" "$SNAP_CONFIG/"
-    log "Next: copy the eilNiri directory to the new machine and run ${BOLD}sudo ./replicate.sh restore${NC}"
+    log "Next: copy the eilNiri directory to the new machine and run ${BOLD}sudo ./install.sh restore${NC}"
 }
 
 # ==============================================================================
@@ -415,7 +415,7 @@ HOME_DIR=""
 
 check_root() {
     if [ "$EUID" -ne 0 ]; then
-        error "$(_t "restore requires root. Use: sudo ./replicate.sh restore" "restore requires root. Use: sudo ./replicate.sh restore")"
+        error "$(_t "restore requires root. Use: sudo ./install.sh restore" "restore requires root. Use: sudo ./install.sh restore")"
         exit 1
     fi
 }
@@ -1647,23 +1647,23 @@ do_rollback() {
 
 usage() {
     cat <<'EOF'
-eilNiri replicate.sh — niri desktop environment replication tool
+eilNiri install.sh — niri desktop environment replication tool
 
 Usage:
-  ./replicate.sh export  [--keep-typos]   create snapshot (normal user, read-only)
-  ./replicate.sh restore [--dry-run]      restore desktop on new system (root)
-  ./replicate.sh rollback                 rollback from existing snapshot (root)
-  ./replicate.sh --help                   show this help
+  ./install.sh export  [--keep-typos]   create snapshot (normal user, read-only)
+  ./install.sh restore [--dry-run]      restore desktop on new system (root)
+  ./install.sh rollback                 rollback from existing snapshot (root)
+  ./install.sh --help                   show this help
 
 Options:
   --dry-run      print plan only, no actual install/enable/deploy
   --keep-typos   keep config as-is during export, skip typo fixes
 
 Workflow:
-  1. On current Arch machine:   ./replicate.sh export
+  1. On current Arch machine:   ./install.sh export
   2. Bring the eilNiri dir to new machine (git / USB / rsync)
-  3. On new machine (Arch/RHEL/Debian): sudo ./replicate.sh restore
-  4. Rollback config:            sudo ./replicate.sh rollback
+  3. On new machine (Arch/RHEL/Debian): sudo ./install.sh restore
+  4. Rollback config:            sudo ./install.sh rollback
 EOF
 }
 
