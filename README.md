@@ -62,7 +62,7 @@ sudo ./install.sh rollback
 2. **目标用户检测**：默认 UID 1000，30s 超时可选创建新用户
 3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）；**CN 时区自动启用 cargo/rustup 镜像（rsproxy.cn）**；niri/awww 的 cargo 编译**转入后台**（日志 `~/.local/state/eilNiri/{niri,awww}-build.log`）
 4. **服务启用**：fzf 选择系统服务 → `systemctl enable --now`（后台编译同时进行）
-5. **显示管理器**：自动安装并启用（Arch→ly；Debian/RHEL→lightdm；已有 DM 则保留并启用）——重启后直接进登录界面
+5. **显示管理器**：自动安装并启用（Arch→ly；Debian/RHEL→lightdm，装不上自动依次尝试 sddm/gdm3；已有 DM 则保留并启用）——重启后直接进登录界面
 6. **配置快照**：部署前将已有配置打包至 `backups/`（tar.gz）
 7. **配置部署**：已有文件自动备份为 `.bak-时间戳` → PipeWire 用户服务自启 → zsh 设为默认 shell
 8. **等待后台构建**：轮询 niri/awww 编译进度（每 15s 显示已用时间 + **当前正在编译的 crate**，如 `Compiling smithay v0.4.0`）→ 编译完成后自动安装二进制到 `/usr/local/bin`；失败读取日志尾部进手动报告。**restore 运行时可在另一终端用 `./install.sh status` 实时查看每个构建的状态/耗时/当前编译项**（日志：`~/.local/state/eilNiri/{niri,awww}-build.log`，`tail -f` 可实时跟看）
@@ -89,6 +89,7 @@ sudo ./install.sh rollback
 | fcitx5-configtool | fcitx5-config-qt |
 | fcitx5-gtk | fcitx5-frontend-all |
 | fcitx5-qt | fcitx5-frontend-all |
+| polkit-gnome | policykit-1-gnome（Ubuntu 24.04+/Debian 13+ 已改名；旧发行版自动回退 polkit-gnome） |
 | ttf-jetbrains-mono-nerd | fonts-jetbrains-mono |
 | wqy-zenhei | fonts-wqy-zenhei |
 | libnotify | libnotify-bin |
@@ -97,10 +98,12 @@ sudo ./install.sh rollback
 - **Ubuntu universe 自动开启**：fuzzel / mako-notifier / waybar / fcitx5-rime / hyprlock 等全部在 universe 组件。Ubuntu Server / minimal / 云镜像默认不开 universe —— restore 的 Pre-Flight 会自动检测并开启（`add-apt-repository universe`），无需手动操作
 - **Ubuntu 版本**：建议 24.04+。低于 24.04 时 Pre-Flight 会明确警告（22.04 等旧版仓库基本没有 niri 套件包）；26.04+ 的 universe 已自带 hyprlock / hypridle，会直接 apt 装成功
 - **debconf 不卡流程**：Debian 系自动 `DEBIAN_FRONTEND=noninteractive`，apt 安装（如 libvirt）不会弹出交互提示
-- **编译提速（后台并行 + 镜像）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。GitHub 下载走"直连 → ghfast.top → ghproxy.net"兜底链（`EILNIRI_GH_MIRROR` 可自定义）；CN 时区自动启用 rsproxy.cn 的 cargo/rustup 镜像。编译日志：`~/.local/state/eilNiri/{niri,awww}-build.log`
+- **编译提速（后台并行 + 镜像 + 资源感知）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。编译并行度按内存自动限制（每任务约 1.5GB，防小 VM OOM；<8GB 内存时 awww 自动等 niri 完成再编译）。GitHub 下载走"直连 → ghfast.top → ghproxy.net"兜底链（`EILNIRI_GH_MIRROR` 可自定义）；CN 时区或 crates.io 不可达时自动启用 rsproxy.cn 的 cargo/rustup 镜像。编译日志：`~/.local/state/eilNiri/{niri,awww}-build.log`
 - **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若该版本未发布预编译包（官方现已只发源码包），自动装 Rust 工具链 + 构建依赖，用官方 `vendored-dependencies` 源码包离线 `cargo build` 编译（后台并行，约 10-20 分钟）；两者都失败才列入"需手动安装"报告。
 - **awww 自动安装**：无 .deb 也无预编译二进制，且上游已从 GitHub 迁到 Codeberg。restore 自动浅克隆 `codeberg.org/LGFae/awww` → 后台 `cargo build --release`（约 5 分钟）→ 安装 `awww` 与 `awww-daemon` 到 `/usr/local/bin`。
 - **satty 自动安装**：无 .deb，但官方（Satty-org/Satty）发布预编译二进制。restore 直接走 `releases/latest/download` 稳定 URL（免 GitHub API，CN 更稳）下载 `satty-<arch>-unknown-linux-gnu.tar.gz`（x86_64/aarch64）→ 安装到 `/usr/local/bin`，并确保 GTK4/libadwaita/librsvg 运行时库；预编译不可用时回退 `cargo install`。
+- **xwayland-satellite 自动安装**：Debian/Ubuntu 稳定仓库没有（Fedora 有）。restore 自动回退 `cargo install xwayland-satellite`（约 3 分钟），并顺带装 Xwayland。
+- **polkit agent**：Ubuntu 24.04+/Debian 13+ 的包名已从 polkit-gnome 改为 `policykit-1-gnome`（自动映射，旧版自动回退）；niri 配置里的 agent 启动路径自动按家族改写（Arch `/usr/lib` ↔ Debian/RHEL `/usr/libexec`）。
 - **hyprlock / hypridle / xwayland-satellite**：Debian/Ubuntu 稳定仓库没有（仅 Debian 13 backports、testing、Ubuntu 26.04+ 有前两者）。restore 会先尝试 apt 安装，失败则给出 backports / 手动编译提示。
 - **PEP 668**：waypaper 的 pip 安装自动加 `--break-system-packages`（Debian/Ubuntu 默认阻止系统级 pip）。
 - **服务提供包**：`libvirtd.service` 的提供包按家族映射（Debian 为 `libvirt-daemon-system`）。
@@ -148,7 +151,7 @@ EilNiri/
 - 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
 - export 默认修正 niri config 两处笔误，live 配置不受影响
 - 壁纸图片不在快照内
-- 中断恢复：重跑自动跳过已完成阶段，删除 `.replicate_progress` 可强制全量重跑
+- 中断恢复：重跑自动跳过已完成阶段，删除 `.replicate_progress` 可强制全量重跑；**进度文件带脚本版本标记，旧版本脚本写的进度自动作废**（失败阶段不再标记完成，重跑自动重试，无需手动删文件）
 - dry-run：不对系统做任何改动（唯一例外：fzf 是交互前提，dry-run 下也会实际安装）
 - 临时文件在退出时自动清理（sudoers、构建目录、解包目录）
 - 日志：`~/.local/state/eilNiri/replicate.log`，自动截断保留最近 800 行

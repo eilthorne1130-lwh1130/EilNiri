@@ -265,10 +265,10 @@ declare -A RHEL_MANUAL=(
     [ly]="Only available on Arch; the script auto-installs lightdm on RHEL instead"
 )
 # RHEL family: extra hint when dnf install fails (available in Fedora official repo, but not on Rocky/Alma/CentOS Stream)
+# (xwayland-satellite falls back to cargo install automatically)
 declare -A RHEL_FAIL_HINT=(
     [hyprlock]="Available in the Fedora official repo (dnf install hyprlock); on Rocky/Alma/CentOS try EPEL / Copr, or install the RPM from the Fedora repo manually"
     [hypridle]="Available in the Fedora official repo (dnf install hypridle); on Rocky/Alma/CentOS try EPEL / Copr, or install the RPM from the Fedora repo manually"
-    [xwayland-satellite]="Available in the Fedora official repo (dnf install xwayland-satellite); on Rocky/Alma/CentOS try EPEL / Copr or build manually"
 )
 # --- Arch -> Debian family translation layer ---
 # Rename mapping
@@ -282,6 +282,11 @@ declare -A DEB_MAP=(
     [ttf-jetbrains-mono-nerd]=fonts-jetbrains-mono
     [wqy-zenhei]=fonts-wqy-zenhei
     [libnotify]=libnotify-bin
+    # polkit-gnome was renamed to policykit-1-gnome in Ubuntu 24.04+ / Debian 13+ (binary name unchanged)
+    [polkit-gnome]=policykit-1-gnome
+)
+# Debian family: alternate package names tried when the primary apt install fails (e.g. old releases)
+declare -A DEB_ALT=(
     [polkit-gnome]=polkit-gnome
 )
 # Packages with no official .deb -> go to the "manual install" report (value = reason/advice)
@@ -290,10 +295,10 @@ declare -A DEB_MANUAL=(
     [ly]="No ly package on Debian/Ubuntu; the script auto-installs lightdm instead"
 )
 # Debian family: extra hint when apt install fails (not in repo but may have an alternative)
+# (xwayland-satellite falls back to cargo install automatically)
 declare -A DEB_FAIL_HINT=(
     [hyprlock]="Installable on Debian 13 via trixie-backports (apt-get install -t trixie-backports hyprlock); already in Ubuntu 26.04+ repos; otherwise build manually"
     [hypridle]="Installable on Debian 13 via trixie-backports (apt-get install -t trixie-backports hypridle); already in Ubuntu 26.04+ repos; otherwise build manually"
-    [xwayland-satellite]="Not in Debian/Ubuntu stable repos; needs sid/testing or manual build"
 )
 # Packages installable via pip as a fallback (common to Arch/RHEL/Debian)
 declare -A PIP_PKGS=(
@@ -501,9 +506,23 @@ as_user() {
     runuser -u "$TARGET_USER" -- "$@"
 }
 
-# Resume support (dry-run does not read/write the progress file)
-stage_done() { [ "$DRY_RUN" -eq 1 ] && return 1; grep -qx "$1" "$STATE_FILE" 2>/dev/null; }
-stage_mark() { [ "$DRY_RUN" -eq 1 ] && return 0; echo "$1" >> "$STATE_FILE"; }
+# Resume support (dry-run does not read/write the progress file).
+# The progress file carries a script-version marker; progress files written by older
+# script versions are ignored (stages are re-run instead of being silently skipped).
+PROGRESS_VERSION="v3"
+stage_done() {
+    [ "$DRY_RUN" -eq 1 ] && return 1
+    grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
+    grep -qx "$1" "$STATE_FILE" 2>/dev/null
+}
+stage_mark() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    # reset stale progress files (missing marker = written by an older script version)
+    if ! grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null; then
+        echo "# eilniri-progress $PROGRESS_VERSION" > "$STATE_FILE"
+    fi
+    grep -qx "$1" "$STATE_FILE" 2>/dev/null || echo "$1" >> "$STATE_FILE"
+}
 
 # Target user detection (simplified detect_target_user)
 detect_target_user() {
@@ -899,6 +918,9 @@ install_rhel() {
             if [ "$p" = "niri" ]; then
                 warn "$(_t "No niri package in dnf (common outside Fedora), falling back to official prebuilt/source install..." "No niri package in dnf (common outside Fedora), falling back to official prebuilt/source install...")"
                 install_niri_binary
+            elif [ "$p" = "xwayland-satellite" ]; then
+                warn "$(_t "No xwayland-satellite package in dnf, falling back to cargo install..." "No xwayland-satellite package in dnf, falling back to cargo install...")"
+                install_xwayland_satellite
             elif [ -n "${RHEL_FAIL_HINT[$p]:-}" ]; then
                 MANUAL_ITEMS+=("$name — not available in repo. ${RHEL_FAIL_HINT[$p]}")
             else
@@ -929,11 +951,19 @@ download_gh() { # $1 = official URL, $2 = output file; returns 0 on success
 }
 
 # Cargo/rustup mirror for CN timezones (builds fetch from crates.io / static.rust-lang.org)
+# Also enabled when crates.io itself is unreachable (probe), e.g. restricted networks.
 apply_cargo_mirror() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     local tz
     tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
-    [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]] || return 0
+    local cn=0
+    [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]] && cn=1
+    if [ "$cn" -eq 0 ]; then
+        if curl -fsS --max-time 8 -o /dev/null https://index.crates.io/config.json 2>/dev/null; then
+            return 0   # crates.io reachable, no mirror needed
+        fi
+        log "$(_t "crates.io unreachable, enabling rsproxy mirror as fallback" "crates.io unreachable, enabling rsproxy mirror as fallback")"
+    fi
     mkdir -p "$HOME/.cargo"
     cat > "$HOME/.cargo/config.toml" <<'EOF'
 [source.crates-io]
@@ -1078,8 +1108,20 @@ install_niri_binary() {
     # Build in background so the rest of the install (packages/services/config) proceeds meanwhile
     log "$(_t "Building niri in background (vendored deps, no network needed); continuing install..." "Building niri in background (vendored deps, no network needed); continuing install...")"
     bg_build_start niri "$srcdir" "$LOG_DIR/niri-build.log" \
-        bash -c "cd '$srcdir' && cargo build --release"
+        bash -c "cd '$srcdir' && cargo build --release -j $(cargo_jobs)"
     return "$BG_PENDING_RC"
+}
+
+# RAM-aware cargo parallelism: cap jobs so big builds (niri needs ~1.5-2GB/job) don't OOM small VMs
+cargo_jobs() { # echoes the job count to use
+    local ram_mb jobs max_by_ram
+    ram_mb=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
+    jobs=$(nproc 2>/dev/null || echo 2)
+    [ "${ram_mb:-0}" -gt 0 ] || ram_mb=4096
+    max_by_ram=$(( ram_mb / 1536 ))
+    [ "$max_by_ram" -lt 1 ] && max_by_ram=1
+    [ "$jobs" -gt "$max_by_ram" ] && jobs="$max_by_ram"
+    echo "$jobs"
 }
 
 # Install the binaries produced by the background niri build (runs in stage_wait_builds)
@@ -1142,10 +1184,18 @@ install_awww() {
         return 1
     fi
 
-    # Build in background so the rest of the install proceeds meanwhile
+    # Build in background so the rest of the install proceeds meanwhile.
+    # On low-RAM machines, wait for the niri build to finish first (avoids OOM from two parallel cargo builds).
+    local awww_cmd ram_mb niri_pid
+    awww_cmd="cd '$work/awww' && cargo build --release --workspace -j $(cargo_jobs)"
+    ram_mb=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
+    if [ "${ram_mb:-0}" -lt 8192 ] && [ ${#BG_JOBS[@]} -gt 0 ]; then
+        niri_pid=$(echo "${BG_JOBS[0]}" | awk '{print $2}')
+        awww_cmd="while kill -0 '$niri_pid' 2>/dev/null; do sleep 15; done; $awww_cmd"
+        log "$(_t "Low RAM detected: awww build will wait for niri to finish first." "Low RAM detected: awww build will wait for niri to finish first.")"
+    fi
     log "$(_t "Building awww in background (~5 min); continuing install..." "Building awww in background (~5 min); continuing install...")"
-    bg_build_start awww "$work/awww" "$LOG_DIR/awww-build.log" \
-        bash -c "cd '$work/awww' && cargo build --release --workspace"
+    bg_build_start awww "$work/awww" "$LOG_DIR/awww-build.log" bash -c "$awww_cmd"
     return "$BG_PENDING_RC"
 }
 
@@ -1326,6 +1376,35 @@ install_rime_ice() {
     return 1
 }
 
+# --- xwayland-satellite (Debian family & Rocky/Alma; Fedora's official repo already has it) ---
+# Fallback install via crates.io when no distro package exists.
+install_xwayland_satellite() {
+    if command -v xwayland-satellite >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("xwayland-satellite (already installed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("xwayland-satellite (cargo install)")
+        return "$DRY_RUN_RC"
+    fi
+    # the Xwayland server it wraps (best effort; binary still installs without it)
+    if ! command -v Xwayland >/dev/null 2>&1; then
+        pm_install xwayland 2>/dev/null || warn "$(_t "xwayland package not available; xwayland-satellite needs Xwayland at runtime." "xwayland package not available; xwayland-satellite needs Xwayland at runtime.")"
+    fi
+    if ! ensure_rust; then
+        MANUAL_ITEMS+=("xwayland-satellite — Rust toolchain install failed; install manually (crates.io: xwayland-satellite)")
+        return 1
+    fi
+    log "$(_t "Building xwayland-satellite via cargo (about 3 min)..." "Building xwayland-satellite via cargo (about 3 min)...")"
+    if exe cargo install --root /usr/local xwayland-satellite; then
+        INSTALLED_PKGS+=("xwayland-satellite (cargo build)")
+        success "$(_t "xwayland-satellite installed" "xwayland-satellite installed")"
+        return 0
+    fi
+    MANUAL_ITEMS+=("xwayland-satellite — cargo install failed; install manually (Fedora repo / crates.io)")
+    return 1
+}
+
 install_debian() {
     local p name erc
     local all=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
@@ -1366,6 +1445,11 @@ install_debian() {
             install_rime_ice
             continue
         fi
+        # xwayland-satellite: not in Debian/Ubuntu stable repos; cargo install fallback
+        if [ "$p" = "xwayland-satellite" ]; then
+            install_xwayland_satellite
+            continue
+        fi
         if [ -n "${DEB_MANUAL[$p]:-}" ]; then
             MANUAL_ITEMS+=("$p — ${DEB_MANUAL[$p]}")
             continue
@@ -1396,6 +1480,19 @@ install_debian() {
         fi
         erc=0
         pm_install "$name" || erc=$?
+        # retry with an alternate package name if the primary one is not in this release
+        if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ -n "${DEB_ALT[$p]:-}" ]; then
+            local alt_name="${DEB_ALT[$p]}"
+            log "$(_t "Package not available, trying alternate name: " "Package not available, trying alternate name: ") $alt_name"
+            if pkg_installed "$alt_name"; then
+                SKIPPED_PKGS+=("$alt_name (already installed)")
+                erc=0
+            else
+                erc=0
+                pm_install "$alt_name" || erc=$?
+                name="$alt_name"
+            fi
+        fi
         if [ "$erc" -eq 0 ]; then
             INSTALLED_PKGS+=("$name")
         elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
@@ -1416,6 +1513,12 @@ stage_apps_install() {
         return
     fi
     section "$(_t "App Install" "App Install")" "$DISTRO_FAMILY family"
+    # warn early about low disk: cargo builds (niri vendored source + target) need several GB
+    local _disk_mb
+    _disk_mb=$(df -m "$BASE_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ "${_disk_mb:-0}" -gt 0 ] && [ "$_disk_mb" -lt 6144 ]; then
+        warn "$(_t "Low disk space: " "Low disk space: ") $((_disk_mb/1024))GB $(_t "free — cargo builds need ~6GB, the build may fail." "free — cargo builds need ~6GB, the build may fail.")"
+    fi
     apply_cargo_mirror
     case "$DISTRO_FAMILY" in
         arch)   install_arch ;;
@@ -1444,7 +1547,7 @@ stage_wait_builds() {
     [ ${#BG_JOBS[@]} -eq 0 ] && { stage_mark apps; return; }
     section "$(_t "Background Builds" "Background Builds")" "$(_t "waiting for cargo builds (niri/awww)" "waiting for cargo builds (niri/awww)")"
     log "$(_t "Run './install.sh status' in another terminal to watch progress live." "Run './install.sh status' in another terminal to watch progress live.")"
-    local entry name pid logfile srcdir rc tailmsg start now prog
+    local entry name pid logfile srcdir rc tailmsg start now prog any_failed=0
     for entry in "${BG_JOBS[@]}"; do
         read -r name pid logfile srcdir <<< "$entry"
         log "$(_t "Waiting for " "Waiting for ") $name $(_t " build..." " build...")"
@@ -1467,6 +1570,7 @@ stage_wait_builds() {
                 awww) install_awww_from_build "$srcdir" "$logfile" ;;
             esac
         else
+            any_failed=1
             tailmsg=$(tail -n 8 "$logfile" 2>/dev/null | tr '\n' ' ')
             MANUAL_ITEMS+=("$name — build failed ($tailmsg)")
             warn "$(_t "Background build failed: " "Background build failed: ") $name ($(_t "see log " "see log ") $logfile)"
@@ -1476,7 +1580,11 @@ stage_wait_builds() {
     done
     rm -f "$BUILD_STATE_FILE"
     BG_JOBS=()
-    stage_mark apps
+    if [ "$any_failed" -eq 0 ]; then
+        stage_mark apps
+    else
+        warn "$(_t "Some background builds failed; apps stage not marked complete — rerun (without deleting progress) retries them." "Some background builds failed; apps stage not marked complete — rerun (without deleting progress) retries them.")"
+    fi
 }
 
 # --- 4.3c build status (./install.sh status, run from another terminal while restore is building) ---
@@ -1635,14 +1743,21 @@ stage_dm() {
         return
     fi
 
-    if pm_install $dm_pkgs && exe systemctl enable "$dm_unit"; then
-        ENABLED_SVCS+=("$dm_unit")
-        success "$(_t "Display manager installed & enabled: " "Display manager installed & enabled: ") $dm_pkgs"
-    else
-        FAILED_PKGS+=("dm:$dm_unit")
-        warn "$(_t "Display manager install failed; run niri-session from tty after reboot." "Display manager install failed; run niri-session from tty after reboot.")"
-    fi
-    stage_mark dm
+    # Try a fallback chain when the preferred DM is unavailable (e.g. universe missing, EPEL absent)
+    local tried unit
+    for tried in "$dm_pkgs|$dm_unit" "sddm|sddm" "gdm3|gdm"; do
+        local tpkg="${tried%%|*}" tunit="${tried##*|}"
+        if pm_install $tpkg && exe systemctl enable "$tunit"; then
+            ENABLED_SVCS+=("$tunit")
+            success "$(_t "Display manager installed & enabled: " "Display manager installed & enabled: ") $tpkg"
+            stage_mark dm
+            return
+        fi
+        FAILED_PKGS+=("dm:$tunit")
+        warn "$(_t "Display manager install failed, trying next..." "Display manager install failed, trying next...") ($tpkg)"
+    done
+    warn "$(_t "No display manager could be installed; run niri-session from tty after reboot." "No display manager could be installed; run niri-session from tty after reboot.")"
+    # not marked complete: rerun will retry this stage
 }
 
 # --- 4.6 config snapshot (backup before deploy) ---
@@ -1883,6 +1998,14 @@ stage_hardware_adapt() {
         fi
     fi
 
+    # --- 4) polkit agent path per family (Arch: /usr/lib; Debian/RHEL: /usr/libexec) ---
+    if [ "$DISTRO_FAMILY" != arch ] && [ -f "$niri_cfg" ] && grep -q 'polkit-gnome-authentication-agent-1' "$niri_cfg" 2>/dev/null; then
+        if grep -q '/usr/lib/polkit-gnome-authentication-agent-1' "$niri_cfg"; then
+            sed -i 's#/usr/lib/polkit-gnome-authentication-agent-1#/usr/libexec/polkit-gnome-authentication-agent-1#g' "$niri_cfg"
+            log "$(_t "polkit agent path adapted to /usr/libexec (Debian/RHEL layout)" "polkit agent path adapted to /usr/libexec (Debian/RHEL layout)")"
+        fi
+    fi
+
     # GPU driver hint
     if command -v lspci &>/dev/null; then
         local gpu_info
@@ -1916,9 +2039,9 @@ stage_verify() {
             local p name
             for p in "${all_sel[@]}"; do
                 [ -n "${PIP_PKGS[$p]:-}" ] && continue
-                # niri/awww/satty may be installed via dnf/prebuilt/source/cargo; check by PATH (common to Debian/RHEL)
+                # niri/awww/satty/xwayland-satellite may be installed via dnf/prebuilt/source/cargo; check by PATH (common to Debian/RHEL)
                 case "$p" in
-                    niri|awww|satty)
+                    niri|awww|satty|xwayland-satellite)
                         command -v "$p" >/dev/null 2>&1 || missing+=("$p")
                         continue
                         ;;
