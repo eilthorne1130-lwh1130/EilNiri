@@ -931,22 +931,57 @@ install_rhel() {
 }
 
 # --- GitHub download with CN-friendly mirror fallback chain ---
-# api.github.com is often blocked/slow in CN; release downloads usually work, and common
-# proxy mirrors are used as a fallback. Override the list with EILNIRI_GH_MIRROR (single URL).
-GH_MIRRORS=("https://ghfast.top" "https://ghproxy.net")
-download_gh() { # $1 = official URL, $2 = output file; returns 0 on success
-    local url="$1" out="$2" m
-    if [ -n "${EILNIRI_GH_MIRROR:-}" ]; then
-        curl -fsL --retry 2 -o "$out" "${EILNIRI_GH_MIRROR%/}/$url" && return 0
-        return 1
-    fi
-    if curl -fsL --retry 2 -o "$out" "$url" 2>/dev/null; then
+# api.github.com is often blocked/slow in CN; release downloads usually work, and proxy mirrors
+# are used as a fallback. Override the list with EILNIRI_GH_MIRROR (single prefix-proxy URL).
+# Mirrors prefixed "nju:" use the NJU github-release mirror (converted URL form).
+GH_MIRRORS=("https://ghfast.top" "https://ghproxy.net" "https://gh-proxy.com" "nju:https://mirror.nju.edu.cn/github-release")
+CURL_DL_FLAGS=(-fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 1800 -C -)
+
+# Convert a github.com release download URL for the given mirror; echoes the mirror URL
+gh_mirror_url() { # $1 = official URL, $2 = mirror
+    local url="$1" m="$2"
+    if [[ "$m" == nju:* ]]; then
+        # https://github.com/{owner}/{repo}/releases/download/{tag}/{file}
+        #   -> https://mirror.nju.edu.cn/github-release/{owner}/{repo}/{tag}/{file}
+        local rest owner_repo tail
+        rest=${url#https://github.com/}
+        owner_repo=${rest%%/releases/download/*}
+        tail=${rest#*/releases/download/}
+        echo "${m#nju:}/${owner_repo}/${tail}"
         return 0
     fi
+    echo "${m%/}/$url"
+}
+
+# one download attempt with resume support; rc 33 = server rejects range requests -> restart
+try_dl() { # $1 = URL, $2 = output file; returns 0 on success
+    local url="$1" out="$2" rc
+    curl "${CURL_DL_FLAGS[@]}" -C - -o "$out" "$url" 2>/dev/null
+    rc=$?
+    if [ "$rc" -eq 33 ]; then
+        rm -f "$out"
+        curl "${CURL_DL_FLAGS[@]}" -o "$out" "$url" 2>/dev/null
+        rc=$?
+    fi
+    return "$rc"
+}
+
+download_gh() { # $1 = official URL, $2 = output file; returns 0 on success
+    local url="$1" out="$2" m last_rc=0
+    if [ -n "${EILNIRI_GH_MIRROR:-}" ]; then
+        try_dl "$(gh_mirror_url "$url" "$EILNIRI_GH_MIRROR")" "$out" && return 0
+        return 1
+    fi
+    if try_dl "$url" "$out"; then
+        return 0
+    fi
+    last_rc=$?
     for m in "${GH_MIRRORS[@]}"; do
         log "$(_t "GitHub download failed, mirror fallback: " "GitHub download failed, mirror fallback: ") $m"
-        curl -fsL --retry 2 -o "$out" "$m/$url" 2>/dev/null && return 0
+        try_dl "$(gh_mirror_url "$url" "$m")" "$out" && return 0
+        last_rc=$?
     done
+    log "$(_t "All download attempts failed (last curl exit code: " "All download attempts failed (last curl exit code: ") $last_rc)"
     return 1
 }
 
@@ -1157,13 +1192,15 @@ install_awww() {
         return "$DRY_RUN_RC"
     fi
 
-    # build deps (wayland protocol XML via pkg-config is required by upstream); runtime libs best effort
+    # build deps: wayland protocol XML via pkg-config is required by upstream;
+    # the `common` crate links lz4 (needs the -dev package providing liblz4.pc);
+    # dav1d/lz4 runtime libs are best effort.
     local bdeps_rc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
-        exe apt-get install -y git libwayland-dev wayland-protocols || bdeps_rc=$?
-        exe apt-get install -y libdav1d6 liblz4-1 2>/dev/null || true
+        exe apt-get install -y git libwayland-dev wayland-protocols liblz4-dev || bdeps_rc=$?
+        exe apt-get install -y libdav1d6 2>/dev/null || true
     else
-        exe dnf install -y git wayland-devel wayland-protocols-devel || bdeps_rc=$?
+        exe dnf install -y git wayland-devel wayland-protocols-devel lz4-devel || bdeps_rc=$?
         exe dnf install -y dav1d lz4 2>/dev/null || true
     fi
     if [ "$bdeps_rc" -ne 0 ]; then
@@ -1391,17 +1428,34 @@ install_xwayland_satellite() {
     if ! command -v Xwayland >/dev/null 2>&1; then
         pm_install xwayland 2>/dev/null || warn "$(_t "xwayland package not available; xwayland-satellite needs Xwayland at runtime." "xwayland package not available; xwayland-satellite needs Xwayland at runtime.")"
     fi
+    # build deps: upstream needs clang (bindgen) + xcb-cursor dev headers
+    local bdeps_rc=0
+    if [ "$DISTRO_FAMILY" = debian ]; then
+        exe apt-get install -y clang libclang-dev libxcb-cursor-dev || bdeps_rc=$?
+    else
+        exe dnf install -y clang libxcb-cursor-devel || bdeps_rc=$?
+    fi
+    if [ "$bdeps_rc" -ne 0 ]; then
+        MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (clang/libxcb-cursor-dev); install manually (crates.io: xwayland-satellite)")
+        return 1
+    fi
     if ! ensure_rust; then
         MANUAL_ITEMS+=("xwayland-satellite — Rust toolchain install failed; install manually (crates.io: xwayland-satellite)")
         return 1
     fi
+    # tee cargo output to a log so failures stay diagnosable
+    local logf="$LOG_DIR/xwayland-satellite-build.log"
     log "$(_t "Building xwayland-satellite via cargo (about 3 min)..." "Building xwayland-satellite via cargo (about 3 min)...")"
-    if exe cargo install --root /usr/local xwayland-satellite; then
+    cargo install --root /usr/local xwayland-satellite 2>&1 | tee "$logf"
+    local crc=${PIPESTATUS[0]}
+    if [ "$crc" -eq 0 ]; then
         INSTALLED_PKGS+=("xwayland-satellite (cargo build)")
         success "$(_t "xwayland-satellite installed" "xwayland-satellite installed")"
         return 0
     fi
-    MANUAL_ITEMS+=("xwayland-satellite — cargo install failed; install manually (Fedora repo / crates.io)")
+    local tailmsg
+    tailmsg=$(tail -n 6 "$logf" 2>/dev/null | tr '\n' ' ')
+    MANUAL_ITEMS+=("xwayland-satellite — cargo install failed ($tailmsg); install manually (Fedora repo / crates.io)")
     return 1
 }
 

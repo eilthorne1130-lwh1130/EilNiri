@@ -98,11 +98,11 @@ sudo ./install.sh rollback
 - **Ubuntu universe 自动开启**：fuzzel / mako-notifier / waybar / fcitx5-rime / hyprlock 等全部在 universe 组件。Ubuntu Server / minimal / 云镜像默认不开 universe —— restore 的 Pre-Flight 会自动检测并开启（`add-apt-repository universe`），无需手动操作
 - **Ubuntu 版本**：建议 24.04+。低于 24.04 时 Pre-Flight 会明确警告（22.04 等旧版仓库基本没有 niri 套件包）；26.04+ 的 universe 已自带 hyprlock / hypridle，会直接 apt 装成功
 - **debconf 不卡流程**：Debian 系自动 `DEBIAN_FRONTEND=noninteractive`，apt 安装（如 libvirt）不会弹出交互提示
-- **编译提速（后台并行 + 镜像 + 资源感知）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。编译并行度按内存自动限制（每任务约 1.5GB，防小 VM OOM；<8GB 内存时 awww 自动等 niri 完成再编译）。GitHub 下载走"直连 → ghfast.top → ghproxy.net"兜底链（`EILNIRI_GH_MIRROR` 可自定义）；CN 时区或 crates.io 不可达时自动启用 rsproxy.cn 的 cargo/rustup 镜像。编译日志：`~/.local/state/eilNiri/{niri,awww}-build.log`
-- **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若该版本未发布预编译包（官方现已只发源码包），自动装 Rust 工具链 + 构建依赖，用官方 `vendored-dependencies` 源码包离线 `cargo build` 编译（后台并行，约 10-20 分钟）；两者都失败才列入"需手动安装"报告。
+- **编译提速（后台并行 + 镜像 + 资源感知）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。编译并行度按内存自动限制（每任务约 1.5GB，防小 VM OOM；<8GB 内存时 awww 自动等 niri 完成再编译）。GitHub 下载走"直连 → ghfast.top → ghproxy.net → gh-proxy.com → 南京大学 github-release 镜像"兜底链（支持断点续传；`EILNIRI_GH_MIRROR` 可自定义）；CN 时区或 crates.io 不可达时自动启用 rsproxy.cn 的 cargo/rustup 镜像。编译日志：`~/.local/state/eilNiri/{niri,awww,xwayland-satellite}-build.log`
+- **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若该版本未发布预编译包（官方现已只发源码包），自动装 Rust 工具链 + 构建依赖（含 liblz4-dev 等），用官方 `vendored-dependencies` 源码包离线 `cargo build` 编译（后台并行，约 10-20 分钟）；两者都失败才列入"需手动安装"报告。
 - **awww 自动安装**：无 .deb 也无预编译二进制，且上游已从 GitHub 迁到 Codeberg。restore 自动浅克隆 `codeberg.org/LGFae/awww` → 后台 `cargo build --release`（约 5 分钟）→ 安装 `awww` 与 `awww-daemon` 到 `/usr/local/bin`。
 - **satty 自动安装**：无 .deb，但官方（Satty-org/Satty）发布预编译二进制。restore 直接走 `releases/latest/download` 稳定 URL（免 GitHub API，CN 更稳）下载 `satty-<arch>-unknown-linux-gnu.tar.gz`（x86_64/aarch64）→ 安装到 `/usr/local/bin`，并确保 GTK4/libadwaita/librsvg 运行时库；预编译不可用时回退 `cargo install`。
-- **xwayland-satellite 自动安装**：Debian/Ubuntu 稳定仓库没有（Fedora 有）。restore 自动回退 `cargo install xwayland-satellite`（约 3 分钟），并顺带装 Xwayland。
+- **xwayland-satellite 自动安装**：Debian/Ubuntu 稳定仓库没有（Fedora 有）。restore 自动装构建依赖（clang/libclang-dev/libxcb-cursor-dev）后 `cargo install xwayland-satellite`（约 3 分钟，日志带失败尾部），并顺带装 Xwayland。
 - **polkit agent**：Ubuntu 24.04+/Debian 13+ 的包名已从 polkit-gnome 改为 `policykit-1-gnome`（自动映射，旧版自动回退）；niri 配置里的 agent 启动路径自动按家族改写（Arch `/usr/lib` ↔ Debian/RHEL `/usr/libexec`）。
 - **hyprlock / hypridle / xwayland-satellite**：Debian/Ubuntu 稳定仓库没有（仅 Debian 13 backports、testing、Ubuntu 26.04+ 有前两者）。restore 会先尝试 apt 安装，失败则给出 backports / 手动编译提示。
 - **PEP 668**：waypaper 的 pip 安装自动加 `--break-system-packages`（Debian/Ubuntu 默认阻止系统级 pip）。
