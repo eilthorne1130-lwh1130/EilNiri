@@ -239,11 +239,9 @@ declare -A RHEL_MAP=(
     [pipewire-pulse]=pipewire-pulseaudio
 )
 # Packages with no official RPM -> go to the "manual install" report (value = reason/advice)
+# (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
 declare -A RHEL_MANUAL=(
-    [awww]="No official RPM; install with: cargo install --git https://github.com/LGFae/awww or download a release binary"
-    [satty]="No official RPM; install with: cargo install satty"
-    [rime-ice-pinyin-git]="Rime Ice (Lùsōng) dictionary must be deployed manually to ~/.local/share/fcitx5/rime"
-    [ly]="Only available on Arch; on RHEL use gdm/sddm, or run niri-session from tty"
+    [ly]="Only available on Arch; the script auto-installs lightdm on RHEL instead"
 )
 # RHEL family: extra hint when dnf install fails (available in Fedora official repo, but not on Rocky/Alma/CentOS Stream)
 declare -A RHEL_FAIL_HINT=(
@@ -266,11 +264,9 @@ declare -A DEB_MAP=(
     [polkit-gnome]=polkit-gnome
 )
 # Packages with no official .deb -> go to the "manual install" report (value = reason/advice)
+# (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
 declare -A DEB_MANUAL=(
-    [awww]="No official .deb; install with: cargo install --git https://github.com/LGFae/awww or download a release binary"
-    [satty]="No official .deb; install with: cargo install satty"
-    [rime-ice-pinyin-git]="Rime Ice (Lùsōng) dictionary must be deployed manually to ~/.local/share/fcitx5/rime"
-    [ly]="No ly package on Debian/Ubuntu; use gdm/sddm/lightdm, or run niri-session from tty"
+    [ly]="No ly package on Debian/Ubuntu; the script auto-installs lightdm instead"
 )
 # Debian family: extra hint when apt install fails (not in repo but may have an alternative)
 declare -A DEB_FAIL_HINT=(
@@ -831,6 +827,20 @@ install_rhel() {
     fi
 
     for p in ${all[@]+"${all[@]}"}; do
+        # awww/satty: no RPM in any RHEL-family repo (prebuilt binary / cargo build)
+        if [ "$p" = "awww" ]; then
+            install_awww
+            continue
+        fi
+        if [ "$p" = "satty" ]; then
+            install_satty
+            continue
+        fi
+        # rime-ice: no RPM; deploy the dictionary from GitHub (fcitx5-rime package provides the engine)
+        if [ "$p" = "rime-ice-pinyin-git" ]; then
+            install_rime_ice
+            continue
+        fi
         if [ -n "${RHEL_MANUAL[$p]:-}" ]; then
             MANUAL_ITEMS+=("$p — ${RHEL_MANUAL[$p]}")
             continue
@@ -1016,6 +1026,219 @@ install_niri_binary() {
     return 1
 }
 
+# --- awww install (Debian/RHEL families; no package, no prebuilt binary) ---
+# awww moved from GitHub to Codeberg and now replaces swww. No release binaries are published,
+# so the only option outside Arch/Fedora repos is a cargo build from the upstream source (~5 min).
+AWWW_REPO="https://codeberg.org/LGFae/awww"
+
+install_awww() {
+    if command -v awww >/dev/null 2>&1 && command -v awww-daemon >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("awww (already installed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("awww (cargo build from codeberg)")
+        return "$DRY_RUN_RC"
+    fi
+
+    # build deps (wayland protocol XML via pkg-config is required by upstream); runtime libs best effort
+    local bdeps_rc=0
+    if [ "$DISTRO_FAMILY" = debian ]; then
+        exe apt-get install -y git libwayland-dev wayland-protocols || bdeps_rc=$?
+        exe apt-get install -y libdav1d6 liblz4-1 2>/dev/null || true
+    else
+        exe dnf install -y git wayland-devel wayland-protocols-devel || bdeps_rc=$?
+        exe dnf install -y dav1d lz4 2>/dev/null || true
+    fi
+    if [ "$bdeps_rc" -ne 0 ]; then
+        MANUAL_ITEMS+=("awww — build dependencies install failed, build manually: $AWWW_REPO")
+        return 1
+    fi
+    if ! ensure_rust; then
+        MANUAL_ITEMS+=("awww — Rust toolchain install failed, build manually: $AWWW_REPO")
+        return 1
+    fi
+
+    local work
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    log "$(_t "Cloning awww source (codeberg)..." "Cloning awww source (codeberg)...")"
+    if ! exe git clone --depth 1 "$AWWW_REPO" "$work/awww" 2>/dev/null; then
+        MANUAL_ITEMS+=("awww — git clone failed (network or Codeberg blocked), build manually: $AWWW_REPO")
+        return 1
+    fi
+
+    log "$(_t "Building awww via cargo (about 5 min)..." "Building awww via cargo (about 5 min)...")"
+    if ! (cd "$work/awww" && cargo build --release --workspace); then
+        MANUAL_ITEMS+=("awww — build failed, build manually: $AWWW_REPO")
+        return 1
+    fi
+
+    # install every produced binary (awww client, awww-daemon, possibly more)
+    local b found=0
+    for b in "$work"/awww/target/release/awww*; do
+        [ -x "$b" ] && [ -f "$b" ] || continue
+        exe install -Dm755 "$b" /usr/local/bin/"$(basename "$b")"
+        found=1
+    done
+    if [ "$found" -eq 1 ] && [ -x /usr/local/bin/awww ]; then
+        INSTALLED_PKGS+=("awww (cargo build)")
+        success "$(_t "awww built from source" "awww built from source")"
+        return 0
+    fi
+    MANUAL_ITEMS+=("awww — build output missing, build manually: $AWWW_REPO")
+    return 1
+}
+
+# --- satty install (Debian/RHEL families; no package) ---
+# Strategy: 1) official prebuilt binary from GitHub releases (satty-<arch>-unknown-linux-gnu.tar.gz)
+#           2) cargo install fallback (needs GTK4/libadwaita/librsvg dev packages) 3) manual report
+SATTY_GH="https://github.com/Satty-org/Satty/releases"
+
+install_satty() {
+    if command -v satty >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("satty (already installed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("satty (official prebuilt or cargo)")
+        return "$DRY_RUN_RC"
+    fi
+
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch=x86_64 ;;
+        aarch64) arch=aarch64 ;;
+        *)
+            MANUAL_ITEMS+=("satty — unsupported architecture $(uname -m), install manually: $SATTY_GH")
+            return 1
+            ;;
+    esac
+
+    # runtime libraries the prebuilt binary links against (best effort)
+    if [ "$DISTRO_FAMILY" = debian ]; then
+        exe apt-get install -y libgtk-4-1 libadwaita-1-0 librsvg2-2 || warn "$(_t "satty runtime libraries failed to install; the binary may not start." "satty runtime libraries failed to install; the binary may not start.")"
+    else
+        exe dnf install -y gtk4 libadwaita librsvg2 || warn "$(_t "satty runtime libraries failed to install; the binary may not start." "satty runtime libraries failed to install; the binary may not start.")"
+    fi
+
+    # --- Strategy 1: official prebuilt binary ---
+    local ver url tmp work b satty_bin
+    ver=$(curl -fsSL https://api.github.com/repos/Satty-org/Satty/releases/latest 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/')
+    if [ -n "$ver" ]; then
+        tmp=$(mktemp)
+        work=$(mktemp -d)
+        register_temp_path "$tmp"
+        register_temp_path "$work"
+        url="$SATTY_GH/download/v${ver}/satty-${arch}-unknown-linux-gnu.tar.gz"
+        if curl -fsL --retry 3 -o "$tmp" "$url" 2>/dev/null && tar xzf "$tmp" -C "$work" 2>/dev/null; then
+            log "$(_t "Downloading satty $ver official prebuilt binary..." "Downloading satty $ver official prebuilt binary...")"
+            satty_bin=""
+            if [ -d "$work/bin" ]; then
+                for b in "$work"/bin/*; do
+                    [ -x "$b" ] && satty_bin="$b"
+                done
+            elif [ -x "$work/satty" ]; then
+                satty_bin="$work/satty"
+            else
+                # fall back to any executable named satty anywhere in the archive
+                satty_bin=$(find "$work" -type f -name satty -perm -u+x 2>/dev/null | head -n 1)
+            fi
+            if [ -n "$satty_bin" ]; then
+                exe install -Dm755 "$satty_bin" /usr/local/bin/satty
+                [ -d "$work/share" ] && exe cp -r "$work"/share/. /usr/local/share/ 2>/dev/null || true
+                INSTALLED_PKGS+=("satty (official prebuilt $ver)")
+                success "$(_t "satty $ver installed" "satty $ver installed")"
+                return 0
+            fi
+        fi
+        warn "$(_t "Prebuilt satty download failed, falling back to cargo." "Prebuilt satty download failed, falling back to cargo.")"
+    fi
+
+    # --- Strategy 2: cargo install (crates.io) ---
+    local bdeps_rc=0
+    if [ "$DISTRO_FAMILY" = debian ]; then
+        exe apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev librsvg2-dev || bdeps_rc=$?
+    else
+        exe dnf install -y gcc pkgconf-pkg-config gtk4-devel libadwaita-devel librsvg2-devel || bdeps_rc=$?
+    fi
+    if [ "$bdeps_rc" -ne 0 ]; then
+        MANUAL_ITEMS+=("satty — build dependencies install failed, install manually: $SATTY_GH")
+        return 1
+    fi
+    if ! ensure_rust; then
+        MANUAL_ITEMS+=("satty — Rust toolchain install failed, install manually: $SATTY_GH")
+        return 1
+    fi
+    log "$(_t "Building satty via cargo (about 5 min)..." "Building satty via cargo (about 5 min)...")"
+    if exe cargo install --root /usr/local satty; then
+        INSTALLED_PKGS+=("satty (cargo build)")
+        success "$(_t "satty built from source" "satty built from source")"
+        return 0
+    fi
+    MANUAL_ITEMS+=("satty — build failed, install manually: $SATTY_GH")
+    return 1
+}
+
+# --- rime-ice (Lùsōng) dictionary deploy (Debian/RHEL families) ---
+# No package exists outside Arch; upstream ships plain config files, so deploying is just
+# cloning https://github.com/iDvel/rime-ice and copying it into the user's fcitx5 rime dir.
+RIME_ICE_REPO="https://github.com/iDvel/rime-ice"
+
+install_rime_ice() {
+    local dest="$HOME_DIR/.local/share/fcitx5/rime"
+    if [ -f "$dest/rime_ice.schema.yaml" ]; then
+        SKIPPED_PKGS+=("rime-ice (already deployed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("rime-ice (dictionary deploy)")
+        return "$DRY_RUN_RC"
+    fi
+    if [ -z "$TARGET_USER" ] || [ -z "$HOME_DIR" ]; then
+        MANUAL_ITEMS+=("rime-ice — target user not detected yet, deploy manually: git clone $RIME_ICE_REPO -> $dest")
+        return 1
+    fi
+
+    # fcitx5-rime must exist for this to be useful
+    if ! pkg_installed fcitx5-rime; then
+        MANUAL_ITEMS+=("rime-ice — fcitx5-rime not installed, skip deploy")
+        return 1
+    fi
+    if ! command -v git &>/dev/null; then
+        pm_install git || { MANUAL_ITEMS+=("rime-ice — git missing, deploy manually: $RIME_ICE_REPO"); return 1; }
+    fi
+
+    local work item b
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    log "$(_t "Cloning rime-ice dictionary..." "Cloning rime-ice dictionary...")"
+    if ! exe git clone --depth 1 "$RIME_ICE_REPO" "$work/rime-ice" 2>/dev/null; then
+        MANUAL_ITEMS+=("rime-ice — git clone failed (network or GitHub blocked), deploy manually: $RIME_ICE_REPO")
+        return 1
+    fi
+
+    exe mkdir -p "$dest"
+    for item in "$work/rime-ice"/*; do
+        [ -e "$item" ] || continue
+        b=$(basename "$item")
+        case "$b" in
+            .git|.github|build|README.md|LICENSE|AGENTS.md|recipe.yaml) continue ;;
+        esac
+        exe cp -r "$item" "$dest/"
+    done
+    exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dest" 2>/dev/null || true
+
+    if [ -f "$dest/rime_ice.schema.yaml" ]; then
+        INSTALLED_PKGS+=("rime-ice (deployed to $dest)")
+        success "$(_t "rime-ice deployed" "rime-ice deployed")"
+        return 0
+    fi
+    MANUAL_ITEMS+=("rime-ice — deploy failed, do it manually: git clone $RIME_ICE_REPO $dest")
+    return 1
+}
+
 install_debian() {
     local p name erc
     local all=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
@@ -1040,6 +1263,20 @@ install_debian() {
         # niri: not in official repos, use prebuilt/source install
         if [ "$p" = "niri" ]; then
             install_niri_binary
+            continue
+        fi
+        # awww/satty: no .deb in any Debian-family repo (prebuilt binary / cargo build)
+        if [ "$p" = "awww" ]; then
+            install_awww
+            continue
+        fi
+        if [ "$p" = "satty" ]; then
+            install_satty
+            continue
+        fi
+        # rime-ice: no .deb; deploy the dictionary from GitHub (fcitx5-rime package provides the engine)
+        if [ "$p" = "rime-ice-pinyin-git" ]; then
+            install_rime_ice
             continue
         fi
         if [ -n "${DEB_MANUAL[$p]:-}" ]; then
@@ -1175,16 +1412,16 @@ stage_services() {
     fi
 }
 
-# --- 4.5 display manager ly (Arch only, not installed by default) ---
+# --- 4.5 display manager (automatic, all families) ---
+# One-script goal: after reboot the machine boots straight into the niri desktop.
+#   Arch  : ly (lightweight, fits niri)
+#   Debian/RHEL: lightdm + lightdm-gtk-greeter (available in Ubuntu/Debian/Fedora repos)
+# If any known DM is already installed it is kept (and enabled if it wasn't).
 
 stage_dm() {
     if stage_done dm; then return; fi
-    if [ "$DISTRO_FAMILY" != arch ]; then
-        stage_mark dm
-        return
-    fi
 
-    section "$(_t "Display Manager" "Display Manager")" "$(_t "ly (optional)" "ly (optional)")"
+    section "$(_t "Display Manager" "Display Manager")" "$(_t "auto (ly / lightdm)" "auto (ly / lightdm)")"
     local known_dms=(gdm sddm lightdm lxdm ly greetd plasma-login-manager lemurs)
     local dm found=""
     for dm in "${known_dms[@]}"; do
@@ -1192,19 +1429,39 @@ stage_dm() {
     done
 
     if [ -n "$found" ]; then
-        info_kv "$(_t "DM Conflict" "DM Conflict")" "$found" "exists, skip ly"
-    elif [ "$DRY_RUN" -eq 1 ]; then
-        # dry-run: skip interaction with default N; tell the user to remove --dry-run to actually install
-        log "$(_t "[DRY-RUN] skipping ly (default N). Remove --dry-run to install." "[DRY-RUN] skipping ly (default N). Remove --dry-run to install.")"
-        DRY_SVCS+=("ly@tty1")
-    elif confirm "$(_t "Install & enable ly DM? [y/N] (default N, 20s):" "Install & enable ly DM? [y/N] (default N, 20s):")" "N" 20; then
-        if pm_install ly && exe systemctl enable ly@tty1; then
-            ENABLED_SVCS+=("ly@tty1")
-        else
-            FAILED_PKGS+=("dm:ly")
+        info_kv "$(_t "DM Conflict" "DM Conflict")" "$found" "already installed, keep"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "$(_t "[DRY-RUN] would enable " "[DRY-RUN] would enable ") $found"
+            DRY_SVCS+=("$found")
+        elif ! systemctl is-enabled --quiet "$found" 2>/dev/null; then
+            if exe systemctl enable "$found"; then
+                ENABLED_SVCS+=("$found")
+            fi
         fi
+        stage_mark dm
+        return
+    fi
+
+    local dm_pkgs dm_unit
+    case "$DISTRO_FAMILY" in
+        arch)   dm_pkgs="ly";           dm_unit="ly@tty1" ;;
+        *)      dm_pkgs="lightdm lightdm-gtk-greeter"; dm_unit="lightdm" ;;
+    esac
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$(_t "[DRY-RUN] would install & enable: " "[DRY-RUN] would install & enable: ") $dm_pkgs"
+        DRY_PKGS+=("$dm_pkgs")
+        DRY_SVCS+=("$dm_unit")
+        stage_mark dm
+        return
+    fi
+
+    if pm_install $dm_pkgs && exe systemctl enable "$dm_unit"; then
+        ENABLED_SVCS+=("$dm_unit")
+        success "$(_t "Display manager installed & enabled: " "Display manager installed & enabled: ") $dm_pkgs"
     else
-        log "$(_t "Skipping ly. Without DM, run niri-session from tty." "Skipping ly. Without DM, run niri-session from tty.")"
+        FAILED_PKGS+=("dm:$dm_unit")
+        warn "$(_t "Display manager install failed; run niri-session from tty after reboot." "Display manager install failed; run niri-session from tty after reboot.")"
     fi
     stage_mark dm
 }
@@ -1480,11 +1737,17 @@ stage_verify() {
             local p name
             for p in "${all_sel[@]}"; do
                 [ -n "${PIP_PKGS[$p]:-}" ] && continue
-                # niri may be installed via dnf/prebuilt/source; check by PATH (common to Debian/RHEL)
-                if [ "$p" = "niri" ]; then
-                    command -v niri >/dev/null 2>&1 || missing+=("niri")
-                    continue
-                fi
+                # niri/awww/satty may be installed via dnf/prebuilt/source/cargo; check by PATH (common to Debian/RHEL)
+                case "$p" in
+                    niri|awww|satty)
+                        command -v "$p" >/dev/null 2>&1 || missing+=("$p")
+                        continue
+                        ;;
+                    rime-ice-pinyin-git)
+                        [ -f "$HOME_DIR/.local/share/fcitx5/rime/rime_ice.schema.yaml" ] || missing+=("rime-ice")
+                        continue
+                        ;;
+                esac
                 if [ "$DISTRO_FAMILY" = rhel ]; then
                     [ -n "${RHEL_MANUAL[$p]:-}" ] && continue
                     name="${RHEL_MAP[$p]:-$p}"
