@@ -1,6 +1,6 @@
 # EilNiri
 
-在新装的 **Arch 系** / **RHEL 系** / **Debian 系**（Debian/Ubuntu）系统上**只运行一个脚本**即可还原完整的 Niri 桌面环境：包安装、niri/awww/satty 预编译或源码构建、waypaper pip 安装、rime-ice 词库部署、**登录管理器**、系统服务、显示器适配、配置部署全部自动完成，无需再手动安装或下载任何东西。Arch 系与 Fedora 全量预编译安装、零 AUR 构建；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上，niri 自动走官方预编译二进制或官方 vendored 源码离线编译。自动适配显示器、输入法中文组件可选、服务自启、字体渲染。
+在新装的 **Arch 系** / **RHEL 系** / **Debian 系**（Debian/Ubuntu）系统上**只运行一个脚本**即可还原完整的 Niri 桌面环境：包安装、niri/awww/satty 预编译或源码构建、waypaper pip 安装、rime-ice 词库部署、**登录管理器**、系统服务、显示器适配、配置部署全部自动完成，无需再手动安装或下载任何东西。**niri/awww 的 cargo 编译自动放到后台并行执行**，期间继续装包、部署配置，最后统一等待收尾，大幅压缩总等待时间。Arch 系与 Fedora 全量预编译安装、零 AUR 构建；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上，niri 自动走官方预编译二进制或官方 vendored 源码离线编译。自动适配显示器、输入法中文组件可选、服务自启、字体渲染。
 
 ## 快速开始
 
@@ -26,6 +26,7 @@ sudo ./install.sh rollback
 | `./install.sh export --keep-typos` | 普通用户 | 保留配置原样，不修正已知笔误 |
 | `sudo ./install.sh restore` | root | 显示 Logo → 安装桌面环境（fzf 交互） |
 | `sudo ./install.sh restore --dry-run` | root | 预览模式，只打印不执行 |
+| `./install.sh status` | 任意 | **查看后台编译进度**（restore 运行时在另一终端执行，支持 `watch -n 5 ./install.sh status`） |
 | `sudo ./install.sh rollback` | root | 从备份快照恢复配置 |
 | `./install.sh --help` | - | 查看帮助 |
 
@@ -57,16 +58,16 @@ sudo ./install.sh rollback
 
 ## restore 流程（共 10 步）
 
-1. **Logo 展示** → **Pre-Flight**：Arch 系（pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新）；RHEL 系（dnf upgrade）；Debian 系（apt-get update + 自动开启 Ubuntu universe + upgrade，确保 curl/tar）
+1. **Logo 展示** → **Pre-Flight**：Arch 系（pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新）；RHEL 系（dnf upgrade）；Debian 系（apt-get update + 自动开启 Ubuntu universe + upgrade，确保 curl/tar/unzip）
 2. **目标用户检测**：默认 UID 1000，30s 超时可选创建新用户
-3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）
-4. **服务启用**：fzf 选择系统服务 → `systemctl enable --now`
+3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）；**CN 时区自动启用 cargo/rustup 镜像（rsproxy.cn）**；niri/awww 的 cargo 编译**转入后台**（日志 `~/.local/state/eilNiri/{niri,awww}-build.log`）
+4. **服务启用**：fzf 选择系统服务 → `systemctl enable --now`（后台编译同时进行）
 5. **显示管理器**：自动安装并启用（Arch→ly；Debian/RHEL→lightdm；已有 DM 则保留并启用）——重启后直接进登录界面
 6. **配置快照**：部署前将已有配置打包至 `backups/`（tar.gz）
 7. **配置部署**：已有文件自动备份为 `.bak-时间戳` → PipeWire 用户服务自启 → zsh 设为默认 shell
-8. **硬件适配**：自动检测显示器输出名+分辨率 → 修复 niri config → 注释 waybar 硬件 sink → GPU 驱动提示
-9. **装后验证**：包对账 + 配置目录审计
-10. **汇总报告** → pacman 缓存清理
+8. **等待后台构建**：轮询 niri/awww 编译进度（每 15s 显示已用时间 + **当前正在编译的 crate**，如 `Compiling smithay v0.4.0`）→ 编译完成后自动安装二进制到 `/usr/local/bin`；失败读取日志尾部进手动报告。**restore 运行时可在另一终端用 `./install.sh status` 实时查看每个构建的状态/耗时/当前编译项**（日志：`~/.local/state/eilNiri/{niri,awww}-build.log`，`tail -f` 可实时跟看）
+9. **硬件适配**：自动检测显示器输出名+分辨率 → 修复 niri config → 注释 waybar 硬件 sink → GPU 驱动提示
+10. **装后验证**：包对账 + 配置目录审计 → **汇总报告** → pacman 缓存清理
 
 ## RHEL 系支持
 
@@ -96,13 +97,14 @@ sudo ./install.sh rollback
 - **Ubuntu universe 自动开启**：fuzzel / mako-notifier / waybar / fcitx5-rime / hyprlock 等全部在 universe 组件。Ubuntu Server / minimal / 云镜像默认不开 universe —— restore 的 Pre-Flight 会自动检测并开启（`add-apt-repository universe`），无需手动操作
 - **Ubuntu 版本**：建议 24.04+。低于 24.04 时 Pre-Flight 会明确警告（22.04 等旧版仓库基本没有 niri 套件包）；26.04+ 的 universe 已自带 hyprlock / hypridle，会直接 apt 装成功
 - **debconf 不卡流程**：Debian 系自动 `DEBIAN_FRONTEND=noninteractive`，apt 安装（如 libvirt）不会弹出交互提示
-- **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若该版本未发布预编译包（官方现已只发源码包），自动装 Rust 工具链 + 构建依赖，用官方 `vendored-dependencies` 源码包离线 `cargo build` 编译（约 10-20 分钟）；两者都失败才列入"需手动安装"报告。
-- **awww 自动安装**：无 .deb 也无预编译二进制，且上游已从 GitHub 迁到 Codeberg。restore 自动浅克隆 `codeberg.org/LGFae/awww` → `cargo build --release`（约 5 分钟）→ 安装 `awww` 与 `awww-daemon` 到 `/usr/local/bin`。
-- **satty 自动安装**：无 .deb，但官方（Satty-org/Satty）发布预编译二进制。restore 自动下载 `satty-<arch>-unknown-linux-gnu.tar.gz`（x86_64/aarch64）→ 安装到 `/usr/local/bin`，并确保 GTK4/libadwaita/librsvg 运行时库；预编译不可用时回退 `cargo install`。
+- **编译提速（后台并行 + 镜像）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。GitHub 下载走"直连 → ghfast.top → ghproxy.net"兜底链（`EILNIRI_GH_MIRROR` 可自定义）；CN 时区自动启用 rsproxy.cn 的 cargo/rustup 镜像。编译日志：`~/.local/state/eilNiri/{niri,awww}-build.log`
+- **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若该版本未发布预编译包（官方现已只发源码包），自动装 Rust 工具链 + 构建依赖，用官方 `vendored-dependencies` 源码包离线 `cargo build` 编译（后台并行，约 10-20 分钟）；两者都失败才列入"需手动安装"报告。
+- **awww 自动安装**：无 .deb 也无预编译二进制，且上游已从 GitHub 迁到 Codeberg。restore 自动浅克隆 `codeberg.org/LGFae/awww` → 后台 `cargo build --release`（约 5 分钟）→ 安装 `awww` 与 `awww-daemon` 到 `/usr/local/bin`。
+- **satty 自动安装**：无 .deb，但官方（Satty-org/Satty）发布预编译二进制。restore 直接走 `releases/latest/download` 稳定 URL（免 GitHub API，CN 更稳）下载 `satty-<arch>-unknown-linux-gnu.tar.gz`（x86_64/aarch64）→ 安装到 `/usr/local/bin`，并确保 GTK4/libadwaita/librsvg 运行时库；预编译不可用时回退 `cargo install`。
 - **hyprlock / hypridle / xwayland-satellite**：Debian/Ubuntu 稳定仓库没有（仅 Debian 13 backports、testing、Ubuntu 26.04+ 有前两者）。restore 会先尝试 apt 安装，失败则给出 backports / 手动编译提示。
 - **PEP 668**：waypaper 的 pip 安装自动加 `--break-system-packages`（Debian/Ubuntu 默认阻止系统级 pip）。
 - **服务提供包**：`libvirtd.service` 的提供包按家族映射（Debian 为 `libvirt-daemon-system`）。
-- **rime-ice 雾凇拼音自动部署**：无 .deb，但词库就是纯配置文件——restore 自动浅克隆 `github.com/iDvel/rime-ice` → 复制到 `~/.local/share/fcitx5/rime`（fcitx5-rime 包提供引擎）。Arch 上仍走 archlinuxcn 包，不受影响。
+- **rime-ice 雾凇拼音自动部署**：无 .deb，但官方发布 release zip（`full.zip`）——restore 自动下载（GitHub → 南京大学 NJU 镜像 → ghproxy 兜底）→ 解压复制到 `~/.local/share/fcitx5/rime`（fcitx5-rime 包提供引擎）。Arch 上仍走 archlinuxcn 包，不受影响。
 - **登录管理器自动安装**：Debian/RHEL 自动装并启用 `lightdm` + `lightdm-gtk-greeter`；已装有 gdm/sddm 等则保留并确保启用。
 - **ly**：仅 Arch 有包（自动安装）；Debian/RHEL 上由脚本改用 lightdm。
 - **export 仅限 Arch**：快照的 pkglist 由 pacman 生成，export 只能在 Arch 参考机上运行（Ubuntu 上 restore 没问题，但快照必须来自 Arch）。
@@ -142,7 +144,8 @@ EilNiri/
 
 ## 注意事项
 
-- Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 可能需要离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）、satty 走官方预编译二进制（不可用时 cargo 构建）
+- Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
+- 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
 - export 默认修正 niri config 两处笔误，live 配置不受影响
 - 壁纸图片不在快照内
 - 中断恢复：重跑自动跳过已完成阶段，删除 `.replicate_progress` 可强制全量重跑

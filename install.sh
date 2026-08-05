@@ -31,9 +31,28 @@ BACKUP_DIR="$BASE_DIR/backups"
 declare -a CLEANUP_TEMP_PATHS=()
 register_temp_path() { CLEANUP_TEMP_PATHS+=("$1"); }
 
+# Background cargo build jobs (niri/awww): "name pid logfile srcdir"
+BG_JOBS=()
+BG_PENDING_RC=98   # installer return code when the build was spawned in background
+bg_build_start() { # $1=name $2=srcdir $3=logfile $4...=command
+    local name="$1" srcdir="$2" logfile="$3"
+    shift 3
+    log "$(_t "Background build started: " "Background build started: ") $name (log: $logfile)"
+    ( "$@" ) >> "$logfile" 2>&1 &
+    BG_JOBS+=("$name $! $logfile $srcdir")
+    echo "$name|$!|$logfile|$srcdir" >> "$BUILD_STATE_FILE"
+}
+
 cleanup() {
     local rc=$?
     local p
+    # kill any background builds still running (they own temp dirs being removed below)
+    local _entry _bpid
+    for _entry in "${BG_JOBS[@]:-}"; do
+        _bpid=$(echo "$_entry" | awk '{print $2}')
+        [ -n "$_bpid" ] && kill "$_bpid" 2>/dev/null
+    done
+    rm -f "$BUILD_STATE_FILE" 2>/dev/null
     for p in "${CLEANUP_TEMP_PATHS[@]:-}"; do
         [ -n "$p" ] && rm -rf "$p" 2>/dev/null
     done
@@ -78,6 +97,8 @@ LOG_DIR="${XDG_STATE_HOME:-$_LOG_HOME/.local/state}/eilNiri"
 unset _LOG_USER _LOG_HOME
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 export TEMP_LOG_FILE="$LOG_DIR/replicate.log"
+# Per-build state for ./install.sh status (name|pid|logfile|srcdir per line)
+export BUILD_STATE_FILE="$LOG_DIR/builds.state"
 
 init_logger() {
     if [ -f "$TEMP_LOG_FILE" ]; then
@@ -656,7 +677,7 @@ stage_preflight() {
                 if ! exe apt-get -y upgrade; then
                     warn "$(_t "System update partially failed, continuing." "System update partially failed, continuing.")"
                 fi
-                pm_install curl tar
+                pm_install curl tar unzip
             fi
             ;;
     esac
@@ -887,6 +908,50 @@ install_rhel() {
     done
 }
 
+# --- GitHub download with CN-friendly mirror fallback chain ---
+# api.github.com is often blocked/slow in CN; release downloads usually work, and common
+# proxy mirrors are used as a fallback. Override the list with EILNIRI_GH_MIRROR (single URL).
+GH_MIRRORS=("https://ghfast.top" "https://ghproxy.net")
+download_gh() { # $1 = official URL, $2 = output file; returns 0 on success
+    local url="$1" out="$2" m
+    if [ -n "${EILNIRI_GH_MIRROR:-}" ]; then
+        curl -fsL --retry 2 -o "$out" "${EILNIRI_GH_MIRROR%/}/$url" && return 0
+        return 1
+    fi
+    if curl -fsL --retry 2 -o "$out" "$url" 2>/dev/null; then
+        return 0
+    fi
+    for m in "${GH_MIRRORS[@]}"; do
+        log "$(_t "GitHub download failed, mirror fallback: " "GitHub download failed, mirror fallback: ") $m"
+        curl -fsL --retry 2 -o "$out" "$m/$url" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# Cargo/rustup mirror for CN timezones (builds fetch from crates.io / static.rust-lang.org)
+apply_cargo_mirror() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local tz
+    tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+    [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]] || return 0
+    mkdir -p "$HOME/.cargo"
+    cat > "$HOME/.cargo/config.toml" <<'EOF'
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+EOF
+    export RUSTUP_DIST_SERVER="https://rsproxy.cn" RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+    log "$(_t "CN timezone detected: cargo/rustup mirror enabled (rsproxy.cn)" "CN timezone detected: cargo/rustup mirror enabled (rsproxy.cn)")"
+}
+
 # --- niri install (common to Debian family and non-Fedora RHEL family; these repos have no niri) ---
 # Strategy: 1) official prebuilt binary (if this release provides it) 2) offline cargo build from the official vendored source archive 3) manual report
 # Fedora's official repo already has niri, so dnf succeeds and this is never reached
@@ -942,12 +1007,17 @@ install_niri_binary() {
             ;;
     esac
 
-    # Resolve the latest version (GitHub API)
+    # Resolve the latest version: prefer the /releases/latest redirect (no API, works behind CN walls),
+    # fall back to the GitHub API if the redirect fails.
     local ver url tmp work srcdir d
-    ver=$(curl -fsSL https://api.github.com/repos/niri-wm/niri/releases/latest 2>/dev/null \
-        | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/')
+    ver=$(curl -fsSI --retry 2 https://github.com/niri-wm/niri/releases/latest 2>/dev/null \
+        | grep -i '^location:' | sed -n 's#.*/tag/\(v[^/]*\).*#\1#p' | head -n 1 | sed 's/^v//')
     if [ -z "$ver" ]; then
-        MANUAL_ITEMS+=("niri — could not fetch latest version (network or GitHub API restricted), install manually: $NIRI_GH")
+        ver=$(curl -fsSL https://api.github.com/repos/niri-wm/niri/releases/latest 2>/dev/null \
+            | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/')
+    fi
+    if [ -z "$ver" ]; then
+        MANUAL_ITEMS+=("niri — could not fetch latest version (network or GitHub restricted), install manually: $NIRI_GH")
         return 1
     fi
     tmp=$(mktemp)
@@ -957,7 +1027,7 @@ install_niri_binary() {
 
     # --- Strategy 1: official prebuilt binary (only some releases provide it; instant install if publishing resumes) ---
     url="$NIRI_GH/download/v${ver}/niri-${ver}-${arch}-linux-gnu.tar.xz"
-    if curl -fsL --retry 2 -o "$tmp" "$url" 2>/dev/null; then
+    if download_gh "$url" "$tmp"; then
         log "$(_t "Downloading niri $ver ($arch) official prebuilt binary..." "Downloading niri $ver ($arch) official prebuilt binary...")"
         if tar xJf "$tmp" -C "$work" 2>/dev/null && [ -d "$work/bin" ]; then
             exe install -Dm755 -t /usr/local/bin "$work"/bin/*
@@ -974,7 +1044,7 @@ install_niri_binary() {
     # --- Strategy 2: offline build from the official vendored source archive (published by upstream for offline builds) ---
     log "$(_t "No prebuilt binary for this version, building from official vendored source (10-20 min)..." "No prebuilt binary for this version, building from official vendored source (10-20 min)...")"
     url="$NIRI_GH/download/v${ver}/niri-${ver}-vendored-dependencies.tar.xz"
-    if ! curl -fL --retry 3 -o "$tmp" "$url" 2>/dev/null; then
+    if ! download_gh "$url" "$tmp"; then
         MANUAL_ITEMS+=("niri — source archive download failed, install manually: $NIRI_GH")
         return 1
     fi
@@ -989,7 +1059,7 @@ install_niri_binary() {
         [ -f "$d/Cargo.toml" ] && { srcdir="$d"; break; }
     done
 
-    # Install build dependencies + Rust toolchain
+    # Install build dependencies + Rust toolchain (foreground, fast)
     if ! ensure_rust; then
         MANUAL_ITEMS+=("niri — Rust toolchain install failed, build manually: $NIRI_GH")
         return 1
@@ -1005,24 +1075,28 @@ install_niri_binary() {
         return 1
     fi
 
-    log "$(_t "Building niri offline (vendored deps), please wait..." "Building niri offline (vendored deps), please wait...")"
-    if ! (cd "$srcdir" && cargo build --release); then
-        MANUAL_ITEMS+=("niri — build failed, build manually or wait for an official prebuilt: $NIRI_GH")
-        return 1
-    fi
+    # Build in background so the rest of the install (packages/services/config) proceeds meanwhile
+    log "$(_t "Building niri in background (vendored deps, no network needed); continuing install..." "Building niri in background (vendored deps, no network needed); continuing install...")"
+    bg_build_start niri "$srcdir" "$LOG_DIR/niri-build.log" \
+        bash -c "cd '$srcdir' && cargo build --release"
+    return "$BG_PENDING_RC"
+}
 
-    # Install (following the file layout from the official Packaging docs)
-    if [ -f "$srcdir/target/release/niri" ]; then
+# Install the binaries produced by the background niri build (runs in stage_wait_builds)
+install_niri_from_build() { # $1 = srcdir, $2 = logfile
+    local srcdir="$1" logfile="$2"
+    if [ -x "$srcdir/target/release/niri" ]; then
         exe install -Dm755 "$srcdir/target/release/niri" /usr/local/bin/niri
         exe install -Dm755 "$srcdir/resources/niri-session" /usr/local/bin/niri-session 2>/dev/null || true
         exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/local/share/wayland-sessions/niri.desktop 2>/dev/null || true
         exe install -Dm644 "$srcdir/resources/niri-portals.conf" /usr/local/share/xdg-desktop-portal/niri-portals.conf 2>/dev/null || true
-        INSTALLED_PKGS+=("niri (source build $ver)")
-        success "$(_t "niri $ver built from source" "niri $ver built from source")"
+        INSTALLED_PKGS+=("niri (source build)")
+        success "$(_t "niri built from source" "niri built from source")"
         return 0
     fi
-
-    MANUAL_ITEMS+=("niri — build output missing, install manually: $NIRI_GH")
+    local tailmsg
+    tailmsg=$(tail -n 6 "$logfile" 2>/dev/null | tr '\n' ' ')
+    MANUAL_ITEMS+=("niri — build failed ($tailmsg); build manually: $NIRI_GH")
     return 1
 }
 
@@ -1068,15 +1142,17 @@ install_awww() {
         return 1
     fi
 
-    log "$(_t "Building awww via cargo (about 5 min)..." "Building awww via cargo (about 5 min)...")"
-    if ! (cd "$work/awww" && cargo build --release --workspace); then
-        MANUAL_ITEMS+=("awww — build failed, build manually: $AWWW_REPO")
-        return 1
-    fi
+    # Build in background so the rest of the install proceeds meanwhile
+    log "$(_t "Building awww in background (~5 min); continuing install..." "Building awww in background (~5 min); continuing install...")"
+    bg_build_start awww "$work/awww" "$LOG_DIR/awww-build.log" \
+        bash -c "cd '$work/awww' && cargo build --release --workspace"
+    return "$BG_PENDING_RC"
+}
 
-    # install every produced binary (awww client, awww-daemon, possibly more)
-    local b found=0
-    for b in "$work"/awww/target/release/awww*; do
+# Install the binaries produced by the background awww build (runs in stage_wait_builds)
+install_awww_from_build() { # $1 = srcdir, $2 = logfile
+    local srcdir="$1" logfile="$2" b found=0
+    for b in "$srcdir"/target/release/awww*; do
         [ -x "$b" ] && [ -f "$b" ] || continue
         exe install -Dm755 "$b" /usr/local/bin/"$(basename "$b")"
         found=1
@@ -1086,7 +1162,9 @@ install_awww() {
         success "$(_t "awww built from source" "awww built from source")"
         return 0
     fi
-    MANUAL_ITEMS+=("awww — build output missing, build manually: $AWWW_REPO")
+    local tailmsg
+    tailmsg=$(tail -n 6 "$logfile" 2>/dev/null | tr '\n' ' ')
+    MANUAL_ITEMS+=("awww — build failed ($tailmsg); build manually: $AWWW_REPO")
     return 1
 }
 
@@ -1123,38 +1201,35 @@ install_satty() {
     fi
 
     # --- Strategy 1: official prebuilt binary ---
-    local ver url tmp work b satty_bin
-    ver=$(curl -fsSL https://api.github.com/repos/Satty-org/Satty/releases/latest 2>/dev/null \
-        | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/')
-    if [ -n "$ver" ]; then
-        tmp=$(mktemp)
-        work=$(mktemp -d)
-        register_temp_path "$tmp"
-        register_temp_path "$work"
-        url="$SATTY_GH/download/v${ver}/satty-${arch}-unknown-linux-gnu.tar.gz"
-        if curl -fsL --retry 3 -o "$tmp" "$url" 2>/dev/null && tar xzf "$tmp" -C "$work" 2>/dev/null; then
-            log "$(_t "Downloading satty $ver official prebuilt binary..." "Downloading satty $ver official prebuilt binary...")"
-            satty_bin=""
-            if [ -d "$work/bin" ]; then
-                for b in "$work"/bin/*; do
-                    [ -x "$b" ] && satty_bin="$b"
-                done
-            elif [ -x "$work/satty" ]; then
-                satty_bin="$work/satty"
-            else
-                # fall back to any executable named satty anywhere in the archive
-                satty_bin=$(find "$work" -type f -name satty -perm -u+x 2>/dev/null | head -n 1)
-            fi
-            if [ -n "$satty_bin" ]; then
-                exe install -Dm755 "$satty_bin" /usr/local/bin/satty
-                [ -d "$work/share" ] && exe cp -r "$work"/share/. /usr/local/share/ 2>/dev/null || true
-                INSTALLED_PKGS+=("satty (official prebuilt $ver)")
-                success "$(_t "satty $ver installed" "satty $ver installed")"
-                return 0
-            fi
+    # Direct "latest/download" URL (no API call, works behind CN walls); mirrors as fallback.
+    local url tmp work b satty_bin
+    tmp=$(mktemp)
+    work=$(mktemp -d)
+    register_temp_path "$tmp"
+    register_temp_path "$work"
+    url="$SATTY_GH/latest/download/satty-${arch}-unknown-linux-gnu.tar.gz"
+    log "$(_t "Downloading satty official prebuilt binary..." "Downloading satty official prebuilt binary...")"
+    if download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; then
+        satty_bin=""
+        if [ -d "$work/bin" ]; then
+            for b in "$work"/bin/*; do
+                [ -x "$b" ] && satty_bin="$b"
+            done
+        elif [ -x "$work/satty" ]; then
+            satty_bin="$work/satty"
+        else
+            # fall back to any executable named satty anywhere in the archive
+            satty_bin=$(find "$work" -type f -name satty -perm -u+x 2>/dev/null | head -n 1)
         fi
-        warn "$(_t "Prebuilt satty download failed, falling back to cargo." "Prebuilt satty download failed, falling back to cargo.")"
+        if [ -n "$satty_bin" ]; then
+            exe install -Dm755 "$satty_bin" /usr/local/bin/satty
+            [ -d "$work/share" ] && exe cp -r "$work"/share/. /usr/local/share/ 2>/dev/null || true
+            INSTALLED_PKGS+=("satty (official prebuilt)")
+            success "$(_t "satty installed" "satty installed")"
+            return 0
+        fi
     fi
+    warn "$(_t "Prebuilt satty download failed, falling back to cargo." "Prebuilt satty download failed, falling back to cargo.")"
 
     # --- Strategy 2: cargo install (crates.io) ---
     local bdeps_rc=0
@@ -1182,9 +1257,11 @@ install_satty() {
 }
 
 # --- rime-ice (Lùsōng) dictionary deploy (Debian/RHEL families) ---
-# No package exists outside Arch; upstream ships plain config files, so deploying is just
-# cloning https://github.com/iDvel/rime-ice and copying it into the user's fcitx5 rime dir.
+# No package exists outside Arch; upstream ships a release zip (official install method):
+# download full.zip, extract, copy into the user's fcitx5 rime dir.
 RIME_ICE_REPO="https://github.com/iDvel/rime-ice"
+RIME_ICE_ZIP_URL="https://github.com/iDvel/rime-ice/releases/latest/download/full.zip"
+RIME_ICE_NJU_MIRROR="https://mirror.nju.edu.cn/github-release/iDvel/rime-ice/LatestRelease/full.zip"
 
 install_rime_ice() {
     local dest="$HOME_DIR/.local/share/fcitx5/rime"
@@ -1206,21 +1283,31 @@ install_rime_ice() {
         MANUAL_ITEMS+=("rime-ice — fcitx5-rime not installed, skip deploy")
         return 1
     fi
-    if ! command -v git &>/dev/null; then
-        pm_install git || { MANUAL_ITEMS+=("rime-ice — git missing, deploy manually: $RIME_ICE_REPO"); return 1; }
+    if ! command -v unzip &>/dev/null; then
+        pm_install unzip || { MANUAL_ITEMS+=("rime-ice — unzip missing, deploy manually: $RIME_ICE_REPO"); return 1; }
     fi
 
-    local work item b
-    work=$(mktemp -d)
-    register_temp_path "$work"
-    log "$(_t "Cloning rime-ice dictionary..." "Cloning rime-ice dictionary...")"
-    if ! exe git clone --depth 1 "$RIME_ICE_REPO" "$work/rime-ice" 2>/dev/null; then
-        MANUAL_ITEMS+=("rime-ice — git clone failed (network or GitHub blocked), deploy manually: $RIME_ICE_REPO")
+    # Official release zip (much faster than git clone); NJU mirror + ghproxy as CN fallbacks
+    local zipfile unzipdir item b
+    zipfile=$(mktemp)
+    unzipdir=$(mktemp -d)
+    register_temp_path "$zipfile"
+    register_temp_path "$unzipdir"
+    log "$(_t "Downloading rime-ice release zip..." "Downloading rime-ice release zip...")"
+    if ! download_gh "$RIME_ICE_ZIP_URL" "$zipfile"; then
+        log "$(_t "GitHub download failed, trying NJU mirror..." "GitHub download failed, trying NJU mirror...")"
+        if ! curl -fsL --retry 2 -o "$zipfile" "$RIME_ICE_NJU_MIRROR" 2>/dev/null; then
+            MANUAL_ITEMS+=("rime-ice — download failed (GitHub/NJU blocked), deploy manually: $RIME_ICE_REPO")
+            return 1
+        fi
+    fi
+    if ! exe unzip -q "$zipfile" -d "$unzipdir"; then
+        MANUAL_ITEMS+=("rime-ice — zip extraction failed, deploy manually: $RIME_ICE_REPO")
         return 1
     fi
 
     exe mkdir -p "$dest"
-    for item in "$work/rime-ice"/*; do
+    for item in "$unzipdir"/*; do
         [ -e "$item" ] || continue
         b=$(basename "$item")
         case "$b" in
@@ -1235,7 +1322,7 @@ install_rime_ice() {
         success "$(_t "rime-ice deployed" "rime-ice deployed")"
         return 0
     fi
-    MANUAL_ITEMS+=("rime-ice — deploy failed, do it manually: git clone $RIME_ICE_REPO $dest")
+    MANUAL_ITEMS+=("rime-ice — deploy failed, do it manually: $RIME_ICE_REPO $dest")
     return 1
 }
 
@@ -1329,12 +1416,104 @@ stage_apps_install() {
         return
     fi
     section "$(_t "App Install" "App Install")" "$DISTRO_FAMILY family"
+    apply_cargo_mirror
     case "$DISTRO_FAMILY" in
         arch)   install_arch ;;
         rhel)   install_rhel ;;
         debian) install_debian ;;
     esac
+    # Defer the progress mark while background builds (niri/awww) are still running;
+    # stage_wait_builds marks the stage complete once they finish.
+    if [ ${#BG_JOBS[@]} -eq 0 ]; then
+        stage_mark apps
+    else
+        log "$(_t "Background builds pending (niri/awww); stage marked complete after they finish." "Background builds pending (niri/awww); stage marked complete after they finish.")"
+    fi
+}
+
+# --- 4.3b wait for background cargo builds and install their outputs ---
+
+# Latest meaningful line from a build log (the crate cargo is currently compiling)
+build_progress_line() { # $1 = logfile
+    tail -n 300 "$1" 2>/dev/null \
+        | grep -E 'Compiling|Finished|error\[|error:|warning: unused|^error|Building|Downloading' \
+        | tail -n 1
+}
+
+stage_wait_builds() {
+    [ ${#BG_JOBS[@]} -eq 0 ] && { stage_mark apps; return; }
+    section "$(_t "Background Builds" "Background Builds")" "$(_t "waiting for cargo builds (niri/awww)" "waiting for cargo builds (niri/awww)")"
+    log "$(_t "Run './install.sh status' in another terminal to watch progress live." "Run './install.sh status' in another terminal to watch progress live.")"
+    local entry name pid logfile srcdir rc tailmsg start now prog
+    for entry in "${BG_JOBS[@]}"; do
+        read -r name pid logfile srcdir <<< "$entry"
+        log "$(_t "Waiting for " "Waiting for ") $name $(_t " build..." " build...")"
+        start=$(date +%s)
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep 15
+            now=$(( $(date +%s) - start ))
+            prog=$(build_progress_line "$logfile")
+            if [ -n "$prog" ]; then
+                log "$(_t "[bg] " "[bg] ") $name ${H_CYAN}$((now/60))m $((now%60))s${NC} $(_t "elapsed — " "elapsed — ") ${DIM}$prog${NC}"
+            else
+                log "$(_t "[bg] " "[bg] ") $name $((now/60))m $((now%60))s $(_t "elapsed" "elapsed")"
+            fi
+        done
+        rc=0
+        wait "$pid" 2>/dev/null || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            case "$name" in
+                niri) install_niri_from_build "$srcdir" "$logfile" ;;
+                awww) install_awww_from_build "$srcdir" "$logfile" ;;
+            esac
+        else
+            tailmsg=$(tail -n 8 "$logfile" 2>/dev/null | tr '\n' ' ')
+            MANUAL_ITEMS+=("$name — build failed ($tailmsg)")
+            warn "$(_t "Background build failed: " "Background build failed: ") $name ($(_t "see log " "see log ") $logfile)"
+        fi
+        # drop this job from the state file so `status` reflects it accurately
+        sed -i "\|^$name|d" "$BUILD_STATE_FILE" 2>/dev/null
+    done
+    rm -f "$BUILD_STATE_FILE"
+    BG_JOBS=()
     stage_mark apps
+}
+
+# --- 4.3c build status (./install.sh status, run from another terminal while restore is building) ---
+
+do_status() {
+    if [ ! -f "$BUILD_STATE_FILE" ]; then
+        echo ""
+        info_kv "$(_t "Build Status" "Build Status")" "$(_t "no background builds running" "no background builds running")"
+        echo "   $(_t "(restore spawns niri/awww builds in background; the state file is removed when they finish)" "(restore spawns niri/awww builds in background; the state file is removed when they finish)")"
+        return 0
+    fi
+    section "$(_t "Build Status" "Build Status")" "$(_t "live progress (refresh manually or use watch)" "live progress (refresh manually or use watch)")"
+    local line name pid logfile srcdir alive elapsed prog
+    while IFS='|' read -r name pid logfile srcdir; do
+        [ -z "$name" ] && continue
+        if kill -0 "$pid" 2>/dev/null; then
+            elapsed=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+            [ -z "$elapsed" ] && elapsed="?"
+            prog=$(build_progress_line "$logfile")
+            echo -e "   ${H_CYAN}●${NC} ${H_GREEN}${name}${NC} ${H_YELLOW}RUNNING${NC} (${elapsed}s)"
+            [ -n "$prog" ] && echo -e "       ${DIM}→ $prog${NC}"
+        else
+            if grep -qE '^error(\[|:)|error: could not' "$logfile" 2>/dev/null; then
+                echo -e "   ${H_RED}✘${NC} ${H_GREEN}${name}${NC} ${H_RED}FAILED${NC} — see $logfile"
+            else
+                echo -e "   ${TICK} ${H_GREEN}${name}${NC} ${H_GREEN}finished${NC} — see $logfile"
+            fi
+        fi
+    done < "$BUILD_STATE_FILE"
+    echo ""
+    echo -e "   ${DIM}$(_t "Live tail (log streams to):" "Live tail (log streams to):")${NC}"
+    if [ -s "$BUILD_STATE_FILE" ]; then
+        while IFS='|' read -r name pid logfile srcdir; do
+            [ -n "$logfile" ] && [ -f "$logfile" ] && echo -e "       ${H_CYAN}tail -f $logfile${NC}"
+        done < "$BUILD_STATE_FILE"
+    fi
+    echo -e "   ${DIM}$(_t "or: watch -n 5 ./install.sh status" "or: watch -n 5 ./install.sh status")${NC}"
 }
 
 # --- 4.4 system services ---
@@ -1835,6 +2014,7 @@ do_restore() {
     stage_dm
     stage_backup
     stage_configs
+    stage_wait_builds
     stage_hardware_adapt
     stage_verify
     # clean the pacman cache to free disk space
@@ -1959,6 +2139,7 @@ eilNiri install.sh — niri desktop environment replication tool
 Usage:
   ./install.sh export  [--keep-typos]   create snapshot (normal user, read-only)
   ./install.sh restore [--dry-run]      restore desktop on new system (root)
+  ./install.sh status                   show background build progress (run from another terminal)
   ./install.sh rollback                 rollback from existing snapshot (root)
   ./install.sh --help                   show this help
 
@@ -1970,6 +2151,8 @@ Workflow:
   1. On current Arch machine:   ./install.sh export
   2. Bring the eilNiri dir to new machine (git / USB / rsync)
   3. On new machine (Arch/RHEL/Debian): sudo ./install.sh restore
+     - niri/awww compile in background:  ./install.sh status   (live progress)
+     - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
   4. Rollback config:            sudo ./install.sh rollback
 EOF
 }
@@ -1978,7 +2161,7 @@ main() {
     local arg
     for arg in "$@"; do
         case "$arg" in
-            export|restore|rollback) MODE="$arg" ;;
+            export|restore|rollback|status) MODE="$arg" ;;
             --dry-run)      DRY_RUN=1 ;;
             --keep-typos)   KEEP_TYPOS=1 ;;
             -h|--help)      usage; exit 0 ;;
@@ -1989,6 +2172,7 @@ main() {
     case "$MODE" in
         export)   do_export ;;
         restore)  do_restore ;;
+        status)   do_status ;;
         rollback) do_rollback ;;
         *)        usage; exit 1 ;;
     esac
