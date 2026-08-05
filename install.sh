@@ -256,6 +256,10 @@ declare -A RHEL_FAIL_HINT=(
 declare -A DEB_MAP=(
     [mako]=mako-notifier
     [fcitx5-configtool]=fcitx5-config-qt
+    # Ubuntu/Debian name the GTK/Qt frontends fcitx5-frontend-* (no fcitx5-gtk / fcitx5-qt binaries);
+    # fcitx5-frontend-all covers gtk2/gtk3/gtk4 + qt5/qt6 frontends and exists on both Debian 13 and Ubuntu 24.04+
+    [fcitx5-gtk]=fcitx5-frontend-all
+    [fcitx5-qt]=fcitx5-frontend-all
     [ttf-jetbrains-mono-nerd]=fonts-jetbrains-mono
     [wqy-zenhei]=fonts-wqy-zenhei
     [libnotify]=libnotify-bin
@@ -291,6 +295,13 @@ do_export() {
     init_logger
     if [ "$EUID" -eq 0 ]; then
         error "$(_t "export must run as normal user (needs ~/.config), do not use sudo." "export must run as normal user (needs ~/.config), do not use sudo.")"
+        exit 1
+    fi
+    # The snapshot pkglist is built from pacman; export only makes sense on the Arch reference system.
+    # On Ubuntu/RHEL the same script still works, but you must get the snapshot from an Arch machine.
+    detect_distro
+    if [ "$DISTRO_FAMILY" != arch ]; then
+        error "$(_t "export must run on an Arch-based system (snapshot pkglist uses pacman). Restore works on Arch/RHEL/Debian (Ubuntu), export does not." "export must run on an Arch-based system (snapshot pkglist uses pacman). Restore works on Arch/RHEL/Debian (Ubuntu), export does not.")"
         exit 1
     fi
 
@@ -408,6 +419,8 @@ DESKTOP_EOF
 # ==============================================================================
 
 DISTRO_FAMILY=""   # arch | rhel | debian
+DISTRO_ID=""       # os-release ID (e.g. ubuntu, debian, arch)
+UBUNTU_VER_NUM=0   # numeric Ubuntu version (e.g. 2404), 0 = not Ubuntu
 TARGET_USER=""
 HOME_DIR=""
 
@@ -426,6 +439,7 @@ detect_distro() {
         id=$(. /etc/os-release; echo "${ID:-}")
         id_like=$(. /etc/os-release; echo "${ID_LIKE:-}")
     fi
+    DISTRO_ID="$id"
     case " $id $id_like " in
         *arch*|*manjaro*|*endeavouros*) DISTRO_FAMILY=arch ;;
         *rhel*|*fedora*|*centos*)       DISTRO_FAMILY=rhel ;;
@@ -435,7 +449,19 @@ detect_distro() {
             exit 1
             ;;
     esac
-    info_kv "$(_t "Distro" "Distro")" "$DISTRO_FAMILY" "(ID=$id)"
+    # Ubuntu version (numeric, e.g. 24.04 -> 2404); used for release-aware hints
+    if [ "$id" = ubuntu ]; then
+        local ver maj min
+        ver=$(. /etc/os-release; echo "${VERSION_ID:-}")
+        maj=$(printf '%s' "$ver" | cut -d. -f1)
+        min=$(printf '%s' "$ver" | cut -d. -f2)
+        [[ "$maj" =~ ^[0-9]+$ ]] && UBUNTU_VER_NUM=$(( maj * 100 + 10#${min:-0} ))
+    fi
+    # apt/debconf must never block the script on prompts
+    [ "$DISTRO_FAMILY" = debian ] && export DEBIAN_FRONTEND=noninteractive
+    local uver=""
+    [ "$UBUNTU_VER_NUM" -gt 0 ] && uver=" UBUNTU $UBUNTU_VER_NUM"
+    info_kv "$(_t "Distro" "Distro")" "$DISTRO_FAMILY" "(ID=$id$uver)"
 }
 
 pkg_installed() { # $1 = package name
@@ -610,8 +636,26 @@ stage_preflight() {
                 log "$(_t "[DRY-RUN] Skipping apt update/upgrade." "[DRY-RUN] Skipping apt update/upgrade.")"
                 DRY_PKGS+=("curl tar")
             else
+                # Ubuntu release too old: most of the niri suite is not packaged before 24.04
+                if [ "$UBUNTU_VER_NUM" -gt 0 ] && [ "$UBUNTU_VER_NUM" -lt 2404 ]; then
+                    warn "$(_t "Ubuntu $UBUNTU_VER_NUM detected: most niri-suite packages require Ubuntu 24.04+ (universe) or Debian 13+. Continue at your own risk." "Ubuntu $UBUNTU_VER_NUM detected: most niri-suite packages require Ubuntu 24.04+ (universe) or Debian 13+. Continue at your own risk.")"
+                fi
                 if ! exe apt-get update; then
                     warn "$(_t "apt-get update failed, continuing." "apt-get update failed, continuing.")"
+                fi
+                # Ubuntu: the niri-suite packages (fuzzel, mako-notifier, waybar, fcitx5-rime, hyprlock, ...) live in
+                # universe, which is NOT enabled by default on Ubuntu Server/minimal/cloud images. Enable it automatically.
+                if [ "$DISTRO_ID" = ubuntu ] && ! apt-cache show mako-notifier >/dev/null 2>&1; then
+                    log "$(_t "universe repository not enabled, enabling it..." "universe repository not enabled, enabling it...")"
+                    if ! command -v add-apt-repository &>/dev/null; then
+                        exe apt-get install -y software-properties-common || warn "$(_t "software-properties-common install failed, universe may stay disabled." "software-properties-common install failed, universe may stay disabled.")"
+                    fi
+                    if command -v add-apt-repository &>/dev/null; then
+                        exe add-apt-repository -y universe || warn "$(_t "add-apt-repository universe failed, packages from universe will not install." "add-apt-repository universe failed, packages from universe will not install.")"
+                        exe apt-get update
+                    else
+                        warn "$(_t "Cannot enable universe automatically; install packages from universe will fail." "Cannot enable universe automatically; install packages from universe will fail.")"
+                    fi
                 fi
                 if ! exe apt-get -y upgrade; then
                     warn "$(_t "System update partially failed, continuing." "System update partially failed, continuing.")"

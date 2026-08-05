@@ -56,7 +56,7 @@ sudo ./install.sh rollback
 
 ## restore 流程（共 10 步）
 
-1. **Logo 展示** → **Pre-Flight**：Arch 系（pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新）；RHEL 系（dnf upgrade）；Debian 系（apt-get update + upgrade，确保 curl/tar）
+1. **Logo 展示** → **Pre-Flight**：Arch 系（pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新）；RHEL 系（dnf upgrade）；Debian 系（apt-get update + 自动开启 Ubuntu universe + upgrade，确保 curl/tar）
 2. **目标用户检测**：默认 UID 1000，30s 超时可选创建新用户
 3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）
 4. **服务启用**：fzf 选择系统服务 → `systemctl enable --now`
@@ -83,16 +83,22 @@ sudo ./install.sh rollback
 |---|---|
 | mako | mako-notifier |
 | fcitx5-configtool | fcitx5-config-qt |
+| fcitx5-gtk | fcitx5-frontend-all |
+| fcitx5-qt | fcitx5-frontend-all |
 | ttf-jetbrains-mono-nerd | fonts-jetbrains-mono |
 | wqy-zenhei | fonts-wqy-zenhei |
 | libnotify | libnotify-bin |
 | polkit-gnome | polkit-gnome |
 
+- **Ubuntu universe 自动开启**：fuzzel / mako-notifier / waybar / fcitx5-rime / hyprlock 等全部在 universe 组件。Ubuntu Server / minimal / 云镜像默认不开 universe —— restore 的 Pre-Flight 会自动检测并开启（`add-apt-repository universe`），无需手动操作
+- **Ubuntu 版本**：建议 24.04+。低于 24.04 时 Pre-Flight 会明确警告（22.04 等旧版仓库基本没有 niri 套件包）；26.04+ 的 universe 已自带 hyprlock / hypridle，会直接 apt 装成功
+- **debconf 不卡流程**：Debian 系自动 `DEBIAN_FRONTEND=noninteractive`，apt 安装（如 libvirt）不会弹出交互提示
 - **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若该版本未发布预编译包（官方现已只发源码包），自动装 Rust 工具链 + 构建依赖，用官方 `vendored-dependencies` 源码包离线 `cargo build` 编译（约 10-20 分钟）；两者都失败才列入"需手动安装"报告。
 - **hyprlock / hypridle / xwayland-satellite**：Debian/Ubuntu 稳定仓库没有（仅 Debian 13 backports、testing、Ubuntu 26.04+ 有前两者）。restore 会先尝试 apt 安装，失败则给出 backports / 手动编译提示。
 - **PEP 668**：waypaper 的 pip 安装自动加 `--break-system-packages`（Debian/Ubuntu 默认阻止系统级 pip）。
 - **服务提供包**：`libvirtd.service` 的提供包按家族映射（Debian 为 `libvirt-daemon-system`）。
 - awww / satty / rime-ice / ly 无官方 .deb，列入"需手动安装"报告。
+- **export 仅限 Arch**：快照的 pkglist 由 pacman 生成，export 只能在 Arch 参考机上运行（Ubuntu 上 restore 没问题，但快照必须来自 Arch）。
 
 ## 硬件自动适配
 
@@ -122,6 +128,8 @@ EilNiri/
 | | Arch 系 | RHEL 系 | Debian 系 |
 |---|---|---|---|
 | 包管理 | pacman | dnf | apt-get |
+| 推荐版本 | 任意 | Fedora / Rocky / Alma / CentOS Stream | **Ubuntu 24.04+** / Debian 13（22.04 会警告） |
+| universe 源 | - | - | Ubuntu 自动开启 |
 | fzf | 自动安装 | 自动安装 | 自动安装 |
 | root | restore/rollback 需要 | restore/rollback 需要 | restore/rollback 需要 |
 
