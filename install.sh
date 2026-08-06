@@ -68,6 +68,9 @@ DRY_RUN=0
 KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
+# Script version — printed at startup so a stale copy on the target machine is easy to spot
+SCRIPT_VERSION="1.4.0"
+
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
 _t() { echo "$2"; }
@@ -330,7 +333,7 @@ do_export() {
     local SNAP_PKGLIST="$BASE_DIR/pkglist"
     local SNAP_CONFIG="$BASE_DIR/config"
 
-    section "Export" "$(_t "Collect Niri Suite Snapshot" "Collect Niri Suite Snapshot")"
+    section "Export v$SCRIPT_VERSION" "$(_t "Collect Niri Suite Snapshot" "Collect Niri Suite Snapshot")"
     info_kv "$(_t "Snapshot Dir" "Snapshot Dir")" "$BASE_DIR"
 
     # --- 3.1 package list ---
@@ -966,11 +969,13 @@ try_dl() { # $1 = URL, $2 = output file; returns 0 on success
     return "$rc"
 }
 
-download_gh() { # $1 = official URL, $2 = output file; returns 0 on success
+download_gh() { # $1 = official URL, $2 = output file; returns 0 on success, else the last curl exit code
     local url="$1" out="$2" m last_rc=0
     if [ -n "${EILNIRI_GH_MIRROR:-}" ]; then
         try_dl "$(gh_mirror_url "$url" "$EILNIRI_GH_MIRROR")" "$out" && return 0
-        return 1
+        last_rc=$?
+        log "$(_t "Download failed via EILNIRI_GH_MIRROR (curl exit code: " "Download failed via EILNIRI_GH_MIRROR (curl exit code: ") $last_rc)"
+        return "$last_rc"
     fi
     if try_dl "$url" "$out"; then
         return 0
@@ -982,7 +987,7 @@ download_gh() { # $1 = official URL, $2 = output file; returns 0 on success
         last_rc=$?
     done
     log "$(_t "All download attempts failed (last curl exit code: " "All download attempts failed (last curl exit code: ") $last_rc)"
-    return 1
+    return "$last_rc"
 }
 
 # Cargo/rustup mirror for CN timezones (builds fetch from crates.io / static.rust-lang.org)
@@ -1109,9 +1114,20 @@ install_niri_binary() {
     # --- Strategy 2: offline build from the official vendored source archive (published by upstream for offline builds) ---
     log "$(_t "No prebuilt binary for this version, building from official vendored source (10-20 min)..." "No prebuilt binary for this version, building from official vendored source (10-20 min)...")"
     url="$NIRI_GH/download/v${ver}/niri-${ver}-vendored-dependencies.tar.xz"
-    if ! download_gh "$url" "$tmp"; then
-        MANUAL_ITEMS+=("niri — source archive download failed, install manually: $NIRI_GH")
-        return 1
+    if download_gh "$url" "$tmp"; then
+        :
+    else
+        local dlrc=$?
+        # flaky networks: one more full pass after a pause before giving up
+        log "$(_t "Download failed, retrying the full mirror chain once after 10s..." "Download failed, retrying the full mirror chain once after 10s...")"
+        sleep 10
+        if download_gh "$url" "$tmp"; then
+            :
+        else
+            dlrc=$?
+            MANUAL_ITEMS+=("niri — source archive download failed (curl exit code $dlrc through all mirrors); install manually: $NIRI_GH")
+            return 1
+        fi
     fi
     if ! tar xJf "$tmp" -C "$work" 2>/dev/null; then
         MANUAL_ITEMS+=("niri — source archive extraction failed, install manually: $url")
@@ -1414,39 +1430,40 @@ install_rime_ice() {
 }
 
 # --- xwayland-satellite (Debian family & Rocky/Alma; Fedora's official repo already has it) ---
-# Fallback install via crates.io when no distro package exists.
+# NOT published on crates.io (verified 404) — install from the upstream GitHub repo via cargo --git.
+XWS_REPO="https://github.com/Supreeeme/xwayland-satellite"
 install_xwayland_satellite() {
     if command -v xwayland-satellite >/dev/null 2>&1; then
         SKIPPED_PKGS+=("xwayland-satellite (already installed)")
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        DRY_PKGS+=("xwayland-satellite (cargo install)")
+        DRY_PKGS+=("xwayland-satellite (cargo --git)")
         return "$DRY_RUN_RC"
     fi
     # the Xwayland server it wraps (best effort; binary still installs without it)
     if ! command -v Xwayland >/dev/null 2>&1; then
         pm_install xwayland 2>/dev/null || warn "$(_t "xwayland package not available; xwayland-satellite needs Xwayland at runtime." "xwayland package not available; xwayland-satellite needs Xwayland at runtime.")"
     fi
-    # build deps: upstream needs clang (bindgen) + xcb-cursor dev headers
+    # build deps: upstream needs clang (bindgen) + xcb-cursor dev headers + git (cargo --git)
     local bdeps_rc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
-        exe apt-get install -y clang libclang-dev libxcb-cursor-dev || bdeps_rc=$?
+        exe apt-get install -y git clang libclang-dev libxcb-cursor-dev || bdeps_rc=$?
     else
-        exe dnf install -y clang libxcb-cursor-devel || bdeps_rc=$?
+        exe dnf install -y git clang libxcb-cursor-devel || bdeps_rc=$?
     fi
     if [ "$bdeps_rc" -ne 0 ]; then
-        MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (clang/libxcb-cursor-dev); install manually (crates.io: xwayland-satellite)")
+        MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (git/clang/libxcb-cursor-dev); install manually: $XWS_REPO")
         return 1
     fi
     if ! ensure_rust; then
-        MANUAL_ITEMS+=("xwayland-satellite — Rust toolchain install failed; install manually (crates.io: xwayland-satellite)")
+        MANUAL_ITEMS+=("xwayland-satellite — Rust toolchain install failed; install manually: $XWS_REPO")
         return 1
     fi
     # tee cargo output to a log so failures stay diagnosable
     local logf="$LOG_DIR/xwayland-satellite-build.log"
-    log "$(_t "Building xwayland-satellite via cargo (about 3 min)..." "Building xwayland-satellite via cargo (about 3 min)...")"
-    cargo install --root /usr/local xwayland-satellite 2>&1 | tee "$logf"
+    log "$(_t "Building xwayland-satellite from GitHub via cargo (about 3 min)..." "Building xwayland-satellite from GitHub via cargo (about 3 min)...")"
+    cargo install --git "$XWS_REPO" --locked --root /usr/local xwayland-satellite 2>&1 | tee "$logf"
     local crc=${PIPESTATUS[0]}
     if [ "$crc" -eq 0 ]; then
         INSTALLED_PKGS+=("xwayland-satellite (cargo build)")
@@ -1455,7 +1472,7 @@ install_xwayland_satellite() {
     fi
     local tailmsg
     tailmsg=$(tail -n 6 "$logf" 2>/dev/null | tr '\n' ' ')
-    MANUAL_ITEMS+=("xwayland-satellite — cargo install failed ($tailmsg); install manually (Fedora repo / crates.io)")
+    MANUAL_ITEMS+=("xwayland-satellite — build failed ($tailmsg); install manually: $XWS_REPO (or Fedora repo)")
     return 1
 }
 
@@ -2175,7 +2192,7 @@ do_restore() {
     check_root
     detect_distro
 
-    section "$(_t "Restore" "Restore")" "$(_t "Restore Niri Desktop" "Restore Niri Desktop")"
+    section "$(_t "Restore" "Restore")" "v$SCRIPT_VERSION — $(_t "Restore Niri Desktop" "Restore Niri Desktop")"
     [ "$DRY_RUN" -eq 1 ] && warn "$(_t "DRY-RUN mode: printing plan only, no changes." "DRY-RUN mode: printing plan only, no changes.")"
     show_logo
 
@@ -2310,8 +2327,8 @@ do_rollback() {
 # ==============================================================================
 
 usage() {
-    cat <<'EOF'
-eilNiri install.sh — niri desktop environment replication tool
+    cat <<EOF
+eilNiri install.sh v$SCRIPT_VERSION — niri desktop environment replication tool
 
 Usage:
   ./install.sh export  [--keep-typos]   create snapshot (normal user, read-only)
