@@ -46,7 +46,7 @@ sudo ./install.sh rollback
 | 输入法 | ✅ | fcitx5 全家 + rime + 雾凇拼音 |
 | 字体 | ✅ | ttf-jetbrains-mono-nerd wqy-zenhei |
 | 密钥环 | ✅ | gnome-keyring |
-| 显示管理器 | ✅ 自动 | 自动安装并**替换现有 DM**：Arch→ly；Debian/RHEL→lightdm（装不上自动尝试 sddm） |
+| 显示管理器 | ✅ 自动 | 自动安装并**替换现有 DM**：Arch→ly；Debian/RHEL→gdm（gdm3 兜底，装不上自动尝试 sddm） |
 | 系统服务 | 可选 | bluetooth / libvirtd / power-profiles-daemon |
 
 ### 配置采集（`collect-config` 复制进仓库 `configs/`）
@@ -63,7 +63,7 @@ sudo ./install.sh rollback
 2. **目标用户检测**：默认 UID 1000，30s 超时可选创建新用户
 3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）；**CN 时区自动启用 cargo/rustup 镜像（rsproxy.cn）**；niri/awww 的 cargo 编译**转入后台**（日志 `~/.local/state/eilNiri/{niri,awww}-build.log`）
 4. **服务启用**：fzf 勾选内置服务（bluetooth / libvirtd / power-profiles-daemon，默认全选）→ `systemctl enable --now`（后台编译同时进行）
-5. **显示管理器**：自动安装脚本选择的 DM 并**替换现有 DM**（Arch→ly；Debian/RHEL→lightdm，装不上自动尝试 sddm）——现有 DM（如 Ubuntu Desktop 预装 gdm3）会被自动禁用、`display-manager.service` 指向新 DM；**先装新的再禁旧的**，安装失败则保留现有 DM 不动；**默认启动目标自动设为 `graphical.target`**（否则重启只会进纯文本 tty、任何 DM 都不启动）；**lightdm 默认会话自动设为 niri**（`user-session=niri` + `lightdm-gtk-greeter default-session=niri` 双层写入，99 高优先级 drop-in，**每次 restore 幂等重检**——niri 后台构建晚完成也会被补上；否则登录会进系统默认桌面如 GNOME）；`EILNIRI_KEEP_DM=1` 可保留现有 DM——重启后直接进 niri 登录
+5. **显示管理器**：自动安装脚本选择的 DM 并**替换现有 DM**（Arch→ly；Debian/RHEL→gdm（gdm3 兜底），装不上自动尝试 sddm）——现有 DM（如 Ubuntu Desktop 预装 gdm3）会被自动禁用、`display-manager.service` 指向新 DM；**先装新的再禁旧的**，安装失败则保留现有 DM 不动；**默认启动目标自动设为 `graphical.target`**（否则重启只会进纯文本 tty、任何 DM 都不启动）；**gdm 默认会话自动设为 niri**（AccountsService `Session=niri`，**每次 restore 幂等重检**——niri 后台构建晚完成也会被补上；否则登录会进系统默认桌面如 GNOME）；`EILNIRI_KEEP_DM=1` 可保留现有 DM——重启后直接进 niri 登录
 6. **配置快照**：部署前将已有配置打包至 `backups/`（tar.gz）
 7. **配置部署**：已有文件自动备份为 `.bak-时间戳` → PipeWire 用户服务自启 → zsh 设为默认 shell
 8. **等待后台构建**：轮询 niri/awww 编译进度（每 15s 显示已用时间 + **当前正在编译的 crate**，如 `Compiling smithay v0.4.0`）→ 编译完成后自动安装二进制到 `/usr/local/bin`；失败读取日志尾部进手动报告。**restore 运行时可在另一终端用 `./install.sh status` 实时查看每个构建的状态/耗时/当前编译项**（日志：`~/.local/state/eilNiri/{niri,awww}-build.log`，`tail -f` 可实时跟看）
@@ -73,12 +73,12 @@ sudo ./install.sh rollback
 ## RHEL 系支持
 
 - 包名自动翻译（如 `ttf-jetbrains-mono-nerd` → `jetbrains-mono-nerd-fonts`）
-- 无 RPM 对应包自动走替代安装（awww 源码构建 / satty 预编译 / rime-ice 词库部署 / lightdm 登录管理器），只有全部失败才列入手动安装报告
+- 无 RPM 对应包自动走替代安装（awww 源码构建 / satty 预编译 / rime-ice 词库部署 / gdm 登录管理器），只有全部失败才列入手动安装报告
 - waypaper 走 pip3 兜底
 - **Fedora**：niri / hyprlock / hypridle / xwayland-satellite 官方仓库都有，`dnf` 直接装
 - **Rocky / Alma / CentOS Stream**：这些包默认仓库没有——niri 自动回退官方预编译/源码编译安装；hyprlock/hypridle/xwayland-satellite 给出 EPEL / Copr / 手动指引
 - **awww / satty**（全部 RHEL 系）：awww 自动从 Codeberg 源码构建（约 5 分钟）；satty 自动下载官方预编译二进制，不可用时回退 cargo 构建
-- **登录管理器**：自动装并启用 `lightdm`（Fedora 仓库有；Rocky/Alma 需 EPEL，装不上会提示并给出 tty 方案）
+- **登录管理器**：自动装并启用 `gdm`（Fedora 仓库有 / gdm3 兜底；装不上会提示并给出 tty 方案）
 
 ## Debian 系支持（Debian 12/13 / Ubuntu 24.04+）
 
@@ -109,8 +109,8 @@ sudo ./install.sh rollback
 - **PEP 668**：waypaper 的 pip 安装自动加 `--break-system-packages`（Debian/Ubuntu 默认阻止系统级 pip）。
 - **服务提供包**：`libvirtd.service` 的提供包按家族映射（Debian 为 `libvirt-daemon-system`）。
 - **rime-ice 雾凇拼音自动部署**：无 .deb，但官方发布 release zip（`full.zip`）——restore 自动从 GitHub 直连下载 → 解压复制到 `~/.local/share/fcitx5/rime`（fcitx5-rime 包提供引擎）。Arch 上仍走 archlinuxcn 包，不受影响。
-- **登录管理器自动安装**：Debian/RHEL 自动装并启用 `lightdm` + `lightdm-gtk-greeter`；现有 DM（gdm3/sddm 等）被自动禁用替换，`EILNIRI_KEEP_DM=1` 可保留。
-- **ly**：仅 Arch 有包（自动安装）；Debian/RHEL 上由脚本改用 lightdm。
+- **登录管理器自动安装**：Debian/RHEL 自动装并启用 `gdm`（gdm3 兜底）；现有 DM 被自动禁用替换，`EILNIRI_KEEP_DM=1` 可保留。
+- **ly**：仅 Arch 有包（自动安装）；Debian/RHEL 上由脚本改用 gdm。
 
 ## 硬件自动适配
 
@@ -146,7 +146,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore/collect-config 开头都会显示 `v版本号`（当前 v1.6.3）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore/collect-config 开头都会显示 `v版本号`（当前 v1.7.0）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
 - 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
 - collect-config 默认修正 niri config 两处笔误（swww-daemon→awww-daemon、authenntication→authentication），live 配置不受影响

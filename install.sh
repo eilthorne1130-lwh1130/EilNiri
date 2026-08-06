@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.6.3"
+SCRIPT_VERSION="1.7.0"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -262,7 +262,7 @@ declare -A RHEL_MAP=(
 # Packages with no official RPM -> go to the "manual install" report (value = reason/advice)
 # (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
 declare -A RHEL_MANUAL=(
-    [ly]="Only available on Arch; the script auto-installs lightdm on RHEL instead"
+    [ly]="Only available on Arch; the script auto-installs gdm on RHEL instead"
 )
 # RHEL family: extra hint when dnf install fails (available in Fedora official repo, but not on Rocky/Alma/CentOS Stream)
 # (xwayland-satellite falls back to cargo install automatically)
@@ -292,7 +292,7 @@ declare -A DEB_ALT=(
 # Packages with no official .deb -> go to the "manual install" report (value = reason/advice)
 # (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
 declare -A DEB_MANUAL=(
-    [ly]="No ly package on Debian/Ubuntu; the script auto-installs lightdm instead"
+    [ly]="No ly package on Debian/Ubuntu; the script auto-installs gdm instead"
 )
 # Debian family: extra hint when apt install fails (not in repo but may have an alternative)
 # (xwayland-satellite falls back to cargo install automatically)
@@ -1781,7 +1781,7 @@ stage_services() {
 # --- 4.5 display manager (automatic, all families) ---
 # One-script goal: after reboot the machine boots straight into the niri desktop.
 #   Arch  : ly (lightweight, fits niri)
-#   Debian/RHEL: lightdm + lightdm-gtk-greeter (fallback: sddm)
+#   Debian/RHEL: gdm (fallback: gdm3 -> sddm)
 # An existing display manager (e.g. gdm3 preinstalled on Ubuntu Desktop) is DISABLED and
 # replaced by the chosen one. Safety: the replacement is installed FIRST and only then is
 # the old DM disabled — if the install fails the current DM stays untouched.
@@ -1790,7 +1790,7 @@ stage_services() {
 stage_dm() {
     if stage_done dm; then return; fi
 
-    section "$(_t "Display Manager" "Display Manager")" "$(_t "auto (ly / lightdm, replaces existing)" "auto (ly / lightdm, replaces existing)")"
+    section "$(_t "Display Manager" "Display Manager")" "$(_t "auto (ly / gdm, replaces existing)" "auto (ly / gdm, replaces existing)")"
 
     # A DM only ever starts under graphical.target. If the system default target is not
     # graphical (Ubuntu Server / previously switched to multi-user), the machine boots to a
@@ -1810,7 +1810,8 @@ stage_dm() {
     local dm_pkgs dm_unit
     case "$DISTRO_FAMILY" in
         arch)   dm_pkgs="ly";           dm_unit="ly@tty1" ;;
-        *)      dm_pkgs="lightdm lightdm-gtk-greeter"; dm_unit="lightdm" ;;
+        # deb/rhel: prefer gdm (Ubuntu 26.04+, Fedora, Rocky), fall back to gdm3 (Ubuntu 24.04-, Debian)
+        *)      dm_pkgs="gdm";          dm_unit="gdm" ;;
     esac
 
     # what is currently configured/installed?
@@ -1846,7 +1847,7 @@ stage_dm() {
 
     # --- install the chosen DM first; never disable the current one before the replacement is in place ---
     local ok=0
-    for tried in "$dm_pkgs|$dm_unit" "sddm|sddm"; do
+    for tried in "$dm_pkgs|$dm_unit" "gdm3|gdm3" "sddm|sddm"; do
         local tpkg="${tried%%|*}" tunit="${tried##*|}"
         if pm_install $tpkg; then
             dm_pkgs="$tpkg"; dm_unit="$tunit"; ok=1
@@ -1889,23 +1890,6 @@ stage_dm() {
         if [ "$_verify_ok" -eq 1 ]; then
             ENABLED_SVCS+=("$dm_unit")
             success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
-            # Make niri the default session for lightdm (Debian/RHEL): without user-session,
-            # lightdm logs the user into the distro's default desktop (e.g. GNOME) instead.
-            if [ "$dm_unit" = "lightdm" ]; then
-                local _niri_desktop=""
-                [ -f /usr/local/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
-                [ -z "$_niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/share/wayland-sessions/niri.desktop
-                if [ -n "$_niri_desktop" ]; then
-                    mkdir -p /etc/lightdm/lightdm.conf.d
-                    cat > /etc/lightdm/lightdm.conf.d/50-niri.conf <<'EOF'
-[Seat:*]
-user-session=niri
-EOF
-                    log "$(_t "lightdm default session set to niri (user-session=niri)" "lightdm default session set to niri (user-session=niri)")"
-                else
-                    warn "$(_t "niri.desktop session not registered (niri build may not have finished) — login will go to the default desktop. Check: ls /usr/local/share/wayland-sessions/" "niri.desktop session not registered (niri build may not have finished) — login will go to the default desktop. Check: ls /usr/local/share/wayland-sessions/")"
-                fi
-            fi
             stage_mark dm
         else
             FAILED_PKGS+=("dm:$dm_unit")
@@ -2312,29 +2296,21 @@ do_restore() {
     stage_verify
     # clean the pacman cache to free disk space
     [ "$DISTRO_FAMILY" = arch ] && exe pacman -Sc --noconfirm 2>/dev/null || true
-    ensure_lightdm_session   # idempotent: re-checks every run (niri build may have finished late)
+    ensure_dm_session   # idempotent: re-checks every run (niri build may have finished late)
     boot_env_check
     print_summary
 }
 
-# --- 4.10b ensure lightdm default session = niri (idempotent, runs on EVERY restore) ---
+# --- 4.10b ensure display manager default session = niri (idempotent, runs on EVERY restore) ---
 # The stage_dm write only happens while that stage runs, but the niri.desktop session file
 # arrives later (background build). This step re-checks on every run so a late niri build
-# still gets picked up as the lightdm default session.
-ensure_lightdm_session() {
+# still gets picked up as the DM default session.
+# Mechanism is DM-specific: gdm uses AccountsService (Session=niri), lightdm uses drop-in confs.
+
+# gdm / gdm3: write /var/lib/AccountsService/users/<TARGET_USER> with Session=niri
+ensure_gdm_session() {
     [ "$DRY_RUN" -eq 1 ] && return 0
-    [ "$DISTRO_FAMILY" = arch ] && return 0
-
-    # only when lightdm actually owns the login (display-manager.service -> lightdm)
-    if [ -e /etc/systemd/system/display-manager.service ]; then
-        local _dl
-        _dl=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
-        [ "$(basename "$_dl" .service)" = "lightdm" ] || return 0
-    else
-        return 0
-    fi
-
-    # niri session must be registered (i.e. the niri build finished)
+    [ -z "$TARGET_USER" ] && return 0
     local _niri_desktop=""
     [ -f /usr/local/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
     [ -z "$_niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/share/wayland-sessions/niri.desktop
@@ -2342,12 +2318,42 @@ ensure_lightdm_session() {
         warn "$(_t "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop." "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop.")"
         return 0
     fi
+    local afile="/var/lib/AccountsService/users/$TARGET_USER"
+    mkdir -p "$(dirname "$afile")"
+    if [ -f "$afile" ] && grep -q '^Session=niri$' "$afile"; then
+        log "$(_t "gdm default session already set to niri (AccountsService)" "gdm default session already set to niri (AccountsService)")"
+        return 0
+    fi
+    if [ -f "$afile" ]; then
+        if grep -q '^Session=' "$afile"; then
+            sed -i 's/^Session=.*$/Session=niri/' "$afile"
+        else
+            sed -i '/^\[User\]/a Session=niri' "$afile"
+        fi
+    else
+        cat > "$afile" <<'EOF'
+[User]
+Session=niri
+EOF
+        chown root:root "$afile" 2>/dev/null || true
+    fi
+    log "$(_t "gdm default session set to niri (AccountsService Session=niri)" "gdm default session set to niri (AccountsService Session=niri)")"
+}
 
-    # idempotent writes:
-    # 1) lightdm user-session via a HIGH-priority drop-in (99- loads last, beats 10-ubuntu.conf etc.)
+# lightdm (kept as compat): drop-in confs for user-session + greeter default-session
+ensure_lightdm_session() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _niri_desktop=""
+    [ -f /usr/local/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
+    [ -z "$_niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/share/wayland-sessions/niri.desktop
+    if [ -z "$_niri_desktop" ]; then
+        warn "$(_t "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop." "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop.")"
+        return 0
+    fi
+    # 99-niri.conf for lightdm user-session
     mkdir -p /etc/lightdm/lightdm.conf.d
     if [ -f /etc/lightdm/lightdm.conf.d/99-niri.conf ] && grep -q '^user-session=niri$' /etc/lightdm/lightdm.conf.d/99-niri.conf; then
-        log "$(_t "lightdm default session already set to niri" "lightdm default session already set to niri")"
+        :
     else
         cat > /etc/lightdm/lightdm.conf.d/99-niri.conf <<'EOF'
 [Seat:*]
@@ -2355,14 +2361,8 @@ user-session=niri
 EOF
         log "$(_t "lightdm default session set to niri (user-session=niri)" "lightdm default session set to niri (user-session=niri)")"
     fi
-    # drop the old 50-niri.conf if present (99- supersedes it; avoids confusion)
-    if [ -f /etc/lightdm/lightdm.conf.d/50-niri.conf ]; then
-        rm -f /etc/lightdm/lightdm.conf.d/50-niri.conf
-        log "$(_t "removed superseded 50-niri.conf" "removed superseded 50-niri.conf")"
-    fi
-
-    # 2) lightdm-gtk-greeter default-session — its priority is HIGHER than lightdm's
-    #    user-session, so without this the greeter can still boot the distro desktop.
+    rm -f /etc/lightdm/lightdm.conf.d/50-niri.conf 2>/dev/null  # superseded by 99-
+    # lightdm-gtk-greeter default-session (higher priority than lightdm user-session)
     mkdir -p /etc/lightdm/lightdm-gtk-greeter.conf.d
     if [ -f /etc/lightdm/lightdm-gtk-greeter.conf.d/99-niri.conf ] && grep -q '^default-session=niri$' /etc/lightdm/lightdm-gtk-greeter.conf.d/99-niri.conf; then
         :
@@ -2373,6 +2373,25 @@ default-session=niri
 EOF
         log "$(_t "lightdm-gtk-greeter default session set to niri" "lightdm-gtk-greeter default session set to niri")"
     fi
+}
+
+# dispatch: pick the right mechanism for the DM that actually owns display-manager.service
+ensure_dm_session() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ "$DISTRO_FAMILY" = arch ] && return 0
+    local _dm
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        _dm=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
+        _dm=$(basename "$_dm" .service)
+    else
+        return 0
+    fi
+    case "$_dm" in
+        gdm|gdm3) ensure_gdm_session ;;
+        lightdm)  ensure_lightdm_session ;;
+        sddm)     warn "$(_t "sddm default session not supported by this script; login may go to the wrong desktop." "sddm default session not supported by this script; login may go to the wrong desktop.")" ;;
+        *)        warn "$(_t "Unknown DM '$_dm' — cannot set niri as the default session." "Unknown DM '$_dm' — cannot set niri as the default session.")" ;;
+    esac
 }
 
 # --- 4.11 boot environment self-check ---
@@ -2396,7 +2415,7 @@ boot_env_check() {
             break
         fi
     done
-    # niri session registration + lightdm default session
+    # niri session registration + DM default session
     local _niri_desktop=""
     [ -f /usr/local/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
     [ -z "$_niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/share/wayland-sessions/niri.desktop
@@ -2405,42 +2424,19 @@ boot_env_check() {
     else
         info_kv "$(_t "Niri Session" "Niri Session")" "$(_t "NOT registered" "NOT registered")" "$(_t "(niri build incomplete — login goes to the default desktop)" "(niri build incomplete — login goes to the default desktop)")"
     fi
-    if [ -f /etc/lightdm/lightdm.conf.d/99-niri.conf ]; then
-        info_kv "$(_t "LightDM Session" "LightDM Session")" "user-session=niri" "$(_t "configured — login goes straight to niri" "configured — login goes straight to niri")"
-    fi
-    # effective user-session value: lightdm reads lightdm.conf first, then lightdm.conf.d/*.conf
-    # in filename order — the LAST assignment wins
-    local _eff _eff_last _f
-    _eff=$(grep -hE '^[[:space:]]*user-session=' /etc/lightdm/lightdm.conf 2>/dev/null
-        for _f in /etc/lightdm/lightdm.conf.d/*.conf; do
-            [ -f "$_f" ] && grep -hE '^[[:space:]]*user-session=' "$_f" 2>/dev/null
-        done
-    )
-    _eff_last=$(printf '%s\n' "$_eff" | tail -n 1)
-    if [ -n "$_eff" ]; then
-        info_kv "$(_t "user-session (effective)" "user-session (effective)")" "$(printf '%s' "$_eff" | tr '\n' '; ' | sed 's/; $//')" "$(_t "(last assignment wins)" "(last assignment wins)")"
-        if [ "$_eff_last" != "user-session=niri" ]; then
-            warn "$(_t "Last user-session assignment is " "Last user-session assignment is ") '$_eff_last'$(_t " — it overrides niri; login will go to the wrong desktop. Check /etc/lightdm/lightdm.conf.d/ and /etc/lightdm/lightdm.conf." " — it overrides niri; login will go to the wrong desktop. Check /etc/lightdm/lightdm.conf.d/ and /etc/lightdm/lightdm.conf.")"
+    # gdm / gdm3: AccountsService
+    if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
+        local _as
+        _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
+        if [ -n "$_as" ]; then
+            info_kv "$(_t "gdm Session" "gdm Session")" "AccountsService=$_as" "$(_t "(must be niri)" "(must be niri)")"
+            [ "$_as" != "niri" ] && warn "$(_t "gdm AccountsService Session=$_as — login will not go to niri." "gdm AccountsService Session=$_as — login will not go to niri.")"
         fi
     fi
-    # lightdm-gtk-greeter default-session (its priority is HIGHER than user-session)
-    local _gdef _gdef_last _gf
-    _gdef=$(grep -hE '^[[:space:]]*default-session=' /etc/lightdm/lightdm-gtk-greeter.conf 2>/dev/null
-        for _gf in /etc/lightdm/lightdm-gtk-greeter.conf.d/*.conf; do
-            [ -f "$_gf" ] && grep -hE '^[[:space:]]*default-session=' "$_gf" 2>/dev/null
-        done
-    )
-    _gdef_last=$(printf '%s\n' "$_gdef" | tail -n 1)
-    if [ -n "$_gdef" ]; then
-        info_kv "$(_t "greeter default-session" "greeter default-session")" "$(printf '%s' "$_gdef" | tr '\n' '; ' | sed 's/; $//')" "$(_t "(higher priority than user-session)" "(higher priority than user-session)")"
-        if [ "$_gdef_last" != "default-session=niri" ]; then
-            warn "$(_t "Greeter default-session is " "Greeter default-session is ") '$_gdef_last'$(_t " — it overrides niri; login will go to the wrong desktop." " — it overrides niri; login will go to the wrong desktop.")"
-        fi
-    fi
-    # session files visible to lightdm
+    # session files visible to the DM
     local _sessions
     _sessions=$(ls /usr/share/xsessions /usr/local/share/xsessions /usr/share/wayland-sessions /usr/local/share/wayland-sessions 2>/dev/null | sort -u | tr '\n' ' ')
-    info_kv "$(_t "Sessions (lightdm)" "Sessions (lightdm)")" "${_sessions:-none}" "$(_t "(niri present if niri.desktop listed)" "(niri present if niri.desktop listed)")"
+    info_kv "$(_t "Sessions (all)" "Sessions (all)")" "${_sessions:-none}" "$(_t "(niri present if niri.desktop listed)" "(niri present if niri.desktop listed)")"
 }
 
 do_rollback() {
