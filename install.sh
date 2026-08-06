@@ -69,7 +69,7 @@ KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -933,28 +933,8 @@ install_rhel() {
     done
 }
 
-# --- GitHub download with CN-friendly mirror fallback chain ---
-# api.github.com is often blocked/slow in CN; release downloads usually work, and proxy mirrors
-# are used as a fallback. Override the list with EILNIRI_GH_MIRROR (single prefix-proxy URL).
-# Mirrors prefixed "nju:" use the NJU github-release mirror (converted URL form).
-GH_MIRRORS=("https://ghfast.top" "https://ghproxy.net" "https://gh-proxy.com" "nju:https://mirror.nju.edu.cn/github-release")
+# --- GitHub download (official direct; resume + retries + timeouts) ---
 CURL_DL_FLAGS=(-fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 1800 -C -)
-
-# Convert a github.com release download URL for the given mirror; echoes the mirror URL
-gh_mirror_url() { # $1 = official URL, $2 = mirror
-    local url="$1" m="$2"
-    if [[ "$m" == nju:* ]]; then
-        # https://github.com/{owner}/{repo}/releases/download/{tag}/{file}
-        #   -> https://mirror.nju.edu.cn/github-release/{owner}/{repo}/{tag}/{file}
-        local rest owner_repo tail
-        rest=${url#https://github.com/}
-        owner_repo=${rest%%/releases/download/*}
-        tail=${rest#*/releases/download/}
-        echo "${m#nju:}/${owner_repo}/${tail}"
-        return 0
-    fi
-    echo "${m%/}/$url"
-}
 
 # one download attempt with resume support; rc 33 = server rejects range requests -> restart
 try_dl() { # $1 = URL, $2 = output file; returns 0 on success
@@ -969,25 +949,15 @@ try_dl() { # $1 = URL, $2 = output file; returns 0 on success
     return "$rc"
 }
 
-download_gh() { # $1 = official URL, $2 = output file; returns 0 on success, else the last curl exit code
-    local url="$1" out="$2" m last_rc=0
-    if [ -n "${EILNIRI_GH_MIRROR:-}" ]; then
-        try_dl "$(gh_mirror_url "$url" "$EILNIRI_GH_MIRROR")" "$out" && return 0
-        last_rc=$?
-        log "$(_t "Download failed via EILNIRI_GH_MIRROR (curl exit code: " "Download failed via EILNIRI_GH_MIRROR (curl exit code: ") $last_rc)"
-        return "$last_rc"
-    fi
+download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the curl exit code
+    local url="$1" out="$2"
     if try_dl "$url" "$out"; then
         return 0
+    else
+        local rc=$?
+        log "$(_t "Download failed (curl exit code: " "Download failed (curl exit code: ") $rc)"
+        return "$rc"
     fi
-    last_rc=$?
-    for m in "${GH_MIRRORS[@]}"; do
-        log "$(_t "GitHub download failed, mirror fallback: " "GitHub download failed, mirror fallback: ") $m"
-        try_dl "$(gh_mirror_url "$url" "$m")" "$out" && return 0
-        last_rc=$?
-    done
-    log "$(_t "All download attempts failed (last curl exit code: " "All download attempts failed (last curl exit code: ") $last_rc)"
-    return "$last_rc"
 }
 
 # Cargo/rustup mirror for CN timezones (builds fetch from crates.io / static.rust-lang.org)
@@ -1122,7 +1092,7 @@ install_niri_binary() {
     else
         local dlrc=$?
         # flaky networks: one more full pass after a pause before giving up
-        log "$(_t "Download failed, retrying the full mirror chain once after 10s..." "Download failed, retrying the full mirror chain once after 10s...")"
+        log "$(_t "Download failed, retrying once after 10s..." "Download failed, retrying once after 10s...")"
         sleep 10
         if download_gh "$url" "$tmp"; then
             :
@@ -1134,7 +1104,7 @@ install_niri_binary() {
                 :
             else
                 dlrc=$?
-                MANUAL_ITEMS+=("niri — source archive download failed (curl exit code $dlrc through all mirrors, vendored + source tarball); install manually: $NIRI_GH")
+                MANUAL_ITEMS+=("niri — source archive download failed (curl exit code $dlrc via GitHub, vendored + source tarball); install manually: $NIRI_GH")
                 return 1
             fi
         fi
@@ -1314,7 +1284,7 @@ install_satty() {
     fi
 
     # --- Strategy 1: official prebuilt binary ---
-    # Direct "latest/download" URL (no API call, works behind CN walls); mirrors as fallback.
+    # Direct "latest/download" URL (no API call), GitHub direct
     local url tmp work b satty_bin
     tmp=$(mktemp)
     work=$(mktemp -d)
@@ -1374,7 +1344,6 @@ install_satty() {
 # download full.zip, extract, copy into the user's fcitx5 rime dir.
 RIME_ICE_REPO="https://github.com/iDvel/rime-ice"
 RIME_ICE_ZIP_URL="https://github.com/iDvel/rime-ice/releases/latest/download/full.zip"
-RIME_ICE_NJU_MIRROR="https://mirror.nju.edu.cn/github-release/iDvel/rime-ice/LatestRelease/full.zip"
 
 install_rime_ice() {
     local dest="$HOME_DIR/.local/share/fcitx5/rime"
@@ -1400,7 +1369,7 @@ install_rime_ice() {
         pm_install unzip || { MANUAL_ITEMS+=("rime-ice — unzip missing, deploy manually: $RIME_ICE_REPO"); return 1; }
     fi
 
-    # Official release zip (much faster than git clone); NJU mirror + ghproxy as CN fallbacks
+    # Official release zip (much faster than git clone), GitHub direct
     local zipfile unzipdir item b
     zipfile=$(mktemp)
     unzipdir=$(mktemp -d)
@@ -1408,11 +1377,8 @@ install_rime_ice() {
     register_temp_path "$unzipdir"
     log "$(_t "Downloading rime-ice release zip..." "Downloading rime-ice release zip...")"
     if ! download_gh "$RIME_ICE_ZIP_URL" "$zipfile"; then
-        log "$(_t "GitHub download failed, trying NJU mirror..." "GitHub download failed, trying NJU mirror...")"
-        if ! curl -fsL --retry 2 -o "$zipfile" "$RIME_ICE_NJU_MIRROR" 2>/dev/null; then
-            MANUAL_ITEMS+=("rime-ice — download failed (GitHub/NJU blocked), deploy manually: $RIME_ICE_REPO")
-            return 1
-        fi
+        MANUAL_ITEMS+=("rime-ice — download failed, deploy manually: $RIME_ICE_REPO")
+        return 1
     fi
     if ! exe unzip -q "$zipfile" -d "$unzipdir"; then
         MANUAL_ITEMS+=("rime-ice — zip extraction failed, deploy manually: $RIME_ICE_REPO")

@@ -98,7 +98,7 @@ sudo ./install.sh rollback
 - **Ubuntu universe 自动开启**：fuzzel / mako-notifier / waybar / fcitx5-rime / hyprlock 等全部在 universe 组件。Ubuntu Server / minimal / 云镜像默认不开 universe —— restore 的 Pre-Flight 会自动检测并开启（`add-apt-repository universe`），无需手动操作
 - **Ubuntu 版本**：建议 24.04+。低于 24.04 时 Pre-Flight 会明确警告（22.04 等旧版仓库基本没有 niri 套件包）；26.04+ 的 universe 已自带 hyprlock / hypridle，会直接 apt 装成功
 - **debconf 不卡流程**：Debian 系自动 `DEBIAN_FRONTEND=noninteractive`，apt 安装（如 libvirt）不会弹出交互提示
-- **编译提速（后台并行 + 镜像 + 资源感知）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。编译并行度按内存自动限制（每任务约 1.5GB，防小 VM OOM；<8GB 内存时 awww 自动等 niri 完成再编译）。GitHub 下载走"直连 → ghfast.top → ghproxy.net → gh-proxy.com → 南京大学 github-release 镜像"兜底链（支持断点续传；失败自动整链重试一次并报告 curl 退出码；`EILNIRI_GH_MIRROR` 可自定义）；CN 时区或 crates.io 不可达时自动启用 rsproxy.cn 的 cargo/rustup 镜像。编译日志：`~/.local/state/eilNiri/{niri,awww,xwayland-satellite}-build.log`
+- **编译提速（后台并行 + 资源感知）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。编译并行度按内存自动限制（每任务约 1.5GB，防小 VM OOM；<8GB 内存时 awww 自动等 niri 完成再编译）。所有下载走 **GitHub 官方直连**（断点续传 + 重试 + 超时，失败自动重试一次并报告 curl 退出码）；CN 时区或 crates.io 不可达时自动启用 rsproxy.cn 的 cargo/rustup 镜像（仅影响 Rust 依赖拉取）。编译日志：`~/.local/state/eilNiri/{niri,awww,xwayland-satellite}-build.log`
 - **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若无预编译包（官方现已只发源码包），先用官方 `vendored-dependencies` 离线源码包（40MB，构建时无需网络）——**该大文件下载失败时自动降级为源码小 tarball（~3MB）+ 网络依赖构建**（依赖逐个从 crates.io/rsproxy 拉取，适配大文件下载受限的网络）；后台并行编译（约 10-20 分钟）；全部失败才列入"需手动安装"报告。
 - **awww 自动安装**：无 .deb 也无预编译二进制，且上游已从 GitHub 迁到 Codeberg。restore 自动浅克隆 `codeberg.org/LGFae/awww` → 后台 `cargo build --release`（约 5 分钟）→ 安装 `awww` 与 `awww-daemon` 到 `/usr/local/bin`。
 - **satty 自动安装**：无 .deb，但官方（Satty-org/Satty）发布预编译二进制。restore 直接走 `releases/latest/download` 稳定 URL（免 GitHub API，CN 更稳）下载 `satty-<arch>-unknown-linux-gnu.tar.gz`（x86_64/aarch64）→ 安装到 `/usr/local/bin`，并确保 GTK4/libadwaita/librsvg 运行时库；预编译不可用时回退 `cargo install`。
@@ -107,7 +107,7 @@ sudo ./install.sh rollback
 - **hyprlock / hypridle / xwayland-satellite**：Debian/Ubuntu 稳定仓库没有（仅 Debian 13 backports、testing、Ubuntu 26.04+ 有前两者）。restore 会先尝试 apt 安装，失败则给出 backports / 手动编译提示。
 - **PEP 668**：waypaper 的 pip 安装自动加 `--break-system-packages`（Debian/Ubuntu 默认阻止系统级 pip）。
 - **服务提供包**：`libvirtd.service` 的提供包按家族映射（Debian 为 `libvirt-daemon-system`）。
-- **rime-ice 雾凇拼音自动部署**：无 .deb，但官方发布 release zip（`full.zip`）——restore 自动下载（GitHub → 南京大学 NJU 镜像 → ghproxy 兜底）→ 解压复制到 `~/.local/share/fcitx5/rime`（fcitx5-rime 包提供引擎）。Arch 上仍走 archlinuxcn 包，不受影响。
+- **rime-ice 雾凇拼音自动部署**：无 .deb，但官方发布 release zip（`full.zip`）——restore 自动从 GitHub 直连下载 → 解压复制到 `~/.local/share/fcitx5/rime`（fcitx5-rime 包提供引擎）。Arch 上仍走 archlinuxcn 包，不受影响。
 - **登录管理器自动安装**：Debian/RHEL 自动装并启用 `lightdm` + `lightdm-gtk-greeter`；已装有 gdm/sddm 等则保留并确保启用。
 - **ly**：仅 Arch 有包（自动安装）；Debian/RHEL 上由脚本改用 lightdm。
 - **export 仅限 Arch**：快照的 pkglist 由 pacman 生成，export 只能在 Arch 参考机上运行（Ubuntu 上 restore 没问题，但快照必须来自 Arch）。
@@ -147,7 +147,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore/export 开头都会显示 `v版本号`（当前 v1.4.1）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore/export 开头都会显示 `v版本号`（当前 v1.4.2）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
 - 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
 - export 默认修正 niri config 两处笔误，live 配置不受影响
