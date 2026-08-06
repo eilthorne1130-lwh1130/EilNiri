@@ -69,7 +69,7 @@ KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -1111,7 +1111,10 @@ install_niri_binary() {
         warn "$(_t "Prebuilt package unusable, falling back to source build." "Prebuilt package unusable, falling back to source build.")"
     fi
 
-    # --- Strategy 2: offline build from the official vendored source archive (published by upstream for offline builds) ---
+    # --- Strategy 2: source build ---
+    # 2a: offline build from the official vendored source archive (pre-fetched deps, no network at build time).
+    # 2b: if the big archive cannot be downloaded (common on CN/flaky networks), fall back to the small
+    #     source tarball (~3MB) and build with deps fetched from crates.io (rsproxy mirror when configured).
     log "$(_t "No prebuilt binary for this version, building from official vendored source (10-20 min)..." "No prebuilt binary for this version, building from official vendored source (10-20 min)...")"
     url="$NIRI_GH/download/v${ver}/niri-${ver}-vendored-dependencies.tar.xz"
     if download_gh "$url" "$tmp"; then
@@ -1125,11 +1128,18 @@ install_niri_binary() {
             :
         else
             dlrc=$?
-            MANUAL_ITEMS+=("niri — source archive download failed (curl exit code $dlrc through all mirrors); install manually: $NIRI_GH")
-            return 1
+            log "$(_t "Vendored archive unreachable (curl exit code " "Vendored archive unreachable (curl exit code ") $dlrc$(_t "), switching to the small source tarball + network deps..." "), switching to the small source tarball + network deps...")"
+            url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
+            if download_gh "$url" "$tmp"; then
+                :
+            else
+                dlrc=$?
+                MANUAL_ITEMS+=("niri — source archive download failed (curl exit code $dlrc through all mirrors, vendored + source tarball); install manually: $NIRI_GH")
+                return 1
+            fi
         fi
     fi
-    if ! tar xJf "$tmp" -C "$work" 2>/dev/null; then
+    if ! tar xJf "$tmp" -C "$work" 2>/dev/null && ! tar xzf "$tmp" -C "$work" 2>/dev/null; then
         MANUAL_ITEMS+=("niri — source archive extraction failed, install manually: $url")
         return 1
     fi
@@ -1157,7 +1167,7 @@ install_niri_binary() {
     fi
 
     # Build in background so the rest of the install (packages/services/config) proceeds meanwhile
-    log "$(_t "Building niri in background (vendored deps, no network needed); continuing install..." "Building niri in background (vendored deps, no network needed); continuing install...")"
+    log "$(_t "Building niri in background; continuing install..." "Building niri in background; continuing install...")"
     bg_build_start niri "$srcdir" "$LOG_DIR/niri-build.log" \
         bash -c "cd '$srcdir' && cargo build --release -j $(cargo_jobs)"
     return "$BG_PENDING_RC"
