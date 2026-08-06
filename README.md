@@ -147,7 +147,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore/export 开头都会显示 `v版本号`（当前 v1.4.5）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore/export 开头都会显示 `v版本号`（当前 v1.4.6）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
 - 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
 - export 默认修正 niri config 两处笔误，live 配置不受影响

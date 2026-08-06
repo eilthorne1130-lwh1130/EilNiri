@@ -69,7 +69,7 @@ KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.4.5"
+SCRIPT_VERSION="1.4.6"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -512,7 +512,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v3"
+PROGRESS_VERSION="v4"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -1625,18 +1625,23 @@ stage_apps_install() {
     if [ "${_disk_mb:-0}" -gt 0 ] && [ "$_disk_mb" -lt 6144 ]; then
         warn "$(_t "Low disk space: " "Low disk space: ") $((_disk_mb/1024))GB $(_t "free — cargo builds need ~6GB, the build may fail." "free — cargo builds need ~6GB, the build may fail.")"
     fi
+    # baseline failure counts: the stage is only marked complete when nothing new failed
+    local _bf=${#FAILED_PKGS[@]} _bm=${#MANUAL_ITEMS[@]}
     apply_cargo_mirror
     case "$DISTRO_FAMILY" in
         arch)   install_arch ;;
         rhel)   install_rhel ;;
         debian) install_debian ;;
     esac
-    # Defer the progress mark while background builds (niri/awww) are still running;
-    # stage_wait_builds marks the stage complete once they finish.
-    if [ ${#BG_JOBS[@]} -eq 0 ]; then
-        stage_mark apps
-    else
+    # Defer the progress mark while background builds (niri/awww) are still running
+    # (stage_wait_builds marks the stage complete once they finish), and when anything
+    # failed in this run — otherwise a rerun would skip retrying the failed installs.
+    if [ ${#BG_JOBS[@]} -gt 0 ]; then
         log "$(_t "Background builds pending (niri/awww); stage marked complete after they finish." "Background builds pending (niri/awww); stage marked complete after they finish.")"
+    elif [ ${#FAILED_PKGS[@]} -gt "$_bf" ] || [ ${#MANUAL_ITEMS[@]} -gt "$_bm" ]; then
+        warn "$(_t "Some packages failed or need manual install; apps stage not marked complete — rerun (without deleting progress) retries them." "Some packages failed or need manual install; apps stage not marked complete — rerun (without deleting progress) retries them.")"
+    else
+        stage_mark apps
     fi
 }
 
