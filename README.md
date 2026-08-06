@@ -99,7 +99,7 @@ sudo ./install.sh rollback
 - **Ubuntu 版本**：建议 24.04+。低于 24.04 时 Pre-Flight 会明确警告（22.04 等旧版仓库基本没有 niri 套件包）；26.04+ 的 universe 已自带 hyprlock / hypridle，会直接 apt 装成功
 - **debconf 不卡流程**：Debian 系自动 `DEBIAN_FRONTEND=noninteractive`，apt 安装（如 libvirt）不会弹出交互提示
 - **编译提速（后台并行 + 资源感知）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。编译并行度按内存自动限制（每任务约 1.5GB，防小 VM OOM；<8GB 内存时 awww 自动等 niri 完成再编译）。所有下载走 **GitHub 官方直连**（断点续传 + 重试 + 超时，失败自动重试一次并报告 curl 退出码）；CN 时区或 crates.io 不可达时自动启用 rsproxy.cn 的 cargo/rustup 镜像（仅影响 Rust 依赖拉取）。编译日志：`~/.local/state/eilNiri/{niri,awww,xwayland-satellite}-build.log`
-- **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若无预编译包（官方现已只发源码包），先用官方 `vendored-dependencies` 离线源码包（40MB，构建时无需网络）——**该大文件下载失败时自动降级为源码小 tarball（~1MB，独立临时文件防污染）+ 网络依赖构建**；解包后硬校验 `Cargo.toml` 存在才启动构建，内容异常直接进手动报告并附文件类型/大小诊断；后台并行编译（约 10-20 分钟）。
+- **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先尝试官方预编译二进制；无预编译包（官方现已只发源码包）则下载**源码小 tarball（~1MB）**后台 `cargo build --release`（依赖从 crates.io 拉取，rsproxy 镜像兜底；约 10-20 分钟）。**仅当任何 cargo 注册源都不可达时**才额外下载 40MB `vendored-dependencies` 归档——注意该归档**只含依赖 crate 不含 niri 源码**，脚本会把它解到 `vendor/` 并写入 `.cargo/config.toml` 做完全离线构建。解包后硬校验 `Cargo.toml`，内容异常直接进手动报告并附文件类型/大小诊断。
 - **awww 自动安装**：无 .deb 也无预编译二进制，且上游已从 GitHub 迁到 Codeberg。restore 自动浅克隆 `codeberg.org/LGFae/awww` → 后台 `cargo build --release`（约 5 分钟）→ 安装 `awww` 与 `awww-daemon` 到 `/usr/local/bin`。
 - **satty 自动安装**：无 .deb，但官方（Satty-org/Satty）发布预编译二进制。restore 直接走 `releases/latest/download` 稳定 URL（免 GitHub API，CN 更稳）下载 `satty-<arch>-unknown-linux-gnu.tar.gz`（x86_64/aarch64）→ 安装到 `/usr/local/bin`，并确保 GTK4/libadwaita/librsvg 运行时库；预编译不可用时回退 `cargo install`。
 - **xwayland-satellite 自动安装**：Debian/Ubuntu 稳定仓库没有（Fedora 有），且**未发布到 crates.io**（已验证 404）。restore 自动装构建依赖（git/clang/libclang-dev/libxcb-cursor-dev）后 `cargo install --git`（官方 GitHub 仓库，约 3 分钟，日志带失败尾部），并顺带装 Xwayland。
@@ -147,7 +147,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore/export 开头都会显示 `v版本号`（当前 v1.4.4）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore/export 开头都会显示 `v版本号`（当前 v1.4.5）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
 - 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
 - export 默认修正 niri config 两处笔误，live 配置不受影响

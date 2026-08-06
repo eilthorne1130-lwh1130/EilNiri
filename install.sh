@@ -69,7 +69,7 @@ KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.4.4"
+SCRIPT_VERSION="1.4.5"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -960,8 +960,10 @@ download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the cur
     fi
 }
 
-# Cargo/rustup mirror for CN timezones (builds fetch from crates.io / static.rust-lang.org)
-# Also enabled when crates.io itself is unreachable (probe), e.g. restricted networks.
+# Cargo/rustup mirror for CN timezones (builds fetch from crates.io / static.rust-lang.org).
+# Sets CRATES_IO_OK=1 when at least one registry (crates.io or rsproxy) is reachable —
+# install_niri_binary uses it to pick the network build vs the vendored-dependencies offline build.
+CRATES_IO_OK=0
 apply_cargo_mirror() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     local tz
@@ -970,7 +972,8 @@ apply_cargo_mirror() {
     [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]] && cn=1
     if [ "$cn" -eq 0 ]; then
         if curl -fsS --max-time 8 -o /dev/null https://index.crates.io/config.json 2>/dev/null; then
-            return 0   # crates.io reachable, no mirror needed
+            CRATES_IO_OK=1   # crates.io reachable, no mirror needed
+            return 0
         fi
         log "$(_t "crates.io unreachable, enabling rsproxy mirror as fallback" "crates.io unreachable, enabling rsproxy mirror as fallback")"
     fi
@@ -988,6 +991,12 @@ index = "sparse+https://rsproxy.cn/index/"
 [net]
 git-fetch-with-cli = true
 EOF
+    if curl -fsS --max-time 8 -o /dev/null https://rsproxy.cn/index/config.json 2>/dev/null; then
+        CRATES_IO_OK=1   # rsproxy mirror works, network build viable
+    else
+        CRATES_IO_OK=0   # no registry reachable -> niri must build offline from vendored deps
+        log "$(_t "rsproxy also unreachable — niri will use the vendored-dependencies archive" "rsproxy also unreachable — niri will use the vendored-dependencies archive")"
+    fi
     export RUSTUP_DIST_SERVER="https://rsproxy.cn" RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
     log "$(_t "CN timezone detected: cargo/rustup mirror enabled (rsproxy.cn)" "CN timezone detected: cargo/rustup mirror enabled (rsproxy.cn)")"
 }
@@ -1083,11 +1092,19 @@ install_niri_binary() {
     fi
 
     # --- Strategy 2: source build ---
-    # 2a: offline build from the official vendored source archive (pre-fetched deps, no network at build time).
-    # 2b: if the big archive cannot be downloaded (common on CN/flaky networks), fall back to the small
-    #     source tarball (~3MB) and build with deps fetched from crates.io (rsproxy mirror when configured).
-    log "$(_t "No prebuilt binary for this version, building from official vendored source (10-20 min)..." "No prebuilt binary for this version, building from official vendored source (10-20 min)...")"
-    url="$NIRI_GH/download/v${ver}/niri-${ver}-vendored-dependencies.tar.xz"
+    # The source tarball (~1MB) is the primary download; the 40MB vendored-dependencies archive
+    # contains ONLY dependency crates (no niri source!), so it is used just as an offline depot
+    # when no cargo registry (crates.io / rsproxy) is reachable.
+    if [ "${CRATES_IO_OK:-0}" -eq 0 ]; then
+        # apply_cargo_mirror may not have run (e.g. direct invocation); probe crates.io now
+        if curl -fsS --max-time 8 -o /dev/null https://index.crates.io/config.json 2>/dev/null; then
+            CRATES_IO_OK=1
+        fi
+    fi
+    local offline=0
+    [ "$CRATES_IO_OK" -eq 0 ] && offline=1
+    log "$(_t "No prebuilt binary for this version, building from source (10-20 min)..." "No prebuilt binary for this version, building from source (10-20 min)...")"
+    url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
     if download_gh "$url" "$tmp"; then
         :
     else
@@ -1099,21 +1116,11 @@ install_niri_binary() {
             :
         else
             dlrc=$?
-            log "$(_t "Vendored archive unreachable (curl exit code " "Vendored archive unreachable (curl exit code ") $dlrc$(_t "), switching to the small source tarball + network deps..." "), switching to the small source tarball + network deps...")"
-            # start the tarball download from a clean file: the failed vendored attempt may have left
-            # partial bytes in $tmp, and -C - resume would corrupt the tarball by concatenating them
-            rm -f "$tmp"
-            url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
-            if download_gh "$url" "$tmp"; then
-                :
-            else
-                dlrc=$?
-                MANUAL_ITEMS+=("niri — source archive download failed (curl exit code $dlrc via GitHub, vendored + source tarball); install manually: $NIRI_GH")
-                return 1
-            fi
+            MANUAL_ITEMS+=("niri — source tarball download failed (curl exit code $dlrc via GitHub); install manually: $NIRI_GH")
+            return 1
         fi
     fi
-    if ! tar xJf "$tmp" -C "$work" 2>/dev/null && ! tar xzf "$tmp" -C "$work" 2>/dev/null; then
+    if ! tar xzf "$tmp" -C "$work" 2>/dev/null; then
         MANUAL_ITEMS+=("niri — source archive extraction failed, install manually: $url")
         return 1
     fi
@@ -1131,6 +1138,45 @@ install_niri_binary() {
         fsize=$(stat -c%s "$tmp" 2>/dev/null || echo "?")
         MANUAL_ITEMS+=("niri — downloaded archive is unusable (no Cargo.toml after extraction; file type: $ftype, size: $fsize bytes, downloaded from: $url); install manually: $NIRI_GH")
         return 1
+    fi
+
+    # Offline depot: when no cargo registry is reachable, fetch the vendored-dependencies archive
+    # (dependency crates only) and wire it up as the cargo source so the build needs no network.
+    if [ "$offline" -eq 1 ]; then
+        log "$(_t "No cargo registry reachable, downloading vendored dependencies for an offline build..." "No cargo registry reachable, downloading vendored dependencies for an offline build...")"
+        local vtmp
+        vtmp=$(mktemp)
+        register_temp_path "$vtmp"
+        url="$NIRI_GH/download/v${ver}/niri-${ver}-vendored-dependencies.tar.xz"
+        if download_gh "$url" "$vtmp"; then
+            :
+        else
+            dlrc=$?
+            log "$(_t "Vendored deps download failed, retrying once after 10s..." "Vendored deps download failed, retrying once after 10s...")"
+            sleep 10
+            if download_gh "$url" "$vtmp"; then
+                :
+            else
+                dlrc=$?
+                MANUAL_ITEMS+=("niri — vendored dependencies download failed (curl exit code $dlrc); install manually: $NIRI_GH")
+                return 1
+            fi
+        fi
+        mkdir -p "$srcdir/vendor"
+        if ! tar xJf "$vtmp" -C "$srcdir/vendor" 2>/dev/null || [ ! -d "$srcdir/vendor/vendor" ]; then
+            MANUAL_ITEMS+=("niri — vendored dependencies extraction failed; install manually: $NIRI_GH")
+            return 1
+        fi
+        # point cargo at the vendored crates so the build is fully offline
+        mkdir -p "$srcdir/.cargo"
+        cat > "$srcdir/.cargo/config.toml" <<'EOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor/vendor"
+EOF
+        log "$(_t "Vendored dependencies ready — building fully offline." "Vendored dependencies ready — building fully offline.")"
     fi
 
     # Install build dependencies + Rust toolchain (foreground, fast)
