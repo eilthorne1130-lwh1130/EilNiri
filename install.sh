@@ -69,7 +69,7 @@ KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -1047,14 +1047,15 @@ install_niri_binary() {
             ;;
     esac
 
-    # Resolve the latest version: prefer the /releases/latest redirect (no API, works behind CN walls),
-    # fall back to the GitHub API if the redirect fails.
+    # Resolve the latest version: prefer the /releases/latest redirect (no API), fall back to the GitHub API.
+    # NOTE: GitHub HTTP headers are CRLF-terminated — the extracted tag must be stripped of \r,
+    # otherwise it embeds a control character in the download URL and curl fails with exit code 3.
     local ver url tmp work srcdir d
     ver=$(curl -fsSI --retry 2 https://github.com/niri-wm/niri/releases/latest 2>/dev/null \
-        | grep -i '^location:' | sed -n 's#.*/tag/\(v[^/]*\).*#\1#p' | head -n 1 | sed 's/^v//')
+        | grep -i '^location:' | sed -n 's#.*/tag/\(v[^/]*\).*#\1#p' | head -n 1 | sed 's/^v//' | tr -d '\r')
     if [ -z "$ver" ]; then
         ver=$(curl -fsSL https://api.github.com/repos/niri-wm/niri/releases/latest 2>/dev/null \
-            | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/')
+            | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/' | tr -d '\r')
     fi
     if [ -z "$ver" ]; then
         MANUAL_ITEMS+=("niri — could not fetch latest version (network or GitHub restricted), install manually: $NIRI_GH")
@@ -2171,6 +2172,14 @@ do_restore() {
     section "$(_t "Restore" "Restore")" "v$SCRIPT_VERSION — $(_t "Restore Niri Desktop" "Restore Niri Desktop")"
     [ "$DRY_RUN" -eq 1 ] && warn "$(_t "DRY-RUN mode: printing plan only, no changes." "DRY-RUN mode: printing plan only, no changes.")"
     show_logo
+
+    # Snapshot completeness check: only the script was copied (missing pkglist/ or config/)
+    local _snap_missing=0
+    [ -d "$BASE_DIR/pkglist" ] || _snap_missing=1
+    [ -d "$BASE_DIR/config" ] || _snap_missing=1
+    if [ "$_snap_missing" -eq 1 ]; then
+        warn "$(_t "Snapshot content missing (pkglist/ and/or config/ not found in " "Snapshot content missing (pkglist/ and/or config/ not found in ") $BASE_DIR$(_t "). Only the script was copied? Services list and config deploy will be skipped, and the built-in package list will be used. Copy the WHOLE eilNiri directory (install.sh + pkglist/ + config/) to the target machine." "). Only the script was copied? Services list and config deploy will be skipped, and the built-in package list will be used. Copy the WHOLE eilNiri directory (install.sh + pkglist/ + config/) to the target machine.")"
+    fi
 
     # update the system first (a fresh machine has a stale package db, so installing fzf directly may fail)
     stage_preflight
