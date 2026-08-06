@@ -5,12 +5,14 @@
 ## 快速开始
 
 ```bash
-# 1. 在当前 Arch 机器采集快照（普通用户运行，只读系统不改动）
+# 1. 在当前 Arch 机器采集快照（普通用户运行，只读系统不改动；完成后自动自检并提示 git 提交）
 ./install.sh export
 
-# 2. 把整个 EilNiri 目录带到新机器（git clone / U盘 任意方式）
+# 2. 用 git 云同步时，快照必须提交（git clone 只传被跟踪的文件，否则目标机没有 pkglist/ 和 snapshot/）：
+git add pkglist snapshot && git commit -m "snapshot update" && git push
+#    （或直接用 U盘/rsync 拷贝整个 EilNiri 目录）
 
-# 3. 在新机器安装（需要 root；一个脚本搞定所有：包、niri/awww/satty、输入法词库、登录管理器、服务、配置）
+# 3. 在新机器克隆/拷贝后安装（需要 root；一个脚本搞定所有：包、niri/awww/satty、输入法词库、登录管理器、服务、配置）
 sudo ./install.sh restore
 #    完成后重启，直接进入登录界面 → niri 桌面
 
@@ -48,11 +50,11 @@ sudo ./install.sh rollback
 | 显示管理器 | ✅ 自动 | 自动安装并启用：Arch→ly；Debian/RHEL→lightdm（已装其他 DM 则保留并启用） |
 | 系统服务 | 可选 | bluetooth / libvirtd / power-profiles-daemon |
 
-### 配置采集（export 复制进 `config/`）
+### 配置采集（export 复制进 `snapshot/`）
 
 `~/.config/` 下：niri waybar mako（排 __pycache__）kitty hypr copyq satty waypaper fcitx5 fcitx environment.d xdg-desktop-portal gtk-3.0 gtk-4.0 fontconfig，以及家目录 `.pam_environment`。
 
-额外捕获并修复 `/usr/bin/niri-session`（systemd 弃用警告）→ 存入 `config/.local/bin/`。
+额外捕获并修复 `/usr/bin/niri-session`（systemd 弃用警告）→ 存入 `snapshot/.local/bin/`。
 
 敏感数据（~/.ssh、keyring、token）不进入快照。
 
@@ -129,7 +131,7 @@ sudo ./install.sh rollback
 EilNiri/
 ├── install.sh
 ├── pkglist/          (official.txt, services.txt)
-├── config/           (配置镜像 + .local/bin/niri-session)
+├── snapshot/        (配置镜像 + .local/bin/niri-session)
 ├── backups/          (回滚快照 tar.gz)
 ├── .replicate_progress
 └── README.md

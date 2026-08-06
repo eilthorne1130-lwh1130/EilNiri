@@ -69,7 +69,7 @@ KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.4.6"
+SCRIPT_VERSION="1.4.8"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -331,7 +331,14 @@ do_export() {
     fi
 
     local SNAP_PKGLIST="$BASE_DIR/pkglist"
-    local SNAP_CONFIG="$BASE_DIR/config"
+    local SNAP_CONFIG="$BASE_DIR/snapshot"
+
+    # The snapshot mirror lives in snapshot/ (not config/, which may be a project file at repo
+    # root, e.g. a waybar JSON). It must be a DIRECTORY; a same-named regular file would break it.
+    if [ -e "$SNAP_CONFIG" ] && [ ! -d "$SNAP_CONFIG" ]; then
+        warn "$(_t "A regular file exists at " "A regular file exists at ") $SNAP_CONFIG$(_t " — the snapshot mirror must be a directory. Move or delete the file first, then rerun export." " — the snapshot mirror must be a directory. Move or delete the file first, then rerun export.")"
+        return 1
+    fi
 
     section "Export v$SCRIPT_VERSION" "$(_t "Collect Niri Suite Snapshot" "Collect Niri Suite Snapshot")"
     info_kv "$(_t "Snapshot Dir" "Snapshot Dir")" "$BASE_DIR"
@@ -436,7 +443,30 @@ DESKTOP_EOF
     section "$(_t "Export Done" "Export Done")" "$(_t "Snapshot Created" "Snapshot Created")"
     info_kv "$(_t "Pkglist" "Pkglist")" "$SNAP_PKGLIST/"
     info_kv "$(_t "Config Mirror" "Config Mirror")" "$SNAP_CONFIG/"
-    log "Next: copy the eilNiri directory to the new machine and run ${BOLD}sudo ./install.sh restore${NC}"
+
+    # --- 3.6 self-check: the snapshot must be complete before it is pushed/cloned anywhere ---
+    local _chk_err=0
+    [ -s "$SNAP_PKGLIST/official.txt" ] || { warn "$(_t "Self-check FAILED: pkglist/official.txt is empty — export is incomplete." "Self-check FAILED: pkglist/official.txt is empty — export is incomplete.")"; _chk_err=1; }
+    if [ ! -d "$SNAP_CONFIG/.config" ] || [ -z "$(ls -A "$SNAP_CONFIG/.config" 2>/dev/null)" ]; then
+        warn "$(_t "Self-check FAILED: config/.config mirror is empty — export is incomplete." "Self-check FAILED: config/.config mirror is empty — export is incomplete.")"
+        _chk_err=1
+    fi
+    if [ "$_chk_err" -eq 1 ]; then
+        error "$(_t "Snapshot is incomplete; fix the issues above and rerun export. Do NOT push/use this snapshot." "Snapshot is incomplete; fix the issues above and rerun export. Do NOT push/use this snapshot.")"
+        return 1
+    fi
+    success "$(_t "Snapshot self-check passed." "Snapshot self-check passed.")"
+
+    # If this repo is synced via git (cloud clone), remind to commit the snapshot content —
+    # git only transfers tracked files, and a missing pkglist/ or config/ silently breaks restore.
+    if [ -d "$BASE_DIR/.git" ] || git -C "$BASE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        echo ""
+        info_kv "$(_t "Git sync" "Git sync")" "$(_t "snapshot must be committed" "snapshot must be committed")" ""
+        echo -e "   ${H_CYAN}git add pkglist snapshot && git commit -m \"snapshot update\" && git push${NC}"
+        echo -e "   ${DIM}$(_t "(git clone only transfers tracked files — without this, restore on the target machine has no snapshot)" "(git clone only transfers tracked files — without this, restore on the target machine has no snapshot)")${NC}"
+    else
+        log "Next: copy the eilNiri directory to the new machine and run ${BOLD}sudo ./install.sh restore${NC}"
+    fi
 }
 
 # ==============================================================================
@@ -1893,7 +1923,7 @@ stage_backup() {
     fi
 
     section "$(_t "Config Snapshot" "Config Snapshot")" "$(_t "Create rollback point before deploy" "Create rollback point before deploy")"
-    local snap_cfg="$BASE_DIR/config"
+    local snap_cfg="$BASE_DIR/snapshot"
     if [ ! -d "$snap_cfg/.config" ]; then
         warn "$(_t "config/ mirror not found, skipping backup." "config/ mirror not found, skipping backup.")"
         stage_mark backup
@@ -1952,7 +1982,7 @@ stage_configs() {
         log "$(_t "Config deploy stage done, skipping." "Config deploy stage done, skipping.")"
         return
     fi
-    local snap="$BASE_DIR/config"
+    local snap="$BASE_DIR/snapshot"
     if [ ! -d "$snap" ]; then
         warn "$(_t "config/ mirror not found, skipping deploy." "config/ mirror not found, skipping deploy.")"
         return
@@ -2250,7 +2280,7 @@ do_restore() {
     # Snapshot completeness check: only the script was copied (missing pkglist/ or config/)
     local _snap_missing=0
     [ -d "$BASE_DIR/pkglist" ] || _snap_missing=1
-    [ -d "$BASE_DIR/config" ] || _snap_missing=1
+    [ -d "$BASE_DIR/snapshot" ] || _snap_missing=1
     if [ "$_snap_missing" -eq 1 ]; then
         warn "$(_t "Snapshot content missing (pkglist/ and/or config/ not found in " "Snapshot content missing (pkglist/ and/or config/ not found in ") $BASE_DIR$(_t "). Only the script was copied? Services list and config deploy will be skipped, and the built-in package list will be used. Copy the WHOLE eilNiri directory (install.sh + pkglist/ + config/) to the target machine." "). Only the script was copied? Services list and config deploy will be skipped, and the built-in package list will be used. Copy the WHOLE eilNiri directory (install.sh + pkglist/ + config/) to the target machine.")"
         if [ "$DRY_RUN" -eq 0 ] && ! confirm "$(_t "Snapshot content missing — continue without config/services? [Y/n] (default Y):" "Snapshot content missing — continue without config/services? [Y/n] (default Y):")" "Y" 30; then
