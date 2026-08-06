@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.6.2"
+SCRIPT_VERSION="1.6.3"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -2343,16 +2343,35 @@ ensure_lightdm_session() {
         return 0
     fi
 
-    # idempotent write of the drop-in
+    # idempotent writes:
+    # 1) lightdm user-session via a HIGH-priority drop-in (99- loads last, beats 10-ubuntu.conf etc.)
     mkdir -p /etc/lightdm/lightdm.conf.d
-    if [ -f /etc/lightdm/lightdm.conf.d/50-niri.conf ] && grep -q '^user-session=niri$' /etc/lightdm/lightdm.conf.d/50-niri.conf; then
+    if [ -f /etc/lightdm/lightdm.conf.d/99-niri.conf ] && grep -q '^user-session=niri$' /etc/lightdm/lightdm.conf.d/99-niri.conf; then
         log "$(_t "lightdm default session already set to niri" "lightdm default session already set to niri")"
     else
-        cat > /etc/lightdm/lightdm.conf.d/50-niri.conf <<'EOF'
+        cat > /etc/lightdm/lightdm.conf.d/99-niri.conf <<'EOF'
 [Seat:*]
 user-session=niri
 EOF
         log "$(_t "lightdm default session set to niri (user-session=niri)" "lightdm default session set to niri (user-session=niri)")"
+    fi
+    # drop the old 50-niri.conf if present (99- supersedes it; avoids confusion)
+    if [ -f /etc/lightdm/lightdm.conf.d/50-niri.conf ]; then
+        rm -f /etc/lightdm/lightdm.conf.d/50-niri.conf
+        log "$(_t "removed superseded 50-niri.conf" "removed superseded 50-niri.conf")"
+    fi
+
+    # 2) lightdm-gtk-greeter default-session — its priority is HIGHER than lightdm's
+    #    user-session, so without this the greeter can still boot the distro desktop.
+    mkdir -p /etc/lightdm/lightdm-gtk-greeter.conf.d
+    if [ -f /etc/lightdm/lightdm-gtk-greeter.conf.d/99-niri.conf ] && grep -q '^default-session=niri$' /etc/lightdm/lightdm-gtk-greeter.conf.d/99-niri.conf; then
+        :
+    else
+        cat > /etc/lightdm/lightdm-gtk-greeter.conf.d/99-niri.conf <<'EOF'
+[greeter]
+default-session=niri
+EOF
+        log "$(_t "lightdm-gtk-greeter default session set to niri" "lightdm-gtk-greeter default session set to niri")"
     fi
 }
 
@@ -2386,7 +2405,7 @@ boot_env_check() {
     else
         info_kv "$(_t "Niri Session" "Niri Session")" "$(_t "NOT registered" "NOT registered")" "$(_t "(niri build incomplete — login goes to the default desktop)" "(niri build incomplete — login goes to the default desktop)")"
     fi
-    if [ -f /etc/lightdm/lightdm.conf.d/50-niri.conf ]; then
+    if [ -f /etc/lightdm/lightdm.conf.d/99-niri.conf ]; then
         info_kv "$(_t "LightDM Session" "LightDM Session")" "user-session=niri" "$(_t "configured — login goes straight to niri" "configured — login goes straight to niri")"
     fi
     # effective user-session value: lightdm reads lightdm.conf first, then lightdm.conf.d/*.conf
@@ -2404,6 +2423,24 @@ boot_env_check() {
             warn "$(_t "Last user-session assignment is " "Last user-session assignment is ") '$_eff_last'$(_t " — it overrides niri; login will go to the wrong desktop. Check /etc/lightdm/lightdm.conf.d/ and /etc/lightdm/lightdm.conf." " — it overrides niri; login will go to the wrong desktop. Check /etc/lightdm/lightdm.conf.d/ and /etc/lightdm/lightdm.conf.")"
         fi
     fi
+    # lightdm-gtk-greeter default-session (its priority is HIGHER than user-session)
+    local _gdef _gdef_last _gf
+    _gdef=$(grep -hE '^[[:space:]]*default-session=' /etc/lightdm/lightdm-gtk-greeter.conf 2>/dev/null
+        for _gf in /etc/lightdm/lightdm-gtk-greeter.conf.d/*.conf; do
+            [ -f "$_gf" ] && grep -hE '^[[:space:]]*default-session=' "$_gf" 2>/dev/null
+        done
+    )
+    _gdef_last=$(printf '%s\n' "$_gdef" | tail -n 1)
+    if [ -n "$_gdef" ]; then
+        info_kv "$(_t "greeter default-session" "greeter default-session")" "$(printf '%s' "$_gdef" | tr '\n' '; ' | sed 's/; $//')" "$(_t "(higher priority than user-session)" "(higher priority than user-session)")"
+        if [ "$_gdef_last" != "default-session=niri" ]; then
+            warn "$(_t "Greeter default-session is " "Greeter default-session is ") '$_gdef_last'$(_t " — it overrides niri; login will go to the wrong desktop." " — it overrides niri; login will go to the wrong desktop.")"
+        fi
+    fi
+    # session files visible to lightdm
+    local _sessions
+    _sessions=$(ls /usr/share/xsessions /usr/local/share/xsessions /usr/share/wayland-sessions /usr/local/share/wayland-sessions 2>/dev/null | sort -u | tr '\n' ' ')
+    info_kv "$(_t "Sessions (lightdm)" "Sessions (lightdm)")" "${_sessions:-none}" "$(_t "(niri present if niri.desktop listed)" "(niri present if niri.desktop listed)")"
 }
 
 do_rollback() {
