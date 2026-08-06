@@ -69,7 +69,7 @@ KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.4.3"
+SCRIPT_VERSION="1.4.4"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -1100,6 +1100,9 @@ install_niri_binary() {
         else
             dlrc=$?
             log "$(_t "Vendored archive unreachable (curl exit code " "Vendored archive unreachable (curl exit code ") $dlrc$(_t "), switching to the small source tarball + network deps..." "), switching to the small source tarball + network deps...")"
+            # start the tarball download from a clean file: the failed vendored attempt may have left
+            # partial bytes in $tmp, and -C - resume would corrupt the tarball by concatenating them
+            rm -f "$tmp"
             url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
             if download_gh "$url" "$tmp"; then
                 :
@@ -1120,6 +1123,15 @@ install_niri_binary() {
     for d in "$work"/*/; do
         [ -f "$d/Cargo.toml" ] && { srcdir="$d"; break; }
     done
+    # Hard validation: never start a cargo build without the manifest. A corrupted/mismatched
+    # download (HTML error page, resumed-across-URLs garbage) extracts fine but lacks Cargo.toml.
+    if [ ! -f "$srcdir/Cargo.toml" ]; then
+        local ftype fsize
+        ftype=$(file -b "$tmp" 2>/dev/null || echo unknown)
+        fsize=$(stat -c%s "$tmp" 2>/dev/null || echo "?")
+        MANUAL_ITEMS+=("niri — downloaded archive is unusable (no Cargo.toml after extraction; file type: $ftype, size: $fsize bytes, downloaded from: $url); install manually: $NIRI_GH")
+        return 1
+    fi
 
     # Install build dependencies + Rust toolchain (foreground, fast)
     if ! ensure_rust; then
@@ -1757,7 +1769,18 @@ stage_dm() {
     if stage_done dm; then return; fi
 
     section "$(_t "Display Manager" "Display Manager")" "$(_t "auto (ly / lightdm)" "auto (ly / lightdm)")"
-    local known_dms=(gdm sddm lightdm lxdm ly greetd plasma-login-manager lemurs)
+
+    # A display-manager.service already pointing at some DM means the system has one configured
+    # (e.g. gdm3 preinstalled on Ubuntu Desktop). Treat it as handled and move on.
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        local dm_link
+        dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
+        info_kv "$(_t "DM" "DM")" "display-manager.service" "already configured (→ ${dm_link:-unknown}), keep"
+        stage_mark dm
+        return
+    fi
+
+    local known_dms=(gdm3 gdm sddm lightdm lxdm ly greetd plasma-login-manager lemurs)
     local dm found=""
     for dm in "${known_dms[@]}"; do
         if pkg_installed "$dm"; then found="$dm"; break; fi
@@ -2179,6 +2202,10 @@ do_restore() {
     [ -d "$BASE_DIR/config" ] || _snap_missing=1
     if [ "$_snap_missing" -eq 1 ]; then
         warn "$(_t "Snapshot content missing (pkglist/ and/or config/ not found in " "Snapshot content missing (pkglist/ and/or config/ not found in ") $BASE_DIR$(_t "). Only the script was copied? Services list and config deploy will be skipped, and the built-in package list will be used. Copy the WHOLE eilNiri directory (install.sh + pkglist/ + config/) to the target machine." "). Only the script was copied? Services list and config deploy will be skipped, and the built-in package list will be used. Copy the WHOLE eilNiri directory (install.sh + pkglist/ + config/) to the target machine.")"
+        if [ "$DRY_RUN" -eq 0 ] && ! confirm "$(_t "Snapshot content missing — continue without config/services? [Y/n] (default Y):" "Snapshot content missing — continue without config/services? [Y/n] (default Y):")" "Y" 30; then
+            error "$(_t "Aborted: copy the whole eilNiri directory (with pkglist/ and config/) and rerun." "Aborted: copy the whole eilNiri directory (with pkglist/ and config/) and rerun.")"
+            exit 1
+        fi
     fi
 
     # update the system first (a fresh machine has a stale package db, so installing fzf directly may fail)

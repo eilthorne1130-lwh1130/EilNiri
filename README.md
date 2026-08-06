@@ -62,7 +62,7 @@ sudo ./install.sh rollback
 2. **目标用户检测**：默认 UID 1000，30s 超时可选创建新用户
 3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）；**CN 时区自动启用 cargo/rustup 镜像（rsproxy.cn）**；niri/awww 的 cargo 编译**转入后台**（日志 `~/.local/state/eilNiri/{niri,awww}-build.log`）
 4. **服务启用**：fzf 选择系统服务 → `systemctl enable --now`（后台编译同时进行）
-5. **显示管理器**：自动安装并启用（Arch→ly；Debian/RHEL→lightdm，装不上自动依次尝试 sddm/gdm3；已有 DM 则保留并启用）——重启后直接进登录界面
+5. **显示管理器**：自动安装并启用（Arch→ly；Debian/RHEL→lightdm，装不上自动依次尝试 sddm/gdm3；**已有 DM（如 Ubuntu Desktop 预装 gdm3 / display-manager.service 已配置）则保留**）——重启后直接进登录界面
 6. **配置快照**：部署前将已有配置打包至 `backups/`（tar.gz）
 7. **配置部署**：已有文件自动备份为 `.bak-时间戳` → PipeWire 用户服务自启 → zsh 设为默认 shell
 8. **等待后台构建**：轮询 niri/awww 编译进度（每 15s 显示已用时间 + **当前正在编译的 crate**，如 `Compiling smithay v0.4.0`）→ 编译完成后自动安装二进制到 `/usr/local/bin`；失败读取日志尾部进手动报告。**restore 运行时可在另一终端用 `./install.sh status` 实时查看每个构建的状态/耗时/当前编译项**（日志：`~/.local/state/eilNiri/{niri,awww}-build.log`，`tail -f` 可实时跟看）
@@ -99,7 +99,7 @@ sudo ./install.sh rollback
 - **Ubuntu 版本**：建议 24.04+。低于 24.04 时 Pre-Flight 会明确警告（22.04 等旧版仓库基本没有 niri 套件包）；26.04+ 的 universe 已自带 hyprlock / hypridle，会直接 apt 装成功
 - **debconf 不卡流程**：Debian 系自动 `DEBIAN_FRONTEND=noninteractive`，apt 安装（如 libvirt）不会弹出交互提示
 - **编译提速（后台并行 + 资源感知）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。编译并行度按内存自动限制（每任务约 1.5GB，防小 VM OOM；<8GB 内存时 awww 自动等 niri 完成再编译）。所有下载走 **GitHub 官方直连**（断点续传 + 重试 + 超时，失败自动重试一次并报告 curl 退出码）；CN 时区或 crates.io 不可达时自动启用 rsproxy.cn 的 cargo/rustup 镜像（仅影响 Rust 依赖拉取）。编译日志：`~/.local/state/eilNiri/{niri,awww,xwayland-satellite}-build.log`
-- **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若无预编译包（官方现已只发源码包），先用官方 `vendored-dependencies` 离线源码包（40MB，构建时无需网络）——**该大文件下载失败时自动降级为源码小 tarball（~3MB）+ 网络依赖构建**（依赖逐个从 crates.io/rsproxy 拉取，适配大文件下载受限的网络）；后台并行编译（约 10-20 分钟）；全部失败才列入"需手动安装"报告。
+- **niri 自动安装（分层策略）**：官方仓库无 niri 包。restore 时优先下载官方预编译二进制；若无预编译包（官方现已只发源码包），先用官方 `vendored-dependencies` 离线源码包（40MB，构建时无需网络）——**该大文件下载失败时自动降级为源码小 tarball（~1MB，独立临时文件防污染）+ 网络依赖构建**；解包后硬校验 `Cargo.toml` 存在才启动构建，内容异常直接进手动报告并附文件类型/大小诊断；后台并行编译（约 10-20 分钟）。
 - **awww 自动安装**：无 .deb 也无预编译二进制，且上游已从 GitHub 迁到 Codeberg。restore 自动浅克隆 `codeberg.org/LGFae/awww` → 后台 `cargo build --release`（约 5 分钟）→ 安装 `awww` 与 `awww-daemon` 到 `/usr/local/bin`。
 - **satty 自动安装**：无 .deb，但官方（Satty-org/Satty）发布预编译二进制。restore 直接走 `releases/latest/download` 稳定 URL（免 GitHub API，CN 更稳）下载 `satty-<arch>-unknown-linux-gnu.tar.gz`（x86_64/aarch64）→ 安装到 `/usr/local/bin`，并确保 GTK4/libadwaita/librsvg 运行时库；预编译不可用时回退 `cargo install`。
 - **xwayland-satellite 自动安装**：Debian/Ubuntu 稳定仓库没有（Fedora 有），且**未发布到 crates.io**（已验证 404）。restore 自动装构建依赖（git/clang/libclang-dev/libxcb-cursor-dev）后 `cargo install --git`（官方 GitHub 仓库，约 3 分钟，日志带失败尾部），并顺带装 Xwayland。
@@ -147,7 +147,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore/export 开头都会显示 `v版本号`（当前 v1.4.3）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore/export 开头都会显示 `v版本号`（当前 v1.4.4）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
 - 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
 - export 默认修正 niri config 两处笔误，live 配置不受影响
