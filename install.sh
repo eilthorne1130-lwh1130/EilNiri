@@ -69,7 +69,7 @@ KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.4.8"
+SCRIPT_VERSION="1.4.9"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -1843,73 +1843,90 @@ stage_services() {
 # --- 4.5 display manager (automatic, all families) ---
 # One-script goal: after reboot the machine boots straight into the niri desktop.
 #   Arch  : ly (lightweight, fits niri)
-#   Debian/RHEL: lightdm + lightdm-gtk-greeter (available in Ubuntu/Debian/Fedora repos)
-# If any known DM is already installed it is kept (and enabled if it wasn't).
+#   Debian/RHEL: lightdm + lightdm-gtk-greeter (fallback: sddm)
+# An existing display manager (e.g. gdm3 preinstalled on Ubuntu Desktop) is DISABLED and
+# replaced by the chosen one. Safety: the replacement is installed FIRST and only then is
+# the old DM disabled — if the install fails the current DM stays untouched.
+# Escape hatch: EILNIRI_KEEP_DM=1 keeps the existing DM as-is.
 
 stage_dm() {
     if stage_done dm; then return; fi
 
-    section "$(_t "Display Manager" "Display Manager")" "$(_t "auto (ly / lightdm)" "auto (ly / lightdm)")"
-
-    # A display-manager.service already pointing at some DM means the system has one configured
-    # (e.g. gdm3 preinstalled on Ubuntu Desktop). Treat it as handled and move on.
-    if [ -e /etc/systemd/system/display-manager.service ]; then
-        local dm_link
-        dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
-        info_kv "$(_t "DM" "DM")" "display-manager.service" "already configured (→ ${dm_link:-unknown}), keep"
-        stage_mark dm
-        return
-    fi
+    section "$(_t "Display Manager" "Display Manager")" "$(_t "auto (ly / lightdm, replaces existing)" "auto (ly / lightdm, replaces existing)")"
 
     local known_dms=(gdm3 gdm sddm lightdm lxdm ly greetd plasma-login-manager lemurs)
-    local dm found=""
-    for dm in "${known_dms[@]}"; do
-        if pkg_installed "$dm"; then found="$dm"; break; fi
-    done
-
-    if [ -n "$found" ]; then
-        info_kv "$(_t "DM Conflict" "DM Conflict")" "$found" "already installed, keep"
-        if [ "$DRY_RUN" -eq 1 ]; then
-            log "$(_t "[DRY-RUN] would enable " "[DRY-RUN] would enable ") $found"
-            DRY_SVCS+=("$found")
-        elif ! systemctl is-enabled --quiet "$found" 2>/dev/null; then
-            if exe systemctl enable "$found"; then
-                ENABLED_SVCS+=("$found")
-            fi
-        fi
-        stage_mark dm
-        return
-    fi
-
     local dm_pkgs dm_unit
     case "$DISTRO_FAMILY" in
         arch)   dm_pkgs="ly";           dm_unit="ly@tty1" ;;
         *)      dm_pkgs="lightdm lightdm-gtk-greeter"; dm_unit="lightdm" ;;
     esac
 
+    # what is currently configured/installed?
+    local current=""
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        current=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "display-manager.service")
+        current=$(basename "$current" .service)   # strip the .service suffix for unit comparison
+    fi
+    if [ -z "$current" ]; then
+        local dm
+        for dm in "${known_dms[@]}"; do
+            if pkg_installed "$dm"; then current="$dm"; break; fi
+        done
+    fi
+
+    # keep the existing DM on request, or when it already is the chosen one
+    if [ -n "$current" ] && { [ "${EILNIRI_KEEP_DM:-0}" = "1" ] || [ "$current" = "$dm_unit" ]; }; then
+        local reason="already the chosen DM"
+        [ "${EILNIRI_KEEP_DM:-0}" = "1" ] && reason="EILNIRI_KEEP_DM=1, keep"
+        info_kv "$(_t "DM" "DM")" "$current" "$reason"
+        stage_mark dm
+        return
+    fi
+    [ -n "$current" ] && info_kv "$(_t "DM" "DM")" "$current" "will be replaced by $dm_pkgs"
+
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "$(_t "[DRY-RUN] would install & enable: " "[DRY-RUN] would install & enable: ") $dm_pkgs"
+        log "$(_t "[DRY-RUN] would install & enable: " "[DRY-RUN] would install & enable: ") $dm_pkgs${current:+ ($(_t "disabling " "disabling ") $current)}"
         DRY_PKGS+=("$dm_pkgs")
         DRY_SVCS+=("$dm_unit")
         stage_mark dm
         return
     fi
 
-    # Try a fallback chain when the preferred DM is unavailable (e.g. universe missing, EPEL absent)
-    local tried unit
-    for tried in "$dm_pkgs|$dm_unit" "sddm|sddm" "gdm3|gdm"; do
+    # --- install the chosen DM first; never disable the current one before the replacement is in place ---
+    local ok=0
+    for tried in "$dm_pkgs|$dm_unit" "sddm|sddm"; do
         local tpkg="${tried%%|*}" tunit="${tried##*|}"
-        if pm_install $tpkg && exe systemctl enable "$tunit"; then
-            ENABLED_SVCS+=("$tunit")
-            success "$(_t "Display manager installed & enabled: " "Display manager installed & enabled: ") $tpkg"
-            stage_mark dm
-            return
+        if pm_install $tpkg; then
+            dm_pkgs="$tpkg"; dm_unit="$tunit"; ok=1
+            break
         fi
-        FAILED_PKGS+=("dm:$tunit")
         warn "$(_t "Display manager install failed, trying next..." "Display manager install failed, trying next...") ($tpkg)"
     done
-    warn "$(_t "No display manager could be installed; run niri-session from tty after reboot." "No display manager could be installed; run niri-session from tty after reboot.")"
-    # not marked complete: rerun will retry this stage
+    if [ "$ok" -eq 0 ]; then
+        FAILED_PKGS+=("dm:$dm_unit")
+        warn "$(_t "No display manager could be installed; keeping the existing one (") $current$(_t ") unchanged — run niri-session from tty after reboot." ") unchanged — run niri-session from tty after reboot.")"
+        return   # not marked: rerun retries
+    fi
+
+    # --- disable every known DM and the display-manager.service entry ---
+    local dm
+    for dm in "${known_dms[@]}"; do
+        exe systemctl disable "$dm" 2>/dev/null || true
+    done
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        exe systemctl disable display-manager.service 2>/dev/null || rm -f /etc/systemd/system/display-manager.service
+    fi
+
+    # --- enable the chosen DM ---
+    if exe systemctl enable "$dm_unit"; then
+        ENABLED_SVCS+=("$dm_unit")
+        success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
+        stage_mark dm
+    else
+        FAILED_PKGS+=("dm:$dm_unit")
+        warn "$(_t "Display manager enable failed; run niri-session from tty after reboot." "Display manager enable failed; run niri-session from tty after reboot.")"
+        # not marked: rerun retries
+    fi
 }
 
 # --- 4.6 config snapshot (backup before deploy) ---
