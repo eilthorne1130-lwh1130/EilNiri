@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.6.1"
+SCRIPT_VERSION="1.6.2"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -2312,8 +2312,48 @@ do_restore() {
     stage_verify
     # clean the pacman cache to free disk space
     [ "$DISTRO_FAMILY" = arch ] && exe pacman -Sc --noconfirm 2>/dev/null || true
+    ensure_lightdm_session   # idempotent: re-checks every run (niri build may have finished late)
     boot_env_check
     print_summary
+}
+
+# --- 4.10b ensure lightdm default session = niri (idempotent, runs on EVERY restore) ---
+# The stage_dm write only happens while that stage runs, but the niri.desktop session file
+# arrives later (background build). This step re-checks on every run so a late niri build
+# still gets picked up as the lightdm default session.
+ensure_lightdm_session() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ "$DISTRO_FAMILY" = arch ] && return 0
+
+    # only when lightdm actually owns the login (display-manager.service -> lightdm)
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        local _dl
+        _dl=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
+        [ "$(basename "$_dl" .service)" = "lightdm" ] || return 0
+    else
+        return 0
+    fi
+
+    # niri session must be registered (i.e. the niri build finished)
+    local _niri_desktop=""
+    [ -f /usr/local/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
+    [ -z "$_niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/share/wayland-sessions/niri.desktop
+    if [ -z "$_niri_desktop" ]; then
+        warn "$(_t "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop." "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop.")"
+        return 0
+    fi
+
+    # idempotent write of the drop-in
+    mkdir -p /etc/lightdm/lightdm.conf.d
+    if [ -f /etc/lightdm/lightdm.conf.d/50-niri.conf ] && grep -q '^user-session=niri$' /etc/lightdm/lightdm.conf.d/50-niri.conf; then
+        log "$(_t "lightdm default session already set to niri" "lightdm default session already set to niri")"
+    else
+        cat > /etc/lightdm/lightdm.conf.d/50-niri.conf <<'EOF'
+[Seat:*]
+user-session=niri
+EOF
+        log "$(_t "lightdm default session set to niri (user-session=niri)" "lightdm default session set to niri (user-session=niri)")"
+    fi
 }
 
 # --- 4.11 boot environment self-check ---
@@ -2348,6 +2388,21 @@ boot_env_check() {
     fi
     if [ -f /etc/lightdm/lightdm.conf.d/50-niri.conf ]; then
         info_kv "$(_t "LightDM Session" "LightDM Session")" "user-session=niri" "$(_t "configured — login goes straight to niri" "configured — login goes straight to niri")"
+    fi
+    # effective user-session value: lightdm reads lightdm.conf first, then lightdm.conf.d/*.conf
+    # in filename order — the LAST assignment wins
+    local _eff _eff_last _f
+    _eff=$(grep -hE '^[[:space:]]*user-session=' /etc/lightdm/lightdm.conf 2>/dev/null
+        for _f in /etc/lightdm/lightdm.conf.d/*.conf; do
+            [ -f "$_f" ] && grep -hE '^[[:space:]]*user-session=' "$_f" 2>/dev/null
+        done
+    )
+    _eff_last=$(printf '%s\n' "$_eff" | tail -n 1)
+    if [ -n "$_eff" ]; then
+        info_kv "$(_t "user-session (effective)" "user-session (effective)")" "$(printf '%s' "$_eff" | tr '\n' '; ' | sed 's/; $//')" "$(_t "(last assignment wins)" "(last assignment wins)")"
+        if [ "$_eff_last" != "user-session=niri" ]; then
+            warn "$(_t "Last user-session assignment is " "Last user-session assignment is ") '$_eff_last'$(_t " — it overrides niri; login will go to the wrong desktop. Check /etc/lightdm/lightdm.conf.d/ and /etc/lightdm/lightdm.conf." " — it overrides niri; login will go to the wrong desktop. Check /etc/lightdm/lightdm.conf.d/ and /etc/lightdm/lightdm.conf.")"
+        fi
     fi
 }
 
