@@ -1,15 +1,15 @@
 # EilNiri
 
-在新装的 **Arch 系** / **RHEL 系** / **Debian 系**（Debian/Ubuntu）系统上**只运行一个脚本**即可还原完整的 Niri 桌面环境：包安装、niri/awww/satty 预编译或源码构建、waypaper pip 安装、rime-ice 词库部署、**登录管理器**、系统服务、显示器适配、配置部署全部自动完成，无需再手动安装或下载任何东西。**niri/awww 的 cargo 编译自动放到后台并行执行**，期间继续装包、部署配置，最后统一等待收尾，大幅压缩总等待时间。Arch 系与 Fedora 全量预编译安装、零 AUR 构建；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上，niri 自动走官方预编译二进制或官方 vendored 源码离线编译。自动适配显示器、输入法中文组件可选、服务自启、字体渲染。
+在新装的 **Arch 系** / **RHEL 系** / **Debian 系**（Debian/Ubuntu）系统上**只运行一个脚本**即可还原完整的 Niri 桌面环境：包安装（内置列表）、niri/awww/satty 预编译或源码构建、waypaper pip 安装、rime-ice 词库部署、**登录管理器（自动替换现有 DM）**、系统服务（内置列表 fzf 勾选）、显示器适配、配置部署（仓库内 `configs/`）全部自动完成，无需快照/export 流程。**niri/awww 的 cargo 编译自动放到后台并行执行**，期间继续装包、部署配置，最后统一等待收尾，大幅压缩总等待时间。Arch 系与 Fedora 全量预编译安装、零 AUR 构建；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上，niri 自动走官方预编译二进制或官方 vendored 源码离线编译。自动适配显示器、输入法中文组件可选、服务自启、字体渲染。
 
 ## 快速开始
 
 ```bash
-# 1. 在当前 Arch 机器采集快照（普通用户运行，只读系统不改动；完成后自动自检并提示 git 提交）
-./install.sh export
+# 1. 在参考机（任意发行版，普通用户）收集桌面配置到仓库 configs/（自动修正笔误与 niri-session，完成后自检并提示 git 提交）
+./install.sh collect-config
 
-# 2. 用 git 云同步时，快照必须提交（git clone 只传被跟踪的文件，否则目标机没有 pkglist/ 和 snapshot/）：
-git add pkglist snapshot && git commit -m "snapshot update" && git push
+# 2. 用 git 云同步时，configs/ 必须提交（git clone 只传被跟踪的文件）：
+git add configs && git commit -m "configs update" && git push
 #    （或直接用 U盘/rsync 拷贝整个 EilNiri 目录）
 
 # 3. 在新机器克隆/拷贝后安装（需要 root；一个脚本搞定所有：包、niri/awww/satty、输入法词库、登录管理器、服务、配置）
@@ -24,12 +24,11 @@ sudo ./install.sh rollback
 
 | 命令 | 权限 | 说明 |
 |---|---|---|
-| `./install.sh export` | 普通用户 | 采集快照（系统零改动） |
-| `./install.sh export --keep-typos` | 普通用户 | 保留配置原样，不修正已知笔误 |
+| `./install.sh collect-config` | 普通用户 | 收集本机桌面配置到仓库 `configs/`（任意发行版） |
 | `sudo ./install.sh restore` | root | 显示 Logo → 安装桌面环境（fzf 交互） |
 | `sudo ./install.sh restore --dry-run` | root | 预览模式，只打印不执行 |
 | `./install.sh status` | 任意 | **查看后台编译进度**（restore 运行时在另一终端执行，支持 `watch -n 5 ./install.sh status`） |
-| `sudo ./install.sh rollback` | root | 从备份快照恢复配置 |
+| `sudo ./install.sh rollback` | root | 从备份（`backups/` tar.gz）恢复配置 |
 | `./install.sh --help` | - | 查看帮助 |
 
 ## 包含内容
@@ -47,23 +46,23 @@ sudo ./install.sh rollback
 | 输入法 | ✅ | fcitx5 全家 + rime + 雾凇拼音 |
 | 字体 | ✅ | ttf-jetbrains-mono-nerd wqy-zenhei |
 | 密钥环 | ✅ | gnome-keyring |
-| 显示管理器 | ✅ 自动 | 自动安装并启用：Arch→ly；Debian/RHEL→lightdm（已装其他 DM 则保留并启用） |
+| 显示管理器 | ✅ 自动 | 自动安装并**替换现有 DM**：Arch→ly；Debian/RHEL→lightdm（装不上自动尝试 sddm） |
 | 系统服务 | 可选 | bluetooth / libvirtd / power-profiles-daemon |
 
-### 配置采集（export 复制进 `snapshot/`）
+### 配置采集（`collect-config` 复制进仓库 `configs/`）
 
 `~/.config/` 下：niri waybar mako（排 __pycache__）kitty hypr copyq satty waypaper fcitx5 fcitx environment.d xdg-desktop-portal gtk-3.0 gtk-4.0 fontconfig，以及家目录 `.pam_environment`。
 
-额外捕获并修复 `/usr/bin/niri-session`（systemd 弃用警告）→ 存入 `snapshot/.local/bin/`。
+额外捕获并修复 `/usr/bin/niri-session`（systemd 弃用警告）→ 存入 `configs/.local/bin/`。
 
-敏感数据（~/.ssh、keyring、token）不进入快照。
+敏感数据（~/.ssh、keyring、token）不进入 `configs/`。
 
 ## restore 流程（共 10 步）
 
 1. **Logo 展示** → **Pre-Flight**：Arch 系（pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新）；RHEL 系（dnf upgrade）；Debian 系（apt-get update + 自动开启 Ubuntu universe + upgrade，确保 curl/tar/unzip）
 2. **目标用户检测**：默认 UID 1000，30s 超时可选创建新用户
 3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）；**CN 时区自动启用 cargo/rustup 镜像（rsproxy.cn）**；niri/awww 的 cargo 编译**转入后台**（日志 `~/.local/state/eilNiri/{niri,awww}-build.log`）
-4. **服务启用**：fzf 选择系统服务 → `systemctl enable --now`（后台编译同时进行）
+4. **服务启用**：fzf 勾选内置服务（bluetooth / libvirtd / power-profiles-daemon，默认全选）→ `systemctl enable --now`（后台编译同时进行）
 5. **显示管理器**：自动安装脚本选择的 DM 并**替换现有 DM**（Arch→ly；Debian/RHEL→lightdm，装不上自动尝试 sddm）——现有 DM（如 Ubuntu Desktop 预装 gdm3）会被自动禁用、`display-manager.service` 指向新 DM；**先装新的再禁旧的**，安装失败则保留现有 DM 不动；**默认启动目标自动设为 `graphical.target`**（否则重启只会进纯文本 tty、任何 DM 都不启动）；`EILNIRI_KEEP_DM=1` 可保留现有 DM——重启后直接进登录界面
 6. **配置快照**：部署前将已有配置打包至 `backups/`（tar.gz）
 7. **配置部署**：已有文件自动备份为 `.bak-时间戳` → PipeWire 用户服务自启 → zsh 设为默认 shell
@@ -110,9 +109,8 @@ sudo ./install.sh rollback
 - **PEP 668**：waypaper 的 pip 安装自动加 `--break-system-packages`（Debian/Ubuntu 默认阻止系统级 pip）。
 - **服务提供包**：`libvirtd.service` 的提供包按家族映射（Debian 为 `libvirt-daemon-system`）。
 - **rime-ice 雾凇拼音自动部署**：无 .deb，但官方发布 release zip（`full.zip`）——restore 自动从 GitHub 直连下载 → 解压复制到 `~/.local/share/fcitx5/rime`（fcitx5-rime 包提供引擎）。Arch 上仍走 archlinuxcn 包，不受影响。
-- **登录管理器自动安装**：Debian/RHEL 自动装并启用 `lightdm` + `lightdm-gtk-greeter`；已装有 gdm/sddm 等则保留并确保启用。
+- **登录管理器自动安装**：Debian/RHEL 自动装并启用 `lightdm` + `lightdm-gtk-greeter`；现有 DM（gdm3/sddm 等）被自动禁用替换，`EILNIRI_KEEP_DM=1` 可保留。
 - **ly**：仅 Arch 有包（自动安装）；Debian/RHEL 上由脚本改用 lightdm。
-- **export 仅限 Arch**：快照的 pkglist 由 pacman 生成，export 只能在 Arch 参考机上运行（Ubuntu 上 restore 没问题，但快照必须来自 Arch）。
 
 ## 硬件自动适配
 
@@ -130,9 +128,8 @@ sudo ./install.sh rollback
 ```
 EilNiri/
 ├── install.sh
-├── pkglist/          (official.txt, services.txt)
-├── snapshot/        (配置镜像 + .local/bin/niri-session)
-├── backups/          (回滚快照 tar.gz)
+├── configs/          (桌面配置镜像 + .local/bin/niri-session，collect-config 生成，随 git 走)
+├── backups/          (回滚点 tar.gz)
 ├── .replicate_progress
 └── README.md
 ```
@@ -149,11 +146,11 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore/export 开头都会显示 `v版本号`（当前 v1.5.1）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore/collect-config 开头都会显示 `v版本号`（当前 v1.6.0）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
 - 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
-- export 默认修正 niri config 两处笔误，live 配置不受影响
-- 壁纸图片不在快照内
+- collect-config 默认修正 niri config 两处笔误（swww-daemon→awww-daemon、authenntication→authentication），live 配置不受影响
+- 壁纸图片不在 `configs/` 内
 - 中断恢复：重跑自动跳过已完成阶段，删除 `.replicate_progress` 可强制全量重跑；**进度文件带脚本版本标记，旧版本脚本写的进度自动作废**（失败阶段不再标记完成，重跑自动重试，无需手动删文件）
 - dry-run：不对系统做任何改动（唯一例外：fzf 是交互前提，dry-run 下也会实际安装）
 - 临时文件在退出时自动清理（sudoers、构建目录、解包目录）

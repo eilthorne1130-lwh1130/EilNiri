@@ -1,0 +1,98 @@
+{
+    "layer": "top",
+    "position": "top",
+    "height": 32,
+    "spacing": 6,
+    "reload_style_on_change": true,
+    "width": 1600,
+    "margin-top": 4,
+    "margin-left": 60,
+    "margin-right": 60,
+
+    "modules-left":   ["niri/workspaces", "niri/window", "network"],
+    "modules-center": ["clock"],
+    "modules-right":  ["pulseaudio", "cpu", "memory", "bluetooth", "tray", "custom/shutdown", "custom/reboot"],
+
+    "niri/workspaces": {
+        "format": "{value}",
+        "workspace-format-windows": "{count}",
+        "window-format": "{app_id}",
+        "sort-by-number": true,
+        "disable-scroll": true
+    },
+
+    "niri/window": {
+        "format": "{app_id}",
+        "max-length": 20,
+        "separate-outputs": true
+    },
+
+    "clock": {
+        "format": "{:%H:%M}",
+        "interval": 1,
+        "tooltip-format": "<tt>{:%Y-%m-%d %A\n%H:%M:%S}</tt>",
+        "on-click": "gsimplecal"
+    },
+
+    "pulseaudio": {
+        "format": "{volume}% {format_source}",
+        "format-muted": "Muted",
+        "format-source": " {volume}%",
+        "format-source-muted": "",
+        "scroll-step": 5,
+        "on-scroll-up":   "pactl set-sink-volume @DEFAULT_SINK@ +5%",
+        "on-scroll-down": "pactl set-sink-volume @DEFAULT_SINK@ -5%",
+        "max-volume": 100,
+        "ignored-sinks": ["alsa_output.pci-0000_00_1f.3.hdmi-stereo"],
+        "tooltip-format": "<tt>{desc}\n音量: {volume}%</tt>"
+    },
+
+    "network": {
+        "format-wifi": " {essid} {signalStrength}% ",
+        "format-ethernet": " {ifname} {ipaddr} ",
+        "format-disconnected": " Offline ",
+        "interval": 1,
+        "tooltip-format-wifi": "<tt>{essid}\n信号: {signalStrength}%\nIP: {ipaddr}</tt>",
+        "tooltip-format-ethernet": "<tt>{ifname}\nIP: {ipaddr}</tt>",
+        "tooltip-format-disconnected": "<tt>网络已断开</tt>"
+    },
+
+    "cpu": {
+        "interval": 1.5,
+        "format": "{usage}%",
+        "on-click": "kitty -e btop",
+        "tooltip-format": "<tt>CPU 使用率: {usage}%</tt>"
+    },
+
+    "memory": {
+        "interval": 1,
+        "format": " {percentage}% ",
+        "tooltip-format": "<tt>内存使用: {percentage}%\n已用: {used}G / 总共: {total}G</tt>"
+    },
+
+    "bluetooth": {
+        "format": " {device_alias} ",
+        "format-connected": " {device_alias} ",
+        "format-on": " On ",
+        "format-off": " Off ",
+        "interval": 10,
+        "on-click": "kitty -e bluetui"
+    },
+
+    "tray": {
+        "icon-size": 20,
+        "spacing": 6
+    },
+
+    "custom/shutdown": {
+        "format": "⏻",
+        "tooltip-format": "关机",
+        "on-click": "sh -c \"zenity --question --text='确定要关机吗?' --title='关机' --width=300 && systemctl poweroff\""
+    },
+
+    "custom/reboot": {
+        "format": "󰑐",
+        "tooltip-format": "重启",
+        "on-click": "sh -c \"zenity --question --text='确定要重启吗?' --title='重启' --width=300 && systemctl reboot\""
+    }
+}

@@ -2,21 +2,19 @@
 # ==============================================================================
 # eilNiri - install.sh
 #
-#   Collects this machine's niri desktop suite (packages + desktop config +
-#   system services) into a snapshot, then reproduces it one-click on a fresh
-#   Arch / RHEL / Debian family system.
+#   One-click niri desktop setup for a fresh Arch / RHEL / Debian family system.
+#   Desktop config lives in the repo's configs/ directory (collect it from your
+#   reference machine with `./install.sh collect-config`), packages come from a
+#   built-in list, and the script installs everything: niri/awww/satty builds,
+#   rime-ice dictionary, display manager (replacing any existing one), services
+#   and config deploy.
 #
 #   Usage:
-#     ./install.sh export  [--keep-typos]   create snapshot (normal user, read-only)
-#     ./install.sh restore [--dry-run]      restore on new system (root)
-#     ./install.sh rollback                 rollback config from snapshot (root)
+#     ./install.sh collect-config          collect this machine's config into configs/ (normal user)
+#     ./install.sh restore [--dry-run]     restore on new system (root)
+#     ./install.sh status                  show background build progress
+#     ./install.sh rollback                rollback config from backup (root)
 #     ./install.sh --help
-#
-#   Snapshot outputs (export generates them next to this script):
-#     pkglist/official.txt   official repo packages
-#     pkglist/aur.txt        AUR packages
-#     pkglist/services.txt   enabled system services (format: "unit provider")
-#     config/                desktop config mirror
 #
 #   Interaction style & visual engine reference: https://github.com/SHORiN-KiWATA/shorin-arch-setup
 #   Snapshot rollback design reference:          https://github.com/ech678/NyxNiri
@@ -65,11 +63,10 @@ trap cleanup EXIT INT TERM
 
 MODE=""
 DRY_RUN=0
-KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.6.0"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -248,7 +245,7 @@ declare -A SVC_PROVIDER=(
     [libvirtd.service]=libvirt
     [power-profiles-daemon.service]=power-profiles-daemon
 )
-# Debian-family service provider names (export snapshot records Arch names; remapped per family on restore)
+# Debian-family service provider names (built-in Arch names; remapped per family on restore)
 declare -A DEB_SVC_PROVIDER=(
     [bluetooth.service]=bluez
     [libvirtd.service]=libvirt-daemon-system
@@ -313,76 +310,36 @@ INSTALLED_PKGS=() SKIPPED_PKGS=() FAILED_PKGS=() MANUAL_ITEMS=() ENABLED_SVCS=()
 DRY_PKGS=() DRY_SVCS=()  # items "that would be executed" in dry-run mode; kept separate to avoid inflated counts
 
 # ==============================================================================
-# 3. export mode — collect snapshot (run as normal user; only scan+copy, no system changes)
-# ==============================================================================
+# 3. collect-config mode — collect this machine's desktop config into configs/ (normal user).
+# Works on any distro (pure file copying; no package manager involved).
 
-do_export() {
+collect_config() {
     init_logger
     if [ "$EUID" -eq 0 ]; then
-        error "$(_t "export must run as normal user (needs ~/.config), do not use sudo." "export must run as normal user (needs ~/.config), do not use sudo.")"
-        exit 1
-    fi
-    # The snapshot pkglist is built from pacman; export only makes sense on the Arch reference system.
-    # On Ubuntu/RHEL the same script still works, but you must get the snapshot from an Arch machine.
-    detect_distro
-    if [ "$DISTRO_FAMILY" != arch ]; then
-        error "$(_t "export must run on an Arch-based system (snapshot pkglist uses pacman). Restore works on Arch/RHEL/Debian (Ubuntu), export does not." "export must run on an Arch-based system (snapshot pkglist uses pacman). Restore works on Arch/RHEL/Debian (Ubuntu), export does not.")"
+        error "$(_t "collect-config must run as normal user (needs ~/.config), do not use sudo." "collect-config must run as normal user (needs ~/.config), do not use sudo.")"
         exit 1
     fi
 
-    local SNAP_PKGLIST="$BASE_DIR/pkglist"
-    local SNAP_CONFIG="$BASE_DIR/snapshot"
+    local CFG_DIR="$BASE_DIR/configs"
 
-    # The snapshot mirror lives in snapshot/ (not config/, which may be a project file at repo
-    # root, e.g. a waybar JSON). It must be a DIRECTORY; a same-named regular file would break it.
-    if [ -e "$SNAP_CONFIG" ] && [ ! -d "$SNAP_CONFIG" ]; then
-        warn "$(_t "A regular file exists at " "A regular file exists at ") $SNAP_CONFIG$(_t " — the snapshot mirror must be a directory. Move or delete the file first, then rerun export." " — the snapshot mirror must be a directory. Move or delete the file first, then rerun export.")"
+    # configs/ must be a DIRECTORY; a same-named regular file would break collection
+    if [ -e "$CFG_DIR" ] && [ ! -d "$CFG_DIR" ]; then
+        warn "$(_t "A regular file exists at " "A regular file exists at ") $CFG_DIR$(_t " — the config mirror must be a directory. Move or delete the file first, then rerun." " — the config mirror must be a directory. Move or delete the file first, then rerun.")"
         return 1
     fi
 
-    section "Export v$SCRIPT_VERSION" "$(_t "Collect Niri Suite Snapshot" "Collect Niri Suite Snapshot")"
-    info_kv "$(_t "Snapshot Dir" "Snapshot Dir")" "$BASE_DIR"
+    section "$(_t "Collect Config" "Collect Config")" "v$SCRIPT_VERSION — $(_t "desktop config -> configs/" "desktop config -> configs/")"
+    info_kv "$(_t "Repo Dir" "Repo Dir")" "$BASE_DIR"
 
-    # --- 3.1 package list ---
-    log "$(_t "Scanning installed niri suite packages..." "Scanning installed niri suite packages...")"
-    mkdir -p "$SNAP_PKGLIST"
-    : > "$SNAP_PKGLIST/official.txt"
+    # --- 3.1 config mirror (whitelist) ---
+    log "$(_t "Copying desktop config (whitelist) to configs/ ..." "Copying desktop config (whitelist) to configs/ ...")"
+    rm -rf "$CFG_DIR"
+    mkdir -p "$CFG_DIR/.config"
 
-    local missing=()
-    for g in "${GROUP_ORDER[@]}"; do
-        for raw in ${GROUP_PKGS[$g]:-}; do
-            if ! pacman -Qq "$raw" &>/dev/null; then
-                missing+=("$raw")
-                continue
-            fi
-            echo "$raw" >> "$SNAP_PKGLIST/official.txt"
-        done
-    done
-    sort -u -o "$SNAP_PKGLIST/official.txt" "$SNAP_PKGLIST/official.txt"
-    info_kv "$(_t "Pkglist" "Pkglist")" "$(wc -l < "$SNAP_PKGLIST/official.txt") packages"
-    if [ ${#missing[@]} -gt 0 ]; then
-        warn "$(_t "The following packages are not installed, not written to snapshot:" "The following packages are not installed, not written to snapshot:")${missing[*]}"
-    fi
-
-    # --- 3.2 service list ---
-    log "$(_t "Scanning enabled system services..." "Scanning enabled system services...")"
-    : > "$SNAP_PKGLIST/services.txt"
-    for unit in "${SVC_ORDER[@]}"; do
-        if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
-            echo "$unit ${SVC_PROVIDER[$unit]}" >> "$SNAP_PKGLIST/services.txt"
-            log "  $(_t "[enabled]" "[enabled]") $unit"
-        fi
-    done
-    info_kv "$(_t "Services" "Services")" "$(wc -l < "$SNAP_PKGLIST/services.txt") services"
-
-    # --- 3.3 config mirror ---
-    log "$(_t "Copying desktop config (whitelist)..." "Copying desktop config (whitelist)...")"
-    rm -rf "$SNAP_CONFIG"
-    mkdir -p "$SNAP_CONFIG/.config"
-
+    local d f
     for d in "${CONFIG_DIRS[@]}"; do
         if [ -d "$HOME/.config/$d" ]; then
-            cp -r "$HOME/.config/$d" "$SNAP_CONFIG/.config/$d"
+            cp -r "$HOME/.config/$d" "$CFG_DIR/.config/$d"
             log "  $(_t "[config]" "[config]") ~/.config/$d"
         else
             warn "  $(_t "[skip]" "[skip]") ~/.config/$d does not exist"
@@ -390,17 +347,17 @@ do_export() {
     done
     for f in "${CONFIG_FILES[@]}"; do
         if [ -f "$HOME/$f" ]; then
-            cp "$HOME/$f" "$SNAP_CONFIG/$f"
+            cp "$HOME/$f" "$CFG_DIR/$f"
             log "  $(_t "[config]" "[config]") ~/$f"
         fi
     done
 
-    # Remove useless cache directories (not part of snapshot)
-    rm -rf "$SNAP_CONFIG/.config/mako/__pycache__" 2>/dev/null
+    # Remove useless cache directories
+    rm -rf "$CFG_DIR/.config/mako/__pycache__" 2>/dev/null
 
-    # --- 3.4 fix known typos in the snapshot copy (never touch live config) ---
-    local NIRI_KDL="$SNAP_CONFIG/.config/niri/config.kdl"
-    if [ -f "$NIRI_KDL" ] && [ "$KEEP_TYPOS" -eq 0 ]; then
+    # --- 3.2 fix known typos in the collected copy (never touch live config) ---
+    local NIRI_KDL="$CFG_DIR/.config/niri/config.kdl"
+    if [ -f "$NIRI_KDL" ]; then
         local fixed=()
         if grep -q "swww-daemon" "$NIRI_KDL"; then
             sed -i 's/swww-daemon/awww-daemon/g' "$NIRI_KDL"
@@ -411,15 +368,15 @@ do_export() {
             fixed+=("polkit-gnome-authenntication -> polkit-gnome-authentication")
         fi
         if [ ${#fixed[@]} -gt 0 ]; then
-            warn "$(_t "Fixed typos in snapshot copy (live config unchanged; --keep-typos to disable):" "Fixed typos in snapshot copy (live config unchanged; --keep-typos to disable):")"
+            warn "$(_t "Fixed typos in the collected copy (live config unchanged):" "Fixed typos in the collected copy (live config unchanged):")"
             for fx in "${fixed[@]}"; do echo -e "     ${H_YELLOW}· $fx${NC}"; done
             write_log "FIX" "${fixed[*]}"
         fi
     fi
 
-    # --- 3.5 capture & fix niri-session (systemd import-environment deprecation warning) ---
-    local NIRI_SESSION="$SNAP_CONFIG/.local/bin/niri-session"
-    local NIRI_DESKTOP="$SNAP_CONFIG/.local/share/applications/niri.desktop"
+    # --- 3.3 capture & fix niri-session (systemd import-environment deprecation warning) ---
+    local NIRI_SESSION="$CFG_DIR/.local/bin/niri-session"
+    local NIRI_DESKTOP="$CFG_DIR/.local/share/applications/niri.desktop"
     if [ -x /usr/bin/niri-session ]; then
         mkdir -p "$(dirname "$NIRI_SESSION")" "$(dirname "$NIRI_DESKTOP")"
         cp /usr/bin/niri-session "$NIRI_SESSION"
@@ -440,36 +397,28 @@ DESKTOP_EOF
         log "  [config] fixed niri-session + desktop entry"
     fi
 
-    section "$(_t "Export Done" "Export Done")" "$(_t "Snapshot Created" "Snapshot Created")"
-    info_kv "$(_t "Pkglist" "Pkglist")" "$SNAP_PKGLIST/"
-    info_kv "$(_t "Config Mirror" "Config Mirror")" "$SNAP_CONFIG/"
+    section "$(_t "Collect Done" "Collect Done")" "$(_t "Config Collected" "Config Collected")"
+    info_kv "$(_t "Config Mirror" "Config Mirror")" "$CFG_DIR/"
 
-    # --- 3.6 self-check: the snapshot must be complete before it is pushed/cloned anywhere ---
-    local _chk_err=0
-    [ -s "$SNAP_PKGLIST/official.txt" ] || { warn "$(_t "Self-check FAILED: pkglist/official.txt is empty — export is incomplete." "Self-check FAILED: pkglist/official.txt is empty — export is incomplete.")"; _chk_err=1; }
-    if [ ! -d "$SNAP_CONFIG/.config" ] || [ -z "$(ls -A "$SNAP_CONFIG/.config" 2>/dev/null)" ]; then
-        warn "$(_t "Self-check FAILED: config/.config mirror is empty — export is incomplete." "Self-check FAILED: config/.config mirror is empty — export is incomplete.")"
-        _chk_err=1
-    fi
-    if [ "$_chk_err" -eq 1 ]; then
-        error "$(_t "Snapshot is incomplete; fix the issues above and rerun export. Do NOT push/use this snapshot." "Snapshot is incomplete; fix the issues above and rerun export. Do NOT push/use this snapshot.")"
+    # --- 3.4 self-check: configs/ must be non-empty before it is pushed/cloned anywhere ---
+    if [ ! -d "$CFG_DIR/.config" ] || [ -z "$(find "$CFG_DIR/.config" -type f 2>/dev/null | head -n 1)" ]; then
+        error "$(_t "Self-check FAILED: configs/.config is empty — nothing was collected. Fix and rerun." "Self-check FAILED: configs/.config is empty — nothing was collected. Fix and rerun.")"
         return 1
     fi
-    success "$(_t "Snapshot self-check passed." "Snapshot self-check passed.")"
+    success "$(_t "Self-check passed." "Self-check passed.")"
 
-    # If this repo is synced via git (cloud clone), remind to commit the snapshot content —
-    # git only transfers tracked files, and a missing pkglist/ or config/ silently breaks restore.
+    # If this repo is synced via git (cloud clone), remind to commit the config —
+    # git only transfers tracked files, and a missing configs/ silently breaks restore.
     if [ -d "$BASE_DIR/.git" ] || git -C "$BASE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
         echo ""
-        info_kv "$(_t "Git sync" "Git sync")" "$(_t "snapshot must be committed" "snapshot must be committed")" ""
-        echo -e "   ${H_CYAN}git add pkglist snapshot && git commit -m \"snapshot update\" && git push${NC}"
-        echo -e "   ${DIM}$(_t "(git clone only transfers tracked files — without this, restore on the target machine has no snapshot)" "(git clone only transfers tracked files — without this, restore on the target machine has no snapshot)")${NC}"
+        info_kv "$(_t "Git sync" "Git sync")" "$(_t "configs must be committed" "configs must be committed")" ""
+        echo -e "   ${H_CYAN}git add configs && git commit -m \"configs update\" && git push${NC}"
+        echo -e "   ${DIM}$(_t "(git clone only transfers tracked files — without this, restore on the target machine deploys no config)" "(git clone only transfers tracked files — without this, restore on the target machine deploys no config)")${NC}"
     else
         log "Next: copy the eilNiri directory to the new machine and run ${BOLD}sudo ./install.sh restore${NC}"
     fi
 }
 
-# ==============================================================================
 # 4. restore mode — reproduce desktop on new system (run as root)
 # ==============================================================================
 
@@ -742,20 +691,13 @@ stage_preflight() {
 REPO_UNIVERSE=()
 
 load_app_universe() {
-    # Prefer the export snapshot list (user-editable), otherwise fall back to the built-in authoritative list
-    local off="$BASE_DIR/pkglist/official.txt"
-    if [ -s "$off" ]; then
-        log "$(_t "Using snapshot pkglist: pkglist/" "Using snapshot pkglist: pkglist/")"
-        mapfile -t REPO_UNIVERSE < <(sed '/^\s*$/d' "$off")
-    else
-        log "$(_t "No snapshot pkglist, using built-in list." "No snapshot pkglist, using built-in list.")"
-        local g raw
-        for g in "${GROUP_ORDER[@]}"; do
-            for raw in ${GROUP_PKGS[$g]:-}; do
-                REPO_UNIVERSE+=("$raw")
-            done
+    # Built-in authoritative package list (no snapshot/pkglist in the snapshot-free mode)
+    local g raw
+    for g in "${GROUP_ORDER[@]}"; do
+        for raw in ${GROUP_PKGS[$g]:-}; do
+            REPO_UNIVERSE+=("$raw")
         done
-    fi
+    done
 }
 
 group_tag() { # $1 = pkg
@@ -1765,23 +1707,19 @@ do_status() {
     echo -e "   ${DIM}$(_t "or: watch -n 5 ./install.sh status" "or: watch -n 5 ./install.sh status")${NC}"
 }
 
-# --- 4.4 system services ---
+# --- 4.4 system services (built-in list, fzf selection; snapshot-free mode) ---
 
 stage_services() {
     if stage_done services; then
         log "$(_t "Service stage done, skipping." "Service stage done, skipping.")"
         return
     fi
-    local svc_file="$BASE_DIR/pkglist/services.txt"
-    if [ ! -s "$svc_file" ]; then
-        warn "$(_t "services.txt not found, skipping." "services.txt not found, skipping.")"
-        return
-    fi
 
-    section "$(_t "Services" "Services")" "$(_t "Select services to enable" "Select services to enable")"
+    section "$(_t "Services" "Services")" "$(_t "Select services to enable (built-in list)" "Select services to enable (built-in list)")"
     local selected
-    selected=$(awk '{print $1 "\tprovider: " $2}' "$svc_file" | \
-        fzf_multi " Select services to enable ") || {
+    selected=$(for unit in "${SVC_ORDER[@]}"; do
+        printf '%s\tprovider: %s\n' "$unit" "${SVC_PROVIDER[$unit]}"
+    done | fzf_multi " Select services to enable ") || {
         warn "$(_t "User cancelled service selection, skipping." "User cancelled service selection, skipping.")"
         return
     }
@@ -1795,8 +1733,8 @@ stage_services() {
     while IFS= read -r line; do
         unit=$(echo "$line" | cut -f1 -d"$(printf '\t')" | xargs)
         [ -z "$unit" ] && continue
-        provider=$(grep -m1 "^$unit " "$svc_file" | awk '{print $2}')
-        # provider names in the export snapshot are Arch names; remap per family for Debian
+        provider="${SVC_PROVIDER[$unit]:-}"
+        # provider names are Arch names; remap per family for Debian
         if [ "$DISTRO_FAMILY" = debian ] && [ -n "${DEB_SVC_PROVIDER[$unit]:-}" ]; then
             provider="${DEB_SVC_PROVIDER[$unit]}"
         fi
@@ -1975,9 +1913,9 @@ stage_backup() {
     fi
 
     section "$(_t "Config Snapshot" "Config Snapshot")" "$(_t "Create rollback point before deploy" "Create rollback point before deploy")"
-    local snap_cfg="$BASE_DIR/snapshot"
+    local snap_cfg="$BASE_DIR/configs"
     if [ ! -d "$snap_cfg/.config" ]; then
-        warn "$(_t "config/ mirror not found, skipping backup." "config/ mirror not found, skipping backup.")"
+        warn "$(_t "configs/ mirror not found, skipping backup." "configs/ mirror not found, skipping backup.")"
         stage_mark backup
         return
     fi
@@ -2034,9 +1972,9 @@ stage_configs() {
         log "$(_t "Config deploy stage done, skipping." "Config deploy stage done, skipping.")"
         return
     fi
-    local snap="$BASE_DIR/snapshot"
+    local snap="$BASE_DIR/configs"
     if [ ! -d "$snap" ]; then
-        warn "$(_t "config/ mirror not found, skipping deploy." "config/ mirror not found, skipping deploy.")"
+        warn "$(_t "configs/ mirror not found, skipping deploy." "configs/ mirror not found, skipping deploy.")"
         return
     fi
 
@@ -2329,14 +2267,13 @@ do_restore() {
     [ "$DRY_RUN" -eq 1 ] && warn "$(_t "DRY-RUN mode: printing plan only, no changes." "DRY-RUN mode: printing plan only, no changes.")"
     show_logo
 
-    # Snapshot completeness check: only the script was copied (missing pkglist/ or config/)
+    # Config mirror check: configs/ must exist in the repo (collect with ./install.sh collect-config)
     local _snap_missing=0
-    [ -d "$BASE_DIR/pkglist" ] || _snap_missing=1
-    [ -d "$BASE_DIR/snapshot" ] || _snap_missing=1
+    [ -d "$BASE_DIR/configs" ] || _snap_missing=1
     if [ "$_snap_missing" -eq 1 ]; then
-        warn "$(_t "Snapshot content missing (pkglist/ and/or config/ not found in " "Snapshot content missing (pkglist/ and/or config/ not found in ") $BASE_DIR$(_t "). Only the script was copied? Services list and config deploy will be skipped, and the built-in package list will be used. Copy the WHOLE eilNiri directory (install.sh + pkglist/ + config/) to the target machine." "). Only the script was copied? Services list and config deploy will be skipped, and the built-in package list will be used. Copy the WHOLE eilNiri directory (install.sh + pkglist/ + config/) to the target machine.")"
-        if [ "$DRY_RUN" -eq 0 ] && ! confirm "$(_t "Snapshot content missing — continue without config/services? [Y/n] (default Y):" "Snapshot content missing — continue without config/services? [Y/n] (default Y):")" "Y" 30; then
-            error "$(_t "Aborted: copy the whole eilNiri directory (with pkglist/ and config/) and rerun." "Aborted: copy the whole eilNiri directory (with pkglist/ and config/) and rerun.")"
+        warn "$(_t "configs/ not found in " "configs/ not found in ") $BASE_DIR$(_t " — no desktop config will be deployed (niri will run with default/empty config). Collect it on your reference machine with './install.sh collect-config' and push the repo." " — no desktop config will be deployed (niri will run with default/empty config). Collect it on your reference machine with './install.sh collect-config' and push the repo.")"
+        if [ "$DRY_RUN" -eq 0 ] && ! confirm "$(_t "configs/ missing — continue without deploying config? [Y/n] (default Y):" "configs/ missing — continue without deploying config? [Y/n] (default Y):")" "Y" 30; then
+            error "$(_t "Aborted: run ./install.sh collect-config on the reference machine, commit configs/, push, then rerun." "Aborted: run ./install.sh collect-config on the reference machine, commit configs/, push, then rerun.")"
             exit 1
         fi
     fi
@@ -2500,19 +2437,18 @@ usage() {
 eilNiri install.sh v$SCRIPT_VERSION — niri desktop environment replication tool
 
 Usage:
-  ./install.sh export  [--keep-typos]   create snapshot (normal user, read-only)
+  ./install.sh collect-config          collect this machine's config into configs/ (normal user)
   ./install.sh restore [--dry-run]      restore desktop on new system (root)
   ./install.sh status                   show background build progress (run from another terminal)
-  ./install.sh rollback                 rollback from existing snapshot (root)
+  ./install.sh rollback                 rollback config from backup (root)
   ./install.sh --help                   show this help
 
 Options:
   --dry-run      print plan only, no actual install/enable/deploy
-  --keep-typos   keep config as-is during export, skip typo fixes
 
 Workflow:
-  1. On current Arch machine:   ./install.sh export
-  2. Bring the eilNiri dir to new machine (git / USB / rsync)
+  1. On your reference machine:  ./install.sh collect-config
+  2. Sync the repo (git push / USB): git add configs && git commit && git push
   3. On new machine (Arch/RHEL/Debian): sudo ./install.sh restore
      - niri/awww compile in background:  ./install.sh status   (live progress)
      - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
@@ -2524,16 +2460,15 @@ main() {
     local arg
     for arg in "$@"; do
         case "$arg" in
-            export|restore|rollback|status) MODE="$arg" ;;
+            collect-config|restore|rollback|status) MODE="$arg" ;;
             --dry-run)      DRY_RUN=1 ;;
-            --keep-typos)   KEEP_TYPOS=1 ;;
             -h|--help)      usage; exit 0 ;;
             *) error "$(_t "Unknown argument: " "Unknown argument: ") $arg"; usage; exit 1 ;;
         esac
     done
 
     case "$MODE" in
-        export)   do_export ;;
+        collect-config) collect_config ;;
         restore)  do_restore ;;
         status)   do_status ;;
         rollback) do_rollback ;;
