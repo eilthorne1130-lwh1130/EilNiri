@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -1889,6 +1889,23 @@ stage_dm() {
         if [ "$_verify_ok" -eq 1 ]; then
             ENABLED_SVCS+=("$dm_unit")
             success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
+            # Make niri the default session for lightdm (Debian/RHEL): without user-session,
+            # lightdm logs the user into the distro's default desktop (e.g. GNOME) instead.
+            if [ "$dm_unit" = "lightdm" ]; then
+                local _niri_desktop=""
+                [ -f /usr/local/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
+                [ -z "$_niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/share/wayland-sessions/niri.desktop
+                if [ -n "$_niri_desktop" ]; then
+                    mkdir -p /etc/lightdm/lightdm.conf.d
+                    cat > /etc/lightdm/lightdm.conf.d/50-niri.conf <<'EOF'
+[Seat:*]
+user-session=niri
+EOF
+                    log "$(_t "lightdm default session set to niri (user-session=niri)" "lightdm default session set to niri (user-session=niri)")"
+                else
+                    warn "$(_t "niri.desktop session not registered (niri build may not have finished) — login will go to the default desktop. Check: ls /usr/local/share/wayland-sessions/" "niri.desktop session not registered (niri build may not have finished) — login will go to the default desktop. Check: ls /usr/local/share/wayland-sessions/")"
+                fi
+            fi
             stage_mark dm
         else
             FAILED_PKGS+=("dm:$dm_unit")
@@ -2320,6 +2337,18 @@ boot_env_check() {
             break
         fi
     done
+    # niri session registration + lightdm default session
+    local _niri_desktop=""
+    [ -f /usr/local/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
+    [ -z "$_niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/share/wayland-sessions/niri.desktop
+    if [ -n "$_niri_desktop" ]; then
+        info_kv "$(_t "Niri Session" "Niri Session")" "$(_t "registered" "registered")" "$_niri_desktop"
+    else
+        info_kv "$(_t "Niri Session" "Niri Session")" "$(_t "NOT registered" "NOT registered")" "$(_t "(niri build incomplete — login goes to the default desktop)" "(niri build incomplete — login goes to the default desktop)")"
+    fi
+    if [ -f /etc/lightdm/lightdm.conf.d/50-niri.conf ]; then
+        info_kv "$(_t "LightDM Session" "LightDM Session")" "user-session=niri" "$(_t "configured — login goes straight to niri" "configured — login goes straight to niri")"
+    fi
 }
 
 do_rollback() {
