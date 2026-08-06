@@ -69,7 +69,7 @@ KEEP_TYPOS=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.4.9"
+SCRIPT_VERSION="1.5.1"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -542,7 +542,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v4"
+PROGRESS_VERSION="v5"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -1854,6 +1854,20 @@ stage_dm() {
 
     section "$(_t "Display Manager" "Display Manager")" "$(_t "auto (ly / lightdm, replaces existing)" "auto (ly / lightdm, replaces existing)")"
 
+    # A DM only ever starts under graphical.target. If the system default target is not
+    # graphical (Ubuntu Server / previously switched to multi-user), the machine boots to a
+    # plain tty login and NO display manager runs — fix the default target explicitly.
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$(_t "[DRY-RUN] would ensure default target: graphical.target" "[DRY-RUN] would ensure default target: graphical.target")"
+    elif [ "$(systemctl get-default 2>/dev/null)" != "graphical.target" ]; then
+        log "$(_t "Default target is not graphical.target, switching to graphical.target..." "Default target is not graphical.target, switching to graphical.target...")"
+        if exe systemctl set-default graphical.target; then
+            success "$(_t "Default target set to graphical.target" "Default target set to graphical.target")"
+        else
+            warn "$(_t "Failed to set default target to graphical.target; the machine may still boot to a plain tty." "Failed to set default target to graphical.target; the machine may still boot to a plain tty.")"
+        fi
+    fi
+
     local known_dms=(gdm3 gdm sddm lightdm lxdm ly greetd plasma-login-manager lemurs)
     local dm_pkgs dm_unit
     case "$DISTRO_FAMILY" in
@@ -1919,9 +1933,30 @@ stage_dm() {
 
     # --- enable the chosen DM ---
     if exe systemctl enable "$dm_unit"; then
-        ENABLED_SVCS+=("$dm_unit")
-        success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
-        stage_mark dm
+        # verify: the unit must be enabled, and (except ly, which runs on tty1 directly)
+        # display-manager.service must point at the new DM
+        local _verify_ok=1
+        if ! systemctl is-enabled --quiet "$dm_unit" 2>/dev/null; then
+            _verify_ok=0
+            warn "$(_t "Verification failed: " "Verification failed: ") $dm_unit $(_t "is not enabled." "is not enabled.")"
+        fi
+        if [ "$dm_unit" != "ly@tty1" ] && [ -e /etc/systemd/system/display-manager.service ]; then
+            local _dm_link
+            _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
+            if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
+                _verify_ok=0
+                warn "$(_t "Verification failed: display-manager.service points to " "Verification failed: display-manager.service points to ") ${_dm_link:-unknown}$(_t ", expected " ", expected ") $dm_unit"
+            fi
+        fi
+        if [ "$_verify_ok" -eq 1 ]; then
+            ENABLED_SVCS+=("$dm_unit")
+            success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
+            stage_mark dm
+        else
+            FAILED_PKGS+=("dm:$dm_unit")
+            warn "$(_t "Display manager enable verification failed; run niri-session from tty after reboot." "Display manager enable verification failed; run niri-session from tty after reboot.")"
+            # not marked: rerun retries
+        fi
     else
         FAILED_PKGS+=("dm:$dm_unit")
         warn "$(_t "Display manager enable failed; run niri-session from tty after reboot." "Display manager enable failed; run niri-session from tty after reboot.")"
@@ -2323,7 +2358,31 @@ do_restore() {
     stage_verify
     # clean the pacman cache to free disk space
     [ "$DISTRO_FAMILY" = arch ] && exe pacman -Sc --noconfirm 2>/dev/null || true
+    boot_env_check
     print_summary
+}
+
+# --- 4.11 boot environment self-check ---
+# Printed right before the summary so a "still stuck at a tty login" problem is diagnosable
+# in one glance: default target, display-manager.service target, DM enabled state.
+boot_env_check() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    section "$(_t "Boot Environment Check" "Boot Environment Check")" "$(_t "default target & display manager" "default target & display manager")"
+    info_kv "$(_t "Default Target" "Default Target")" "$(systemctl get-default 2>/dev/null || echo unknown)" "$(_t "(must be graphical.target)" "(must be graphical.target)")"
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        local _dl
+        _dl=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo unknown)
+        info_kv "$(_t "Display Manager" "Display Manager")" "$(basename "$_dl")" "display-manager.service → $_dl"
+    else
+        info_kv "$(_t "Display Manager" "Display Manager")" "$(_t "none configured" "none configured")" "$(_t "display-manager.service missing — boot will stay at a tty" "display-manager.service missing — boot will stay at a tty")"
+    fi
+    local _dm
+    for _dm in lightdm sddm gdm3 gdm ly; do
+        if systemctl is-enabled --quiet "$_dm" 2>/dev/null; then
+            info_kv "$(_t "Enabled DM" "Enabled DM")" "$_dm" ""
+            break
+        fi
+    done
 }
 
 do_rollback() {
