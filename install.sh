@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.7.3"
+SCRIPT_VERSION="1.7.4"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -485,7 +485,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v8"
+PROGRESS_VERSION="v9"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -973,7 +973,7 @@ EOF
 NIRI_GH="https://github.com/niri-wm/niri/releases"
 
 # niri system build dependencies (Debian/Ubuntu names, per the official niri Packaging docs)
-NIRI_BUILD_DEPS=(build-essential pkg-config curl tar \
+NIRI_BUILD_DEPS=(build-essential cmake pkg-config curl tar \
     libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev wayland-protocols \
     libinput-dev libdisplay-info-dev libudev-dev libseat-dev \
     libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
@@ -996,6 +996,7 @@ ensure_rust() {
         exe bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable' || return 1
     fi
     export PATH="$HOME/.cargo/bin:$PATH"
+    exe rustup default stable 2>/dev/null || true
     command -v cargo >/dev/null
 }
 
@@ -1088,14 +1089,6 @@ install_niri_binary() {
     # The source tarball (~1MB) is the primary download; the 40MB vendored-dependencies archive
     # contains ONLY dependency crates (no niri source!), so it is used just as an offline depot
     # when no cargo registry (crates.io / rsproxy) is reachable.
-    if [ "${CRATES_IO_OK:-0}" -eq 0 ]; then
-        # apply_cargo_mirror may not have run (e.g. direct invocation); probe crates.io now
-        if curl -fsS --max-time 8 -o /dev/null https://index.crates.io/config.json 2>/dev/null; then
-            CRATES_IO_OK=1
-        fi
-    fi
-    local offline=0
-    [ "$CRATES_IO_OK" -eq 0 ] && offline=1
     log "$(_t "Building niri from source (10-20 min)..." "Building niri from source (10-20 min)...")"
     url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
     if download_gh "$url" "$tmp"; then
@@ -1132,6 +1125,18 @@ install_niri_binary() {
         MANUAL_ITEMS+=("niri — downloaded archive is unusable (no Cargo.toml after extraction; file type: $ftype, size: $fsize bytes, downloaded from: $url); install manually: $NIRI_GH")
         return 1
     fi
+
+    # Probe cargo registry reachability NOW, right before deciding the build strategy.
+    # Doing it after the source download ensures the network is still alive and avoids
+    # a stale probe from minutes earlier.
+    if [ "${CRATES_IO_OK:-0}" -eq 0 ]; then
+        # apply_cargo_mirror may not have run (e.g. direct invocation); probe crates.io now
+        if curl -fsS --max-time 8 -o /dev/null https://index.crates.io/config.json 2>/dev/null; then
+            CRATES_IO_OK=1
+        fi
+    fi
+    local offline=0
+    [ "$CRATES_IO_OK" -eq 0 ] && offline=1
 
     # Offline depot: when no cargo registry is reachable, fetch the vendored-dependencies archive
     # (dependency crates only) and wire it up as the cargo source so the build needs no network.
