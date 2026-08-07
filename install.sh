@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.7.1"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -491,7 +491,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v5"
+PROGRESS_VERSION="v6"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -1054,6 +1054,7 @@ install_niri_binary() {
         if tar xJf "$tmp" -C "$work" 2>/dev/null && [ -d "$work/bin" ]; then
             exe install -Dm755 -t /usr/local/bin "$work"/bin/*
             [ -d "$work/share" ] && exe cp -r "$work"/share/. /usr/local/share/
+            [ -d "$work/share/wayland-sessions" ] && exe cp -r "$work"/share/wayland-sessions/. /usr/share/wayland-sessions/
             if [ -x /usr/local/bin/niri ]; then
                 INSTALLED_PKGS+=("niri (official prebuilt $ver)")
                 success "$(_t "niri $ver installed" "niri $ver installed")"
@@ -1193,6 +1194,7 @@ install_niri_from_build() { # $1 = srcdir, $2 = logfile
         exe install -Dm755 "$srcdir/target/release/niri" /usr/local/bin/niri
         exe install -Dm755 "$srcdir/resources/niri-session" /usr/local/bin/niri-session 2>/dev/null || true
         exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/local/share/wayland-sessions/niri.desktop 2>/dev/null || true
+        exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/share/wayland-sessions/niri.desktop 2>/dev/null || true
         exe install -Dm644 "$srcdir/resources/niri-portals.conf" /usr/local/share/xdg-desktop-portal/niri-portals.conf 2>/dev/null || true
         INSTALLED_PKGS+=("niri (source build)")
         success "$(_t "niri built from source" "niri built from source")"
@@ -2318,26 +2320,51 @@ ensure_gdm_session() {
         warn "$(_t "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop." "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop.")"
         return 0
     fi
+
+    # gdm custom.conf can override the session with DefaultSession / AutomaticLoginSession
+    # (e.g. Ubuntu pre-sets DefaultSession=ubuntu.desktop or =gnome.desktop).
+    # Clear the override so that AccountsService Session=niri takes effect.
+    local _gconf
+    for _gconf in /etc/gdm/custom.conf /etc/gdm3/custom.conf; do
+        if [ -f "$_gconf" ]; then
+            if grep -q '^DefaultSession=' "$_gconf" 2>/dev/null || grep -q '^AutomaticLoginSession=' "$_gconf" 2>/dev/null; then
+                log "$(_t "Clearing session override in " "Clearing session override in ") $_gconf"
+                sed -i 's/^DefaultSession=.*$/DefaultSession=/' "$_gconf"
+                sed -i 's/^AutomaticLoginSession=.*$/AutomaticLoginSession=/' "$_gconf"
+            fi
+        fi
+    done
+
     local afile="/var/lib/AccountsService/users/$TARGET_USER"
     mkdir -p "$(dirname "$afile")"
     if [ -f "$afile" ] && grep -q '^Session=niri$' "$afile"; then
         log "$(_t "gdm default session already set to niri (AccountsService)" "gdm default session already set to niri (AccountsService)")"
-        return 0
-    fi
-    if [ -f "$afile" ]; then
-        if grep -q '^Session=' "$afile"; then
-            sed -i 's/^Session=.*$/Session=niri/' "$afile"
-        else
-            sed -i '/^\[User\]/a Session=niri' "$afile"
-        fi
     else
-        cat > "$afile" <<'EOF'
+        if [ -f "$afile" ]; then
+            if grep -q '^Session=' "$afile"; then
+                sed -i 's/^Session=.*$/Session=niri/' "$afile"
+            elif grep -q '^\[User\]' "$afile"; then
+                sed -i '/^\[User\]/a Session=niri' "$afile"
+            else
+                # file exists but has no [User] section; append one
+                echo -e '\n[User]\nSession=niri' >> "$afile"
+            fi
+        else
+            cat > "$afile" <<'EOF'
 [User]
 Session=niri
 EOF
-        chown root:root "$afile" 2>/dev/null || true
+            chown root:root "$afile" 2>/dev/null || true
+            chmod 644 "$afile" 2>/dev/null || true
+        fi
+        log "$(_t "gdm default session set to niri (AccountsService Session=niri)" "gdm default session set to niri (AccountsService Session=niri)")"
     fi
-    log "$(_t "gdm default session set to niri (AccountsService Session=niri)" "gdm default session set to niri (AccountsService Session=niri)")"
+
+    # accounts-daemon reads the file on startup; restart so it picks up the change NOW
+    # (matters if the user logs in without rebooting first — the daemon may cache the old value)
+    if systemctl is-active --quiet accounts-daemon 2>/dev/null; then
+        exe systemctl try-restart accounts-daemon 2>/dev/null || true
+    fi
 }
 
 # lightdm (kept as compat): drop-in confs for user-session + greeter default-session
