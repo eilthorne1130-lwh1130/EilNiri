@@ -37,7 +37,7 @@ bg_build_start() { # $1=name $2=srcdir $3=logfile $4...=command
     shift 3
     log "$(_t "Background build started: " "Background build started: ") $name (log: $logfile)"
     ( "$@" ) >> "$logfile" 2>&1 &
-    BG_JOBS+=("$name $! $logfile $srcdir")
+    BG_JOBS+=("$name|$!|$logfile|$srcdir")
     echo "$name|$!|$logfile|$srcdir" >> "$BUILD_STATE_FILE"
 }
 
@@ -46,12 +46,12 @@ cleanup() {
     local p
     # kill any background builds still running (they own temp dirs being removed below)
     local _entry _bpid
-    for _entry in "${BG_JOBS[@]:-}"; do
-        _bpid=$(echo "$_entry" | awk '{print $2}')
+    for _entry in ${BG_JOBS[@]+"${BG_JOBS[@]}"}; do
+        _bpid=$(echo "$_entry" | awk -F'|' '{print $2}')
         [ -n "$_bpid" ] && kill "$_bpid" 2>/dev/null
     done
     rm -f "$BUILD_STATE_FILE" 2>/dev/null
-    for p in "${CLEANUP_TEMP_PATHS[@]:-}"; do
+    for p in ${CLEANUP_TEMP_PATHS[@]+"${CLEANUP_TEMP_PATHS[@]}"}; do
         [ -n "$p" ] && rm -rf "$p" 2>/dev/null
     done
     if [ $rc -ne 0 ] && [ $rc -ne 130 ] && [ "${_ERROR_REPORTED:-0}" -ne 1 ]; then
@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.7.1"
+SCRIPT_VERSION="1.7.3"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -262,7 +262,6 @@ declare -A RHEL_MAP=(
 # Packages with no official RPM -> go to the "manual install" report (value = reason/advice)
 # (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
 declare -A RHEL_MANUAL=(
-    [ly]="Only available on Arch; the script auto-installs gdm on RHEL instead"
 )
 # RHEL family: extra hint when dnf install fails (available in Fedora official repo, but not on Rocky/Alma/CentOS Stream)
 # (xwayland-satellite falls back to cargo install automatically)
@@ -285,14 +284,9 @@ declare -A DEB_MAP=(
     # polkit-gnome was renamed to policykit-1-gnome in Ubuntu 24.04+ / Debian 13+ (binary name unchanged)
     [polkit-gnome]=policykit-1-gnome
 )
-# Debian family: alternate package names tried when the primary apt install fails (e.g. old releases)
-declare -A DEB_ALT=(
-    [polkit-gnome]=polkit-gnome
-)
 # Packages with no official .deb -> go to the "manual install" report (value = reason/advice)
 # (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
 declare -A DEB_MANUAL=(
-    [ly]="No ly package on Debian/Ubuntu; the script auto-installs gdm instead"
 )
 # Debian family: extra hint when apt install fails (not in repo but may have an alternative)
 # (xwayland-satellite falls back to cargo install automatically)
@@ -491,7 +485,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v6"
+PROGRESS_VERSION="v8"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -997,21 +991,64 @@ NIRI_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config curl tar \
 
 # Ensure a usable Rust toolchain (use rustup for the latest stable when the distro version is too old)
 ensure_rust() {
-    if command -v cargo &>/dev/null && cargo --version 2>/dev/null | awk -F'[ .]' '{ if ($2 < 1 || ($2 == 1 && $3 < 85)) exit 1 }'; then
-        return 0
-    fi
-    log "$(_t "System Rust too old or missing, installing rustup toolchain..." "System Rust too old or missing, installing rustup toolchain...")"
     if ! command -v rustup &>/dev/null; then
+        log "$(_t "Installing Rust toolchain (rustup)..." "Installing Rust toolchain (rustup)...")"
         exe bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable' || return 1
     fi
     export PATH="$HOME/.cargo/bin:$PATH"
     command -v cargo >/dev/null
 }
 
+# Lightweight repair: niri binary is already installed but the session file (niri.desktop)
+# is missing. Downloads the source tarball (~1MB) and extracts only the desktop file.
+# This is much faster than re-submitting a full cargo build (10-20 min).
+_repair_niri_session() {
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("niri (session file repair)"); return "$DRY_RUN_RC"; }
+    local ver
+    ver=$(curl -fsSI --retry 2 https://github.com/niri-wm/niri/releases/latest 2>/dev/null \
+        | grep -i '^location:' | sed -n 's#.*/tag/\(v[^/]*\).*#\1#p' | head -n 1 | sed 's/^v//' | tr -d '\r')
+    if [ -z "$ver" ]; then
+        ver=$(curl -fsSL https://api.github.com/repos/niri-wm/niri/releases/latest 2>/dev/null \
+            | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/' | tr -d '\r')
+    fi
+    if [ -z "$ver" ]; then
+        MANUAL_ITEMS+=("niri — session file repair: could not fetch latest version; create /usr/share/wayland-sessions/niri.desktop manually")
+        return 1
+    fi
+    local tmp work url desktop_file
+    tmp=$(mktemp)
+    work=$(mktemp -d)
+    register_temp_path "$tmp"
+    register_temp_path "$work"
+    url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
+    if ! download_gh "$url" "$tmp"; then
+        MANUAL_ITEMS+=("niri — session file repair: source tarball download failed; create /usr/share/wayland-sessions/niri.desktop manually")
+        return 1
+    fi
+    if tar xzf "$tmp" -C "$work" 2>/dev/null; then
+        desktop_file=$(find "$work" -name niri.desktop -type f 2>/dev/null | head -1)
+        if [ -n "$desktop_file" ] && [ -s "$desktop_file" ]; then
+            mkdir -p /usr/local/share/wayland-sessions /usr/share/wayland-sessions
+            exe install -Dm644 "$desktop_file" /usr/local/share/wayland-sessions/niri.desktop
+            exe install -Dm644 "$desktop_file" /usr/share/wayland-sessions/niri.desktop
+            INSTALLED_PKGS+=("niri (session file repaired from source v$ver)")
+            success "$(_t "niri session file repaired" "niri session file repaired")"
+            return 0
+        fi
+    fi
+    MANUAL_ITEMS+=("niri — session file repair: extraction failed; create /usr/share/wayland-sessions/niri.desktop manually")
+    return 1
+}
+
 install_niri_binary() {
     if command -v niri >/dev/null 2>&1; then
-        SKIPPED_PKGS+=("niri (already installed)")
-        return 0
+        if [ -f /usr/share/wayland-sessions/niri.desktop ] || [ -f /usr/local/share/wayland-sessions/niri.desktop ]; then
+            SKIPPED_PKGS+=("niri (already installed)")
+            return 0
+        fi
+        log "$(_t "niri binary found but niri.desktop missing; repairing session file..." "niri binary found but niri.desktop missing; repairing session file...")"
+        _repair_niri_session
+        return $?
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
         DRY_PKGS+=("niri (official prebuilt or source build)")
@@ -1031,7 +1068,7 @@ install_niri_binary() {
     # Resolve the latest version: prefer the /releases/latest redirect (no API), fall back to the GitHub API.
     # NOTE: GitHub HTTP headers are CRLF-terminated — the extracted tag must be stripped of \r,
     # otherwise it embeds a control character in the download URL and curl fails with exit code 3.
-    local ver url tmp work srcdir d
+    local ver url tmp work srcdir
     ver=$(curl -fsSI --retry 2 https://github.com/niri-wm/niri/releases/latest 2>/dev/null \
         | grep -i '^location:' | sed -n 's#.*/tag/\(v[^/]*\).*#\1#p' | head -n 1 | sed 's/^v//' | tr -d '\r')
     if [ -z "$ver" ]; then
@@ -1047,24 +1084,7 @@ install_niri_binary() {
     register_temp_path "$tmp"
     register_temp_path "$work"
 
-    # --- Strategy 1: official prebuilt binary (only some releases provide it; instant install if publishing resumes) ---
-    url="$NIRI_GH/download/v${ver}/niri-${ver}-${arch}-linux-gnu.tar.xz"
-    if download_gh "$url" "$tmp"; then
-        log "$(_t "Downloading niri $ver ($arch) official prebuilt binary..." "Downloading niri $ver ($arch) official prebuilt binary...")"
-        if tar xJf "$tmp" -C "$work" 2>/dev/null && [ -d "$work/bin" ]; then
-            exe install -Dm755 -t /usr/local/bin "$work"/bin/*
-            [ -d "$work/share" ] && exe cp -r "$work"/share/. /usr/local/share/
-            [ -d "$work/share/wayland-sessions" ] && exe cp -r "$work"/share/wayland-sessions/. /usr/share/wayland-sessions/
-            if [ -x /usr/local/bin/niri ]; then
-                INSTALLED_PKGS+=("niri (official prebuilt $ver)")
-                success "$(_t "niri $ver installed" "niri $ver installed")"
-                return 0
-            fi
-        fi
-        warn "$(_t "Prebuilt package unusable, falling back to source build." "Prebuilt package unusable, falling back to source build.")"
-    fi
-
-    # --- Strategy 2: source build ---
+    # --- source build ---
     # The source tarball (~1MB) is the primary download; the 40MB vendored-dependencies archive
     # contains ONLY dependency crates (no niri source!), so it is used just as an offline depot
     # when no cargo registry (crates.io / rsproxy) is reachable.
@@ -1076,7 +1096,7 @@ install_niri_binary() {
     fi
     local offline=0
     [ "$CRATES_IO_OK" -eq 0 ] && offline=1
-    log "$(_t "No prebuilt binary for this version, building from source (10-20 min)..." "No prebuilt binary for this version, building from source (10-20 min)...")"
+    log "$(_t "Building niri from source (10-20 min)..." "Building niri from source (10-20 min)...")"
     url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
     if download_gh "$url" "$tmp"; then
         :
@@ -1560,19 +1580,6 @@ install_debian() {
         fi
         erc=0
         pm_install "$name" || erc=$?
-        # retry with an alternate package name if the primary one is not in this release
-        if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ -n "${DEB_ALT[$p]:-}" ]; then
-            local alt_name="${DEB_ALT[$p]}"
-            log "$(_t "Package not available, trying alternate name: " "Package not available, trying alternate name: ") $alt_name"
-            if pkg_installed "$alt_name"; then
-                SKIPPED_PKGS+=("$alt_name (already installed)")
-                erc=0
-            else
-                erc=0
-                pm_install "$alt_name" || erc=$?
-                name="$alt_name"
-            fi
-        fi
         if [ "$erc" -eq 0 ]; then
             INSTALLED_PKGS+=("$name")
         elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
@@ -1634,7 +1641,7 @@ stage_wait_builds() {
     log "$(_t "Run './install.sh status' in another terminal to watch progress live." "Run './install.sh status' in another terminal to watch progress live.")"
     local entry name pid logfile srcdir rc tailmsg start now prog any_failed=0
     for entry in "${BG_JOBS[@]}"; do
-        read -r name pid logfile srcdir <<< "$entry"
+        IFS='|' read -r name pid logfile srcdir <<< "$entry"
         log "$(_t "Waiting for " "Waiting for ") $name $(_t " build..." " build...")"
         start=$(date +%s)
         while kill -0 "$pid" 2>/dev/null; do
@@ -1808,7 +1815,7 @@ stage_dm() {
         fi
     fi
 
-    local known_dms=(gdm3 gdm sddm lightdm lxdm ly greetd plasma-login-manager lemurs)
+    local known_dms=(gdm3 gdm sddm lxdm ly greetd plasma-login-manager lemurs)
     local dm_pkgs dm_unit
     case "$DISTRO_FAMILY" in
         arch)   dm_pkgs="ly";           dm_unit="ly@tty1" ;;
@@ -1851,7 +1858,7 @@ stage_dm() {
     local ok=0
     for tried in "$dm_pkgs|$dm_unit" "gdm3|gdm3" "sddm|sddm"; do
         local tpkg="${tried%%|*}" tunit="${tried##*|}"
-        if pm_install $tpkg; then
+        if pm_install "$tpkg"; then
             dm_pkgs="$tpkg"; dm_unit="$tunit"; ok=1
             break
         fi
@@ -2083,8 +2090,9 @@ stage_hardware_adapt() {
         local w h refresh
         w=$(echo "$detected_mode" | cut -dx -f1)
         h=$(echo "$detected_mode" | cut -dx -f2)
-        refresh=$(head -1 "$dir/edid" 2>/dev/null | od -An -j12 -N1 -i 2>/dev/null | tr -d ' ')
-        [ -z "$refresh" ] && refresh=60
+        # EDID offset 12 is NOT the refresh rate; proper refresh requires parsing
+        # the detailed timing descriptor. Default to 60Hz to avoid bogus values.
+        refresh=60
         mode_line="mode \"${w}x${h}@${refresh}\""
     fi
 
@@ -2307,7 +2315,7 @@ do_restore() {
 # The stage_dm write only happens while that stage runs, but the niri.desktop session file
 # arrives later (background build). This step re-checks on every run so a late niri build
 # still gets picked up as the DM default session.
-# Mechanism is DM-specific: gdm uses AccountsService (Session=niri), lightdm uses drop-in confs.
+# Mechanism is DM-specific: gdm uses AccountsService (Session=niri).
 
 # gdm / gdm3: write /var/lib/AccountsService/users/<TARGET_USER> with Session=niri
 ensure_gdm_session() {
@@ -2367,41 +2375,6 @@ EOF
     fi
 }
 
-# lightdm (kept as compat): drop-in confs for user-session + greeter default-session
-ensure_lightdm_session() {
-    [ "$DRY_RUN" -eq 1 ] && return 0
-    local _niri_desktop=""
-    [ -f /usr/local/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
-    [ -z "$_niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/share/wayland-sessions/niri.desktop
-    if [ -z "$_niri_desktop" ]; then
-        warn "$(_t "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop." "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop.")"
-        return 0
-    fi
-    # 99-niri.conf for lightdm user-session
-    mkdir -p /etc/lightdm/lightdm.conf.d
-    if [ -f /etc/lightdm/lightdm.conf.d/99-niri.conf ] && grep -q '^user-session=niri$' /etc/lightdm/lightdm.conf.d/99-niri.conf; then
-        :
-    else
-        cat > /etc/lightdm/lightdm.conf.d/99-niri.conf <<'EOF'
-[Seat:*]
-user-session=niri
-EOF
-        log "$(_t "lightdm default session set to niri (user-session=niri)" "lightdm default session set to niri (user-session=niri)")"
-    fi
-    rm -f /etc/lightdm/lightdm.conf.d/50-niri.conf 2>/dev/null  # superseded by 99-
-    # lightdm-gtk-greeter default-session (higher priority than lightdm user-session)
-    mkdir -p /etc/lightdm/lightdm-gtk-greeter.conf.d
-    if [ -f /etc/lightdm/lightdm-gtk-greeter.conf.d/99-niri.conf ] && grep -q '^default-session=niri$' /etc/lightdm/lightdm-gtk-greeter.conf.d/99-niri.conf; then
-        :
-    else
-        cat > /etc/lightdm/lightdm-gtk-greeter.conf.d/99-niri.conf <<'EOF'
-[greeter]
-default-session=niri
-EOF
-        log "$(_t "lightdm-gtk-greeter default session set to niri" "lightdm-gtk-greeter default session set to niri")"
-    fi
-}
-
 # dispatch: pick the right mechanism for the DM that actually owns display-manager.service
 ensure_dm_session() {
     [ "$DRY_RUN" -eq 1 ] && return 0
@@ -2415,7 +2388,6 @@ ensure_dm_session() {
     fi
     case "$_dm" in
         gdm|gdm3) ensure_gdm_session ;;
-        lightdm)  ensure_lightdm_session ;;
         sddm)     warn "$(_t "sddm default session not supported by this script; login may go to the wrong desktop." "sddm default session not supported by this script; login may go to the wrong desktop.")" ;;
         *)        warn "$(_t "Unknown DM '$_dm' — cannot set niri as the default session." "Unknown DM '$_dm' — cannot set niri as the default session.")" ;;
     esac
@@ -2436,7 +2408,7 @@ boot_env_check() {
         info_kv "$(_t "Display Manager" "Display Manager")" "$(_t "none configured" "none configured")" "$(_t "display-manager.service missing — boot will stay at a tty" "display-manager.service missing — boot will stay at a tty")"
     fi
     local _dm
-    for _dm in lightdm sddm gdm3 gdm ly; do
+    for _dm in sddm gdm3 gdm ly; do
         if systemctl is-enabled --quiet "$_dm" 2>/dev/null; then
             info_kv "$(_t "Enabled DM" "Enabled DM")" "$_dm" ""
             break
