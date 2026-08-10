@@ -214,10 +214,10 @@ declare -A GROUP_EN=(
 )
 
 declare -A GROUP_PKGS=(
-    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome wl-clipboard libnotify zsh"
+    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh zsh-autosuggestions zsh-syntax-highlighting"
     [lock]="hyprlock hypridle"
     [wallpaper]="awww waypaper"
-    [clip]="copyq satty"
+    [clip]="copyq satty grim slurp"
     [media]="playerctl brightnessctl"
     [audio]="pipewire-pulse wireplumber"
     [ime]="fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git"
@@ -235,8 +235,8 @@ done
 unset _g _p
 
 # Config capture whitelist (~/.config dirs) + home dotfiles
-CONFIG_DIRS=(niri waybar mako kitty hypr copyq satty waypaper fcitx5 fcitx environment.d xdg-desktop-portal gtk-3.0 gtk-4.0 fontconfig)
-CONFIG_FILES=(.pam_environment)
+CONFIG_DIRS=(niri waybar mako kitty hypr copyq satty waypaper fcitx5 fcitx5 environment.d xdg-desktop-portal gtk-3.0 gtk-4.0 fontconfig systemd)
+CONFIG_FILES=(.pam_environment .zshrc)
 
 # service -> provider package mapping (filtered by is-enabled during export and written to services.txt)
 SVC_ORDER=(bluetooth.service libvirtd.service power-profiles-daemon.service)
@@ -2203,6 +2203,20 @@ stage_configs() {
     if [ "$_pw" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
         log "$(_t "Enabling PipeWire user services..." "Enabling PipeWire user services...")"
         as_user systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service 2>/dev/null || true
+    fi
+
+    # enable waypaper user services (wallpaper restore on login + random-change timer),
+    # deployed from configs/.config/systemd/user/. Only when waypaper was selected.
+    if [ "$DRY_RUN" -eq 0 ]; then
+        local _has_wp=0
+        for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+            [ "$_p" = "waypaper" ] && _has_wp=1
+        done
+        if [ "$_has_wp" -eq 1 ] && [ -f "$HOME_DIR/.config/systemd/user/waypaper.service" ]; then
+            log "$(_t "Enabling waypaper user services..." "Enabling waypaper user services...")"
+            as_user systemctl --user daemon-reload 2>/dev/null || true
+            as_user systemctl --user enable --now waypaper.service waypaper-random.timer 2>/dev/null || true
+        fi
     fi
 
     # fcitx5 IME environment variables: ~/.pam_environment is disabled by default on

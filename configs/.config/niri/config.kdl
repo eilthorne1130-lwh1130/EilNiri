@@ -377,6 +377,13 @@ window-rule {
 
 // All other apps default to 100% opaque.
 
+// gsimplecal calendar popup: float as a small card (not tiled)
+window-rule {
+    match app-id=r#"^gsimplecal$"#
+    open-floating true
+    geometry-corner-radius 14
+}
+
 // Example: block out two password managers from screen capture.
 // (This example rule is commented out with a "/-" in front.)
 /-window-rule {
@@ -403,7 +410,7 @@ binds {
     // Mod-Shift-/, which is usually the same as Mod-?,
     // shows a list of important hotkeys.
     Mod+Shift+Slash { show-hotkey-overlay; }
-    //Mod+Shift+S+A {spawn-sh "wl-paste | satty -f -";}
+    //Ctrl+Alt {spawn-sh "wl-paste | satty -f -";}
 
     // Suggested binds for running programs: terminal, app launcher, screen locker.
     Mod+W hotkey-overlay-title="Open a Terminal: kitty" { spawn-sh "GLFW_IM_MODULE=ibus QT_IM_MODULE=fcitx GTK_IM_MODULE=fcitx XMODIFIERS=@im=fcitx kitty -e zsh"; }
@@ -653,7 +660,7 @@ binds {
     // Mod+Space       { switch-layout "next"; }
     // Mod+Shift+Space { switch-layout "prev"; }
 
-    Mod+Shift+S { screenshot; }
+    Mod+Shift+S { spawn-sh "grim -g \"$(slurp -d)\" - | satty --filename=- --output-filename='~/Pictures/Screenshots/Screenshot from %Y-%m-%d %H-%M-%S.png'"; }
     Ctrl+Print { screenshot-screen; }
     Alt+Print { screenshot-window; }
 
