@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.7.4"
+SCRIPT_VERSION="1.8.0"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -299,6 +299,25 @@ declare -A PIP_PKGS=(
     [waypaper]=waypaper
 )
 
+# Packages to build from source when the distro repo has no package.
+# key = arch-style pkg name, value = upstream git URL. Add entries here to extend
+# the "apt/dnf failed -> build from source" fallback (install_debian / install_rhel).
+declare -A SOURCE_PKGS=(
+    [hyprlock]="https://github.com/hyprwm/hyprlock"
+    [hypridle]="https://github.com/hyprwm/hypridle"
+)
+
+# hyprlock / hypridle system build dependencies (Debian/Ubuntu names).
+# libhyprutils-dev & libhyprlang-dev exist on Ubuntu 25.10+ / Debian 13+ universe only;
+# apt_install_tolerant handles their absence on older releases (cargo then reports the real error).
+HYPR_BUILD_DEPS_DEB=(build-essential cmake pkg-config git libwayland-dev wayland-protocols
+    libpango1.0-dev libgbm-dev libdrm-dev libxkbcommon-dev libxcb1-dev
+    libhyprutils-dev libhyprlang-dev)
+# hyprlock / hypridle system build dependencies (RHEL family names)
+HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config git wayland-devel wayland-protocols-devel
+    pango-devel mesa-libgbm-devel libdrm-devel libxkbcommon-devel libxcb-devel
+    hyprutils-devel hyprlang-devel)
+
 # Summary report collectors
 INSTALLED_PKGS=() SKIPPED_PKGS=() FAILED_PKGS=() MANUAL_ITEMS=() ENABLED_SVCS=()
 DRY_PKGS=() DRY_SVCS=()  # items "that would be executed" in dry-run mode; kept separate to avoid inflated counts
@@ -478,6 +497,26 @@ pm_install() { # $@ = package names
     esac
 }
 
+# Install as many packages of a batch as possible; return non-zero only when one or more
+# names are genuinely unavailable. Used for build-deps batches that must be resilient to a
+# few absent names (so a single renamed -dev package no longer aborts the whole build).
+BDEPS_MISSING=()
+apt_install_tolerant() {
+    BDEPS_MISSING=()
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$@"); return "$DRY_RUN_RC"; }
+    if exe apt-get install -y "$@" 2>/dev/null; then
+        return 0   # whole batch installed
+    fi
+    # batch failed (at least one name missing) — retry one-by-one so the available ones still install
+    local p erc
+    for p in "$@"; do
+        erc=0
+        exe apt-get install -y "$p" 2>/dev/null || erc=$?
+        [ "$erc" -ne 0 ] && BDEPS_MISSING+=("$p")
+    done
+    [ ${#BDEPS_MISSING[@]} -eq 0 ]
+}
+
 as_user() {
     runuser -u "$TARGET_USER" -- "$@"
 }
@@ -485,7 +524,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v9"
+PROGRESS_VERSION="v10"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -673,6 +712,21 @@ stage_preflight() {
                     warn "$(_t "System update partially failed, continuing." "System update partially failed, continuing.")"
                 fi
                 pm_install curl tar unzip
+                # Generate the zh_CN / en_US locales: envvars.conf sets LANG=zh_CN.UTF-8 and
+                # a missing locale triggers noisy "cannot set locale" warnings on every command.
+                if ! command -v locale-gen >/dev/null 2>&1; then
+                    exe apt-get install -y locales 2>/dev/null || true
+                fi
+                if command -v locale-gen >/dev/null 2>&1; then
+                    local _lg
+                    for _lg in "zh_CN.UTF-8 UTF-8" "en_US.UTF-8 UTF-8"; do
+                        local _loc="${_lg%% *}"
+                        grep -q "^#*${_lg}$" /etc/locale.gen 2>/dev/null \
+                            && sed -i "s/^#*${_lg}$/${_lg}/" /etc/locale.gen \
+                            || echo "$_lg" >> /etc/locale.gen
+                    done
+                    exe locale-gen 2>/dev/null || warn "$(_t "locale-gen failed, locale warnings may appear." "locale-gen failed, locale warnings may appear.")"
+                fi
             fi
             ;;
     esac
@@ -890,6 +944,9 @@ install_rhel() {
             elif [ "$p" = "xwayland-satellite" ]; then
                 warn "$(_t "No xwayland-satellite package in dnf, falling back to cargo install..." "No xwayland-satellite package in dnf, falling back to cargo install...")"
                 install_xwayland_satellite
+            elif [ -n "${SOURCE_PKGS[$p]:-}" ]; then
+                warn "$(_t "No dnf package for " "No dnf package for ") $p, building from source..."
+                install_hypr_source "$p" "${SOURCE_PKGS[$p]}"
             elif [ -n "${RHEL_FAIL_HINT[$p]:-}" ]; then
                 MANUAL_ITEMS+=("$name — not available in repo. ${RHEL_FAIL_HINT[$p]}")
             else
@@ -919,11 +976,19 @@ download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the cur
     local url="$1" out="$2"
     if try_dl "$url" "$out"; then
         return 0
-    else
-        local rc=$?
-        log "$(_t "Download failed (curl exit code: " "Download failed (curl exit code: ") $rc)"
-        return "$rc"
     fi
+    local rc=$?
+    # direct download failed — try mirror proxies (CN-friendly; configurable via EILNIRI_GH_PROXY)
+    log "$(_t "Direct download failed (curl " "Direct download failed (curl ") $rc), trying mirror proxies..."
+    local proxy prefix
+    for proxy in ${EILNIRI_GH_PROXY:-https://ghfast.top/ https://mirror.ghproxy.com/}; do
+        prefix="${proxy%/}"
+        if try_dl "${prefix}/${url}" "$out"; then
+            return 0
+        fi
+    done
+    log "$(_t "Download failed after all proxies (last curl exit code: " "Download failed after all proxies (last curl exit code: ") $rc)"
+    return "$rc"
 }
 
 # Cargo/rustup mirror for CN timezones (builds fetch from crates.io / static.rust-lang.org).
@@ -991,6 +1056,13 @@ NIRI_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config curl tar \
 
 # Ensure a usable Rust toolchain (use rustup for the latest stable when the distro version is too old)
 ensure_rust() {
+    # Re-apply rsproxy mirror env for CN timezones so the rustup toolchain download is not blocked.
+    # apply_cargo_mirror may already have set these, but ensure_rust can be called directly too.
+    local _tz
+    _tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+    if [[ "$_tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]]; then
+        export RUSTUP_DIST_SERVER="https://rsproxy.cn" RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+    fi
     if ! command -v rustup &>/dev/null; then
         log "$(_t "Installing Rust toolchain (rustup)..." "Installing Rust toolchain (rustup)...")"
         exe bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable' || return 1
@@ -1184,11 +1256,14 @@ EOF
     fi
     local bdeps_rc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
-        exe apt-get install -y "${NIRI_BUILD_DEPS[@]}" || bdeps_rc=$?
+        apt_install_tolerant "${NIRI_BUILD_DEPS[@]}" || bdeps_rc=$?
+        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+            warn "$(_t "Some niri build deps unavailable (continuing; cargo will report the real error if a header is still missing):" "Some niri build deps unavailable (continuing; cargo will report the real error if a header is still missing):") ${BDEPS_MISSING[*]}"
+        fi
     else
         exe dnf install -y "${NIRI_BUILD_DEPS_RHEL[@]}" || bdeps_rc=$?
     fi
-    if [ "$bdeps_rc" -ne 0 ]; then
+    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
         MANUAL_ITEMS+=("niri — build dependencies install failed, build manually: $NIRI_GH")
         return 1
     fi
@@ -1251,13 +1326,16 @@ install_awww() {
     # dav1d/lz4 runtime libs are best effort.
     local bdeps_rc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
-        exe apt-get install -y git libwayland-dev wayland-protocols liblz4-dev || bdeps_rc=$?
+        apt_install_tolerant git libwayland-dev wayland-protocols liblz4-dev || bdeps_rc=$?
+        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+            warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+        fi
         exe apt-get install -y libdav1d6 2>/dev/null || true
     else
         exe dnf install -y git wayland-devel wayland-protocols-devel lz4-devel || bdeps_rc=$?
         exe dnf install -y dav1d lz4 2>/dev/null || true
     fi
-    if [ "$bdeps_rc" -ne 0 ]; then
+    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
         MANUAL_ITEMS+=("awww — build dependencies install failed, build manually: $AWWW_REPO")
         return 1
     fi
@@ -1375,11 +1453,14 @@ install_satty() {
     # --- Strategy 2: cargo install (crates.io) ---
     local bdeps_rc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
-        exe apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev librsvg2-dev || bdeps_rc=$?
+        apt_install_tolerant build-essential pkg-config libgtk-4-dev libadwaita-1-dev librsvg2-dev || bdeps_rc=$?
+        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+            warn "$(_t "Some satty build deps unavailable (continuing):" "Some satty build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+        fi
     else
         exe dnf install -y gcc pkgconf-pkg-config gtk4-devel libadwaita-devel librsvg2-devel || bdeps_rc=$?
     fi
-    if [ "$bdeps_rc" -ne 0 ]; then
+    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
         MANUAL_ITEMS+=("satty — build dependencies install failed, install manually: $SATTY_GH")
         return 1
     fi
@@ -1482,11 +1563,14 @@ install_xwayland_satellite() {
     # build deps: upstream needs clang (bindgen) + xcb-cursor dev headers + git (cargo --git)
     local bdeps_rc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
-        exe apt-get install -y git clang libclang-dev libxcb-cursor-dev || bdeps_rc=$?
+        apt_install_tolerant git clang libclang-dev libxcb-cursor-dev || bdeps_rc=$?
+        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+            warn "$(_t "Some xwayland-satellite build deps unavailable (continuing):" "Some xwayland-satellite build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+        fi
     else
         exe dnf install -y git clang libxcb-cursor-devel || bdeps_rc=$?
     fi
-    if [ "$bdeps_rc" -ne 0 ]; then
+    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
         MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (git/clang/libxcb-cursor-dev); install manually: $XWS_REPO")
         return 1
     fi
@@ -1508,6 +1592,82 @@ install_xwayland_satellite() {
     tailmsg=$(tail -n 6 "$logf" 2>/dev/null | tr '\n' ' ')
     MANUAL_ITEMS+=("xwayland-satellite — build failed ($tailmsg); install manually: $XWS_REPO (or Fedora repo)")
     return 1
+}
+
+# --- hyprlock / hypridle source build (fallback when no apt/dnf package) ---
+# Used for any package listed in SOURCE_PKGS. Clones the upstream repo, installs the
+# hyprwm C build deps, runs a foreground cargo build (~3 min), installs the binary to
+# /usr/local/bin. For hyprlock it also writes /etc/pam.d/hyprlock (the apt package
+# ships one, but a source build does not — without it hyprlock cannot authenticate).
+install_hypr_source() { # $1 = pkg name, $2 = repo URL
+    local pkg="$1" repo="$2"
+    if command -v "$pkg" >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("$pkg (already installed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("$pkg (cargo source build)")
+        return "$DRY_RUN_RC"
+    fi
+
+    # build deps (tolerant: libhyprutils-dev/libhyprlang-dev are absent on older releases)
+    local _brc=0
+    if [ "$DISTRO_FAMILY" = debian ]; then
+        apt_install_tolerant "${HYPR_BUILD_DEPS_DEB[@]}" || _brc=$?
+        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+            warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+        fi
+    else
+        exe dnf install -y "${HYPR_BUILD_DEPS_RHEL[@]}" || _brc=$?
+    fi
+    if ! ensure_rust; then
+        MANUAL_ITEMS+=("$pkg — Rust toolchain install failed, build manually: $repo")
+        return 1
+    fi
+
+    local work
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    log "$(_t "Cloning " "Cloning ") $pkg ($repo)..."
+    if ! exe git clone --depth 1 "$repo" "$work/$pkg" 2>/dev/null; then
+        MANUAL_ITEMS+=("$pkg — git clone failed, build manually: $repo")
+        return 1
+    fi
+
+    local logf="$LOG_DIR/$pkg-build.log"
+    log "$(_t "Building " "Building ") $pkg from source (~3 min, log: $logf)..."
+    ( cd "$work/$pkg" && cargo build --release ) > "$logf" 2>&1
+    local crc=$?
+    if [ "$crc" -ne 0 ] || [ ! -x "$work/$pkg/target/release/$pkg" ]; then
+        local tailmsg
+        tailmsg=$(tail -n 6 "$logf" 2>/dev/null | tr '\n' ' ')
+        MANUAL_ITEMS+=("$pkg — build failed ($tailmsg); build manually: $repo")
+        warn "$(_t "Build failed: " "Build failed: ") $pkg (see $logf)"
+        return 1
+    fi
+
+    exe install -Dm755 "$work/$pkg/target/release/$pkg" "/usr/local/bin/$pkg"
+    INSTALLED_PKGS+=("$pkg (cargo source build)")
+    success "$(_t "$pkg built from source" "$pkg built from source")"
+
+    # hyprlock needs a PAM config to authenticate; the apt package ships one, a source build does not.
+    if [ "$pkg" = hyprlock ] && [ ! -f /etc/pam.d/hyprlock ]; then
+        local _pam_src="$work/$pkg/pam/hyprlock"
+        mkdir -p /etc/pam.d
+        if [ -f "$_pam_src" ]; then
+            exe install -Dm644 "$_pam_src" /etc/pam.d/hyprlock
+        else
+            cat > /etc/pam.d/hyprlock <<'PAMEOF'
+# Minimal PAM config for hyprlock (generated by eilNiri source build)
+auth       include      login
+-account   include      login
+password   include      login
+session    include      login
+PAMEOF
+        fi
+        log "$(_t "Wrote /etc/pam.d/hyprlock for source-built hyprlock" "Wrote /etc/pam.d/hyprlock for source-built hyprlock")"
+    fi
+    return 0
 }
 
 install_debian() {
@@ -1590,7 +1750,10 @@ install_debian() {
         elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
             DRY_PKGS+=("$name")
         else
-            if [ -n "${DEB_FAIL_HINT[$p]:-}" ]; then
+            if [ -n "${SOURCE_PKGS[$p]:-}" ]; then
+                warn "$(_t "No apt package for " "No apt package for ") $p, building from source..."
+                install_hypr_source "$p" "${SOURCE_PKGS[$p]}"
+            elif [ -n "${DEB_FAIL_HINT[$p]:-}" ]; then
                 MANUAL_ITEMS+=("$name — not available in repo. ${DEB_FAIL_HINT[$p]}")
             else
                 FAILED_PKGS+=("apt:$name")
@@ -2041,6 +2204,32 @@ stage_configs() {
         log "$(_t "Enabling PipeWire user services..." "Enabling PipeWire user services...")"
         as_user systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service 2>/dev/null || true
     fi
+
+    # fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
+    # Debian 12+ / Ubuntu 22.04+ (pam_env user_readenv removed), so the IME vars shipped
+    # there never load on modern systems. Write them to environment.d (systemd reads it)
+    # as a fallback when fcitx5 was selected and no ime.conf is already present.
+    if [ "$DRY_RUN" -eq 0 ]; then
+        local _has_ime=0
+        for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+            case "$_p" in fcitx5|fcitx5-*) _has_ime=1; break ;; esac
+        done
+        if [ "$_has_ime" -eq 1 ] && [ -n "$TARGET_USER" ]; then
+            local _imed="$HOME_DIR/.config/environment.d"
+            mkdir -p "$_imed"
+            if [ ! -f "$_imed/ime.conf" ]; then
+                cat > "$_imed/ime.conf" <<'IMEEOF'
+GTK_IM_MODULE=fcitx5
+QT_IM_MODULE=fcitx5
+XMODIFIERS=@im=fcitx5
+SDL_IM_MODULE=fcitx5
+GLFW_IM_MODULE=fcitx5
+IMEEOF
+                chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_imed/ime.conf" 2>/dev/null || true
+                log "$(_t "Wrote ~/.config/environment.d/ime.conf (fcitx5 IME vars; .pam_environment is ignored on Debian 12+/Ubuntu 22.04+)" "Wrote ~/.config/environment.d/ime.conf (fcitx5 IME vars; .pam_environment is ignored on Debian 12+/Ubuntu 22.04+)")"
+            fi
+        fi
+    fi
     # set zsh as the default shell (if zsh is installed and is not already the shell)
     for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
         if [ "$_p" = "zsh" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != "/usr/bin/zsh" ]; then
@@ -2313,7 +2502,81 @@ do_restore() {
     [ "$DISTRO_FAMILY" = arch ] && exe pacman -Sc --noconfirm 2>/dev/null || true
     ensure_dm_session   # idempotent: re-checks every run (niri build may have finished late)
     boot_env_check
+    print_niri_status
     print_summary
+    save_diag_bundle
+}
+
+# --- 4.10c one-line niri status (printed right before the summary) ---
+print_niri_status() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _bin="MISSING" _desk="MISSING" _sess="unset"
+    if command -v niri >/dev/null 2>&1 || [ -x /usr/local/bin/niri ]; then _bin="installed"; fi
+    if [ -f /usr/local/share/wayland-sessions/niri.desktop ] || [ -f /usr/share/wayland-sessions/niri.desktop ]; then _desk="registered"; fi
+    if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
+        _sess=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//' )
+        [ -z "$_sess" ] && _sess="unset"
+    fi
+    echo ""
+    info_kv "$(_t "NIRI STATUS" "NIRI STATUS")" "binary=$_bin | desktop=$_desk | gdm Session=$_sess"
+}
+
+# --- 4.10d diagnostic bundle (so a failed run can be shared for offline analysis) ---
+save_diag_bundle() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _ts _bundle _tmpdir
+    _ts=$(date +%Y%m%d-%H%M%S)
+    _tmpdir=$(mktemp -d)
+    register_temp_path "$_tmpdir"
+    # gather plain-text snapshots (best effort; never fail the whole restore here)
+    {
+        echo "=== eilNiri diagnostic bundle ==="
+        echo "Date: $(date)"
+        echo "Script: v$SCRIPT_VERSION  Progress: $PROGRESS_VERSION"
+        echo "Distro: $DISTRO_FAMILY ($DISTRO_ID)  Ubuntu: $UBUNTU_VER_NUM"
+        echo "Target user: $TARGET_USER  Home: $HOME_DIR"
+        echo
+        echo "=== systemctl get-default ==="
+        systemctl get-default 2>/dev/null
+        echo
+        echo "=== display-manager.service ==="
+        readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "(missing)"
+        echo
+        echo "=== enabled DMs ==="
+        for _d in gdm gdm3 sddm ly lightdm; do systemctl is-enabled --quiet "$_d" 2>/dev/null && echo "$_d enabled"; done
+        echo
+        echo "=== AccountsService users/$TARGET_USER ==="
+        cat "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null || echo "(missing)"
+        echo
+        echo "=== gdm custom.conf ==="
+        cat /etc/gdm/custom.conf /etc/gdm3/custom.conf 2>/dev/null || echo "(none)"
+        echo
+        echo "=== niri.desktop locations ==="
+        ls -l /usr/local/share/wayland-sessions/niri.desktop /usr/share/wayland-sessions/niri.desktop 2>/dev/null || echo "(none)"
+        echo
+        echo "=== niri binary ==="
+        command -v niri 2>/dev/null && niri --version 2>&1 | head -1 || echo "(not found)"
+        echo
+        echo "=== installed pkgs (gdm/niri/rust/accountsservice/hypr) ==="
+        case "$DISTRO_FAMILY" in
+            debian) dpkg -l 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr' ;;
+            rhel)   rpm -qa 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr' ;;
+            arch)   pacman -Q 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr' ;;
+        esac
+        echo
+        echo "=== build logs tail ==="
+        for _f in "$LOG_DIR/niri-build.log" "$LOG_DIR/awww-build.log" "$LOG_DIR/xwayland-satellite-build.log" "$LOG_DIR/hyprlock-build.log" "$LOG_DIR/hypridle-build.log"; do
+            [ -f "$_f" ] && { echo "--- $_f (tail 30) ---"; tail -n 30 "$_f" 2>/dev/null; }
+        done
+    } > "$_tmpdir/diag.txt" 2>/dev/null
+    # attach the full replicate log too
+    [ -f "$TEMP_LOG_FILE" ] && cp "$TEMP_LOG_FILE" "$_tmpdir/replicate.log" 2>/dev/null
+    _bundle="$LOG_DIR/diag-$_ts.tar.gz"
+    if tar czf "$_bundle" -C "$_tmpdir" . 2>/dev/null; then
+        echo ""
+        info_kv "$(_t "Diagnostic Bundle" "Diagnostic Bundle")" "$_bundle" "$(_t "(share this if niri fails to start)" "(share this if niri fails to start)")"
+        write_log "DIAG" "bundle saved: $_bundle"
+    fi
 }
 
 # --- 4.10b ensure display manager default session = niri (idempotent, runs on EVERY restore) ---
@@ -2334,19 +2597,37 @@ ensure_gdm_session() {
         return 0
     fi
 
-    # gdm custom.conf can override the session with DefaultSession / AutomaticLoginSession
-    # (e.g. Ubuntu pre-sets DefaultSession=ubuntu.desktop or =gnome.desktop).
-    # Clear the override so that AccountsService Session=niri takes effect.
+    # gdm custom.conf can override the session with DefaultSession / AutomaticLoginSession,
+    # or bypass session selection entirely via AutomaticLogin (auto-login uses the default
+    # session, i.e. GNOME on Ubuntu). Clear all of these so AccountsService Session=niri wins.
     local _gconf
     for _gconf in /etc/gdm/custom.conf /etc/gdm3/custom.conf; do
         if [ -f "$_gconf" ]; then
-            if grep -q '^DefaultSession=' "$_gconf" 2>/dev/null || grep -q '^AutomaticLoginSession=' "$_gconf" 2>/dev/null; then
-                log "$(_t "Clearing session override in " "Clearing session override in ") $_gconf"
-                sed -i 's/^DefaultSession=.*$/DefaultSession=/' "$_gconf"
-                sed -i 's/^AutomaticLoginSession=.*$/AutomaticLoginSession=/' "$_gconf"
+            local _changed=0
+            if grep -q '^DefaultSession=' "$_gconf" 2>/dev/null; then
+                sed -i 's/^DefaultSession=.*$/DefaultSession=/' "$_gconf"; _changed=1
             fi
+            if grep -q '^AutomaticLoginSession=' "$_gconf" 2>/dev/null; then
+                sed -i 's/^AutomaticLoginSession=.*$/AutomaticLoginSession=/' "$_gconf"; _changed=1
+            fi
+            # AutomaticLoginEnable=true + AutomaticLogin=<user> bypasses session selection
+            # entirely (auto-login drops into the default desktop = GNOME). Disable it so the
+            # user picks the session at the greeter (and AccountsService Session=niri applies).
+            if grep -qi '^AutomaticLoginEnable=true' "$_gconf" 2>/dev/null; then
+                sed -i 's/^AutomaticLoginEnable=.*/AutomaticLoginEnable=false/I' "$_gconf"; _changed=1
+                warn "$(_t "Disabled AutomaticLoginEnable in " "Disabled AutomaticLoginEnable in ") $_gconf $(_t " (auto-login bypasses session selection)" " (auto-login bypasses session selection)")"
+            fi
+            [ "$_changed" -eq 1 ] && log "$(_t "Cleared session override(s) in " "Cleared session override(s) in ") $_gconf"
         fi
     done
+
+    # gdm reads the default session via AccountsService (accounts-daemon). If the daemon is
+    # missing, the Session=niri file we write below is silently ignored and login goes to GNOME.
+    if ! pkg_installed accountsservice 2>/dev/null && ! pkg_installed accounts-daemon 2>/dev/null; then
+        log "$(_t "Installing accountsservice (gdm reads the default session from it)..." "Installing accountsservice (gdm reads the default session from it)...")"
+        pm_install accountsservice 2>/dev/null || warn "$(_t "accountsservice install failed; gdm may ignore Session=niri." "accountsservice install failed; gdm may ignore Session=niri.")"
+    fi
+    systemctl enable --now accounts-daemon 2>/dev/null || systemctl enable --now accountsservice 2>/dev/null || true
 
     local afile="/var/lib/AccountsService/users/$TARGET_USER"
     mkdir -p "$(dirname "$afile")"
@@ -2441,6 +2722,28 @@ boot_env_check() {
     local _sessions
     _sessions=$(ls /usr/share/xsessions /usr/local/share/xsessions /usr/share/wayland-sessions /usr/local/share/wayland-sessions 2>/dev/null | sort -u | tr '\n' ' ')
     info_kv "$(_t "Sessions (all)" "Sessions (all)")" "${_sessions:-none}" "$(_t "(niri present if niri.desktop listed)" "(niri present if niri.desktop listed)")"
+
+    # final assertion: will gdm actually boot into niri?
+    local _boot_ok=1 _reason=""
+    [ -z "$_niri_desktop" ] && { _boot_ok=0; _reason="niri.desktop not registered (build incomplete)"; }
+    if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
+        local _as
+        _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
+        if [ "$_as" != "niri" ]; then
+            _boot_ok=0
+            [ -n "$_reason" ] && _reason="; "
+            _reason="${_reason}gdm AccountsService Session='${_as:-unset}' (expected niri)"
+        fi
+    fi
+    if [ "$_boot_ok" -eq 1 ]; then
+        success "$(_t "Boot check: gdm will start niri after reboot." "Boot check: gdm will start niri after reboot.")"
+    else
+        echo -e "   ${H_RED}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
+        echo -e "   ${H_RED}┃  BOOT CHECK FAILED: gdm will NOT start niri.                       ┃${NC}"
+        echo -e "   ${H_RED}┃  Reason: $_reason${NC}"
+        echo -e "   ${H_RED}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
+        write_log "FAIL" "boot check failed: $_reason"
+    fi
 }
 
 do_rollback() {
