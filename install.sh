@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.8.0"
+SCRIPT_VERSION="1.8.1"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -548,7 +548,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v11"
+PROGRESS_VERSION="v12"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -1062,7 +1062,7 @@ EOF
 NIRI_GH="https://github.com/niri-wm/niri/releases"
 
 # niri system build dependencies (Debian/Ubuntu names, per the official niri Packaging docs)
-NIRI_BUILD_DEPS=(build-essential cmake pkg-config curl tar \
+NIRI_BUILD_DEPS=(build-essential cmake pkg-config curl tar clang libclang-dev \
     libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev wayland-protocols \
     libinput-dev libdisplay-info-dev libudev-dev libseat-dev \
     libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
@@ -1071,7 +1071,7 @@ NIRI_BUILD_DEPS=(build-essential cmake pkg-config curl tar \
     libxcb-xfixes0-dev libxcb-present-dev libxcb-render-util0-dev libxcb-res0-dev \
     libxcb-shape0-dev libxcb-util-dev libxcb-xkb-dev libxcb-xinerama0-dev)
 # niri system build dependencies (RHEL/Fedora names; some need EPEL/CRB — fall back to the manual report when missing)
-NIRI_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config curl tar \
+NIRI_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config curl tar clang libclang-devel \
     libxkbcommon-devel libxkbcommon-x11-devel libwayland-devel wayland-protocols-devel \
     libinput-devel display-info-devel systemd-devel libseat-devel \
     mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel \
@@ -1290,6 +1290,25 @@ EOF
     if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
         MANUAL_ITEMS+=("niri — build dependencies install failed, build manually: $NIRI_GH")
         return 1
+    fi
+
+    # Hard-verify the critical build deps that bindgen (libspa-sys / pipewire) needs.
+    # If build-essential or clang is missing, the build produces an obscure "stdbool.h
+    # not found" error instead of a clear diagnostic. Re-try any missing one now.
+    # (Debian/Ubuntu only; RHEL's dnf install above handles the batch atomically.)
+    if [ "$DISTRO_FAMILY" = debian ]; then
+        local _crit _missing=0
+        for _crit in build-essential cmake pkg-config clang libclang-dev; do
+            if ! pkg_installed "$_crit"; then
+                warn "$(_t "Critical build dep missing, retrying: " "Critical build dep missing, retrying: ") $_crit"
+                pm_install "$_crit" 2>/dev/null || true
+                if ! pkg_installed "$_crit"; then
+                    MANUAL_ITEMS+=("niri — critical build dependency $_crit not installed; install manually then rerun: $NIRI_GH")
+                    _missing=1
+                fi
+            fi
+        done
+        if [ "$_missing" -eq 1 ]; then return 1; fi
     fi
 
     # Build in background so the rest of the install (packages/services/config) proceeds meanwhile
