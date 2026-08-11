@@ -318,6 +318,30 @@ HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config git wayland-devel wayland-p
     pango-devel mesa-libgbm-devel libdrm-devel libxkbcommon-devel libxcb-devel
     hyprutils-devel hyprlang-devel)
 
+# System components (from other desktop environments) to disable when restoring
+# on a multi-DE target machine.  Only masked / hidden, NEVER uninstalled — the user
+# can switch back to the other DE at any time.  Each item is existence-checked first
+# so it is safe on Arch (most entries won't exist) and RHEL/Debian alike.
+# type: autostart  — write ~/.config/autostart/<name> with Hidden=true as override
+#       userunit   — systemctl --user mask <name>
+#       systemunit — systemctl mask <name>
+DISABLE_SYS=(
+    # --- notification daemons (would compete with mako) ---
+    "userunit|evolution-alarm-notify.service|GNOME notifications"
+    "autostart|evolution-alarm-notify.desktop|GNOME notifications"
+    "userunit|xfce4-notifyd.service|XFCE notifications"
+    "autostart|xfce4-notifyd.desktop|XFCE notifications"
+    # --- GNOME settings daemon (media keys / power / sound / clipboard → handled by waybar / power-profiles-daemon) ---
+    "autostart|org.gnome.SettingsDaemon.MediaKeys.desktop|GNOME media keys"
+    "autostart|org.gnome.SettingsDaemon.Power.desktop|GNOME power"
+    "autostart|org.gnome.SettingsDaemon.Sound.desktop|GNOME sound"
+    "autostart|org.gnome.SettingsDaemon.Clipboard.desktop|GNOME clipboard"
+    "userunit|org.gnome.SettingsDaemon.MediaKeys.service|GNOME media keys"
+    # --- misc system services ---
+    "systemunit|gnome-remote-desktop.service|GNOME remote desktop"
+)
+
+
 # Summary report collectors
 INSTALLED_PKGS=() SKIPPED_PKGS=() FAILED_PKGS=() MANUAL_ITEMS=() ENABLED_SVCS=()
 DRY_PKGS=() DRY_SVCS=()  # items "that would be executed" in dry-run mode; kept separate to avoid inflated counts
@@ -524,7 +548,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v10"
+PROGRESS_VERSION="v11"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -2256,6 +2280,80 @@ IMEEOF
     stage_mark configs
 }
 
+# --- 4.7b disable system components from other desktop environments ---
+# No DE other than niri is needed on this machine; disable the conflicting components
+# (notifications, settings daemons, etc.) so the niri session runs cleanly.  Every action
+# is recorded in $BASE_DIR/.system_disabled and is reversible via `restore-system`.
+DISABLE_MANIFEST="$BASE_DIR/.system_disabled"
+stage_disable_system() {
+    if stage_done sysdisable; then return; fi
+    if [ "${EILNIRI_KEEP_SYS:-0}" = "1" ]; then
+        log "$(_t "EILNIRI_KEEP_SYS=1: skipping system component disable." "EILNIRI_KEEP_SYS=1: skipping system component disable.")"
+        stage_mark sysdisable
+        return
+    fi
+
+    section "$(_t "System Cleanup" "System Cleanup")" "$(_t "disabling other-DE components (mask / autostart Hidden)" "disabling other-DE components (mask / autostart Hidden)")"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$(_t "[DRY-RUN] Would disable system components of other desktop environments." "[DRY-RUN] Would disable system components of other desktop environments.")"
+        stage_mark sysdisable
+        return
+    fi
+
+    local line type name reason _rc _adir _afile _valid any_failed=0
+    for line in "${DISABLE_SYS[@]}"; do
+        IFS='|' read -r type name reason <<< "$line"
+        valid=0
+        case "$type" in
+            autostart)
+                if [ -f "/etc/xdg/autostart/$name" ]; then
+                    _adir="$HOME_DIR/.config/autostart"
+                    mkdir -p "$_adir"
+                    _afile="$_adir/$name"
+                    cat > "$_afile" <<ASEOF
+[Desktop Entry]
+Hidden=true
+ASEOF
+                    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_afile" 2>/dev/null || true
+                    log "$(_t "Disabled autostart: " "Disabled autostart: ")$name — $reason"
+                    valid=1
+                fi
+                ;;
+            userunit)
+                if as_user systemctl --user list-unit-files "$name" >/dev/null 2>&1; then
+                    _rc=0; as_user systemctl --user mask "$name" 2>/dev/null || _rc=$?
+                    if [ "$_rc" -eq 0 ]; then
+                        log "$(_t "Masked user unit: " "Masked user unit: ")$name — $reason"
+                        valid=1
+                    fi
+                fi
+                ;;
+            systemunit)
+                if systemctl list-unit-files "$name" >/dev/null 2>&1; then
+                    _rc=0; systemctl mask "$name" 2>/dev/null || _rc=$?
+                    if [ "$_rc" -eq 0 ]; then
+                        log "$(_t "Masked system unit: " "Masked system unit: ")$name — $reason"
+                        valid=1
+                    fi
+                fi
+                ;;
+        esac
+        if [ "$valid" -eq 1 ]; then
+            echo "$type|$name" >> "$DISABLE_MANIFEST"
+        else
+            any_failed=1
+        fi
+    done
+
+    if [ "$any_failed" -eq 0 ]; then
+        stage_mark sysdisable
+        success "$(_t "System components from other DEs disabled (mask + autostart overrides)." "System components from other DEs disabled (mask + autostart overrides).")"
+    else
+        warn "$(_t "Some system components could not be disabled; stage not marked complete — rerun retries." "Some system components could not be disabled; stage not marked complete — rerun retries.")"
+    fi
+}
+
 # --- 4.8 hardware adapt (auto-detect output/resolution) ---
 
 stage_hardware_adapt() {
@@ -2509,6 +2607,7 @@ do_restore() {
     stage_dm
     stage_backup
     stage_configs
+    stage_disable_system
     stage_wait_builds
     stage_hardware_adapt
     stage_verify
@@ -2866,6 +2965,48 @@ do_rollback() {
     success "Config restored from snapshot $snapshot. Previous config backed up as .bak-$ts"
 }
 
+# --- 4.12 restore-system: re-enable system components that were disabled during restore ---
+do_restore_system() {
+    init_logger
+    check_root
+    detect_distro
+    detect_target_user
+
+    section "$(_t "Restore System" "Restore System")" "$(_t "Re-enable disabled DE components" "Re-enable disabled DE components")"
+    local mf="$BASE_DIR/.system_disabled"
+    if [ ! -f "$mf" ] || [ ! -s "$mf" ]; then
+        log "$(_t "No disabled system components found (manifest missing or empty)." "No disabled system components found (manifest missing or empty).")"
+        return 0
+    fi
+
+    local count=0 line type name _rc
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        IFS='|' read -r type name <<< "$line"
+        case "$type" in
+            autostart)
+                local _af="$HOME_DIR/.config/autostart/$name"
+                if [ -f "$_af" ]; then
+                    rm -f "$_af" && log "$(_t "Re-enabled autostart: " "Re-enabled autostart: ")$name"
+                fi
+                ;;
+            userunit)
+                _rc=0; as_user systemctl --user unmask "$name" 2>/dev/null || _rc=$?
+                [ "$_rc" -eq 0 ] && log "$(_t "Unmasked user unit: " "Unmasked user unit: ")$name"
+                ;;
+            systemunit)
+                _rc=0; systemctl unmask "$name" 2>/dev/null || _rc=$?
+                [ "$_rc" -eq 0 ] && log "$(_t "Unmasked system unit: " "Unmasked system unit: ")$name"
+                ;;
+        esac
+        count=$((count + 1))
+    done < "$mf"
+    as_user systemctl --user daemon-reload 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    rm -f "$mf"
+    success "$(_t "$count system component(s) re-enabled; manifest cleared." "$count system component(s) re-enabled; manifest cleared.")"
+}
+
 # ==============================================================================
 # 5. main
 # ==============================================================================
@@ -2879,10 +3020,16 @@ Usage:
   ./install.sh restore [--dry-run]      restore desktop on new system (root)
   ./install.sh status                   show background build progress (run from another terminal)
   ./install.sh rollback                 rollback config from backup (root)
+  ./install.sh restore-system           re-enable system components disabled by restore (root)
   ./install.sh --help                   show this help
 
 Options:
   --dry-run      print plan only, no actual install/enable/deploy
+
+Environment:
+  EILNIRI_KEEP_DM=1    keep existing display manager unchanged
+  EILNIRI_KEEP_SYS=1   skip disabling other-DE components during restore
+  EILNIRI_GH_PROXY     space-separated GitHub proxy URLs (default: ghfast.top mirror.ghproxy.com)
 
 Workflow:
   1. On your reference machine:  ./install.sh collect-config
@@ -2891,6 +3038,7 @@ Workflow:
      - niri/awww compile in background:  ./install.sh status   (live progress)
      - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
   4. Rollback config:            sudo ./install.sh rollback
+  5. Re-enable other-DE comps:   sudo ./install.sh restore-system
 EOF
 }
 
@@ -2898,7 +3046,7 @@ main() {
     local arg
     for arg in "$@"; do
         case "$arg" in
-            collect-config|restore|rollback|status) MODE="$arg" ;;
+            collect-config|restore|rollback|status|restore-system) MODE="$arg" ;;
             --dry-run)      DRY_RUN=1 ;;
             -h|--help)      usage; exit 0 ;;
             *) error "$(_t "Unknown argument: " "Unknown argument: ") $arg"; usage; exit 1 ;;
@@ -2906,11 +3054,12 @@ main() {
     done
 
     case "$MODE" in
-        collect-config) collect_config ;;
-        restore)  do_restore ;;
-        status)   do_status ;;
-        rollback) do_rollback ;;
-        *)        usage; exit 1 ;;
+        collect-config)  collect_config ;;
+        restore)         do_restore ;;
+        status)          do_status ;;
+        rollback)        do_rollback ;;
+        restore-system)  do_restore_system ;;
+        *)               usage; exit 1 ;;
     esac
 }
 
