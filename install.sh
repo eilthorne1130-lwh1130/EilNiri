@@ -322,23 +322,60 @@ HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config git wayland-devel wayland-p
 # on a multi-DE target machine.  Only masked / hidden, NEVER uninstalled — the user
 # can switch back to the other DE at any time.  Each item is existence-checked first
 # so it is safe on Arch (most entries won't exist) and RHEL/Debian alike.
-# type: autostart  — write ~/.config/autostart/<name> with Hidden=true as override
-#       userunit   — systemctl --user mask <name>
-#       systemunit — systemctl mask <name>
+# type: autostart  — write ~/.config/autostart/<name> with Hidden=true as override + kill process
+#       userunit   — systemctl --user mask <name> + systemctl --user stop <name>
+#       systemunit — systemctl mask <name> + systemctl stop <name>
 DISABLE_SYS=(
-    # --- notification daemons (would compete with mako) ---
+    # --- notification daemons (replaced by mako) ---
     "userunit|evolution-alarm-notify.service|GNOME notifications"
     "autostart|evolution-alarm-notify.desktop|GNOME notifications"
     "userunit|xfce4-notifyd.service|XFCE notifications"
     "autostart|xfce4-notifyd.desktop|XFCE notifications"
-    # --- GNOME settings daemon (media keys / power / sound / clipboard → handled by waybar / power-profiles-daemon) ---
-    "autostart|org.gnome.SettingsDaemon.MediaKeys.desktop|GNOME media keys"
-    "autostart|org.gnome.SettingsDaemon.Power.desktop|GNOME power"
-    "autostart|org.gnome.SettingsDaemon.Sound.desktop|GNOME sound"
-    "autostart|org.gnome.SettingsDaemon.Clipboard.desktop|GNOME clipboard"
-    "userunit|org.gnome.SettingsDaemon.MediaKeys.service|GNOME media keys"
-    # --- misc system services ---
+    
+    # --- GNOME settings daemon (replaced by waybar + power-profiles-daemon) ---
+    "autostart|org.gnome.SettingsDaemon.MediaKeys.desktop|GNOME media keys daemon"
+    "autostart|org.gnome.SettingsDaemon.Power.desktop|GNOME power daemon (replaced by hypridle)"
+    "autostart|org.gnome.SettingsDaemon.Sound.desktop|GNOME sound daemon"
+    "autostart|org.gnome.SettingsDaemon.Clipboard.desktop|GNOME clipboard daemon"
+    "userunit|org.gnome.SettingsDaemon.MediaKeys.service|GNOME media keys service"
+    "userunit|org.gnome.SettingsDaemon.Power.service|GNOME power service (replaced by hypridle)"
+    "userunit|org.gnome.SettingsDaemon.Sound.service|GNOME sound service"
+    "userunit|org.gnome.SettingsDaemon.Clipboard.service|GNOME clipboard service"
+    
+    # --- GNOME screensaver / lock screen (replaced by hyprlock + hypridle) ---
+    "userunit|org.gnome.ScreenSaver.service|GNOME screensaver (replaced by hyprlock)"
+    "autostart|org.gnome.ScreenSaver.desktop|GNOME screensaver (replaced by hyprlock)"
+    "systemunit|gnome-screensaver.service|GNOME screensaver system service (replaced by hyprlock)"
+    
+    # --- GDM / display manager session helpers (niri handles display) ---
+    "systemunit|gdm-launch-environment.service|GDM launch environment"
+    "systemunit|gdm-x11-session.service|GDM X11 session"
+    "systemunit|gdm-wayland-session.service|GDM Wayland session"
+    
+    # --- misc GNOME system services ---
     "systemunit|gnome-remote-desktop.service|GNOME remote desktop"
+    
+    # --- PulseAudio (Ubuntu 24.04+ uses PipeWire by default, but legacy units may exist) ---
+    "userunit|pulseaudio.service|PulseAudio service (replaced by PipeWire)"
+    "userunit|pulseaudio.socket|PulseAudio socket (replaced by PipeWire)"
+    "systemunit|pulseaudio.service|PulseAudio system service (replaced by PipeWire)"
+    
+    # --- XFCE power management (replaced by power-profiles-daemon) ---
+    "userunit|xfce4-power-manager.service|XFCE power manager"
+    "autostart|xfce4-power-manager.desktop|XFCE power manager (replaced by power-profiles-daemon)"
+    
+    # --- KDE power management (replaced by power-profiles-daemon) ---
+    "userunit|org.kde.powerdevil.service|KDE power manager"
+    "autostart|org.kde.powerdevil.desktop|KDE power manager (replaced by power-profiles-daemon)"
+    
+    # --- XFCE screen saver (replaced by hyprlock + hypridle) ---
+    "userunit|xfce4-screensaver.service|XFCE screensaver (replaced by hyprlock)"
+    "autostart|xfce4-screensaver.desktop|XFCE screensaver (replaced by hyprlock)"
+    "systemunit|xfce4-screensaver.service|XFCE screensaver system (replaced by hyprlock)"
+    
+    # --- KDE screen locker (replaced by hyprlock + hypridle) ---
+    "systemunit|kscreenlocker.service|KDE screen locker (replaced by hyprlock)"
+    "autostart|kscreenlocker.desktop|KDE screen locker (replaced by hyprlock)"
 )
 
 
@@ -1070,6 +1107,13 @@ NIRI_BUILD_DEPS=(build-essential cmake pkg-config curl tar clang libclang-dev \
     libxcb-composite0-dev libxcb-ewmh-dev libxcb-icccm4-dev libxcb-randr0-dev \
     libxcb-xfixes0-dev libxcb-present-dev libxcb-render-util0-dev libxcb-res0-dev \
     libxcb-shape0-dev libxcb-util-dev libxcb-xkb-dev libxcb-xinerama0-dev)
+# Debian/Ubuntu version-specific package name mappings for niri build deps
+# (different Debian/Ubuntu versions use different package names for the same library)
+declare -A DEB_NIRI_BDEPS_MAP=(
+    [libdisplay-info-dev]="libdisplay-info0-dev"  # Debian 12, Ubuntu <24.04
+    [libhyprutils-dev]=""                         # optional, only in newer versions
+    [libhyprlang-dev]=""                          # optional, only in newer versions
+)
 # niri system build dependencies (RHEL/Fedora names; some need EPEL/CRB — fall back to the manual report when missing)
 NIRI_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config curl tar clang libclang-devel \
     libxkbcommon-devel libxkbcommon-x11-devel libwayland-devel wayland-protocols-devel \
@@ -1187,20 +1231,23 @@ install_niri_binary() {
     # when no cargo registry (crates.io / rsproxy) is reachable.
     log "$(_t "Building niri from source (10-20 min)..." "Building niri from source (10-20 min)...")"
     url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
-    if download_gh "$url" "$tmp"; then
-        :
-    else
-        local dlrc=$?
-        # flaky networks: one more full pass after a pause before giving up
-        log "$(_t "Download failed, retrying once after 10s..." "Download failed, retrying once after 10s...")"
-        sleep 10
+    
+    local _dl_attempts=3 _dl_delay=15 _dlrc=0
+    for (( _attempt=1; _attempt<=$_dl_attempts; _attempt++ )); do
         if download_gh "$url" "$tmp"; then
-            :
-        else
-            dlrc=$?
-            MANUAL_ITEMS+=("niri — source tarball download failed (curl exit code $dlrc via GitHub); install manually: $NIRI_GH")
-            return 1
+            _dlrc=0
+            break
         fi
+        _dlrc=$?
+        if [ "$_attempt" -lt "$_dl_attempts" ]; then
+            log "$(_t "Download attempt $_attempt/$_dl_attempts failed (code $?), retrying in ${_dl_delay}s..." "Download attempt $_attempt/$_dl_attempts failed (code $?), retrying in ${_dl_delay}s...")"
+            sleep "$_dl_delay"
+        fi
+    done
+    
+    if [ "$_dlrc" -ne 0 ]; then
+        MANUAL_ITEMS+=("niri — source tarball download failed after $_dl_attempts attempts (curl exit code $_dlrc); check network and try: $NIRI_GH")
+        return 1
     fi
     if ! tar xzf "$tmp" -C "$work" 2>/dev/null; then
         MANUAL_ITEMS+=("niri — source archive extraction failed, install manually: $url")
@@ -1238,23 +1285,26 @@ install_niri_binary() {
     # (dependency crates only) and wire it up as the cargo source so the build needs no network.
     if [ "$offline" -eq 1 ]; then
         log "$(_t "No cargo registry reachable, downloading vendored dependencies for an offline build..." "No cargo registry reachable, downloading vendored dependencies for an offline build...")"
-        local vtmp
+        local vtmp _vdl_attempts=3 _vdl_delay=15 _vdlrc=0
         vtmp=$(mktemp)
         register_temp_path "$vtmp"
         url="$NIRI_GH/download/v${ver}/niri-${ver}-vendored-dependencies.tar.xz"
-        if download_gh "$url" "$vtmp"; then
-            :
-        else
-            dlrc=$?
-            log "$(_t "Vendored deps download failed, retrying once after 10s..." "Vendored deps download failed, retrying once after 10s...")"
-            sleep 10
+        
+        for (( _vattempt=1; _vattempt<=$_vdl_attempts; _vattempt++ )); do
             if download_gh "$url" "$vtmp"; then
-                :
-            else
-                dlrc=$?
-                MANUAL_ITEMS+=("niri — vendored dependencies download failed (curl exit code $dlrc); install manually: $NIRI_GH")
-                return 1
+                _vdlrc=0
+                break
             fi
+            _vdlrc=$?
+            if [ "$_vattempt" -lt "$_vdl_attempts" ]; then
+                log "$(_t "Vendored deps download attempt $_vattempt/$_vdl_attempts failed (code $_vdlrc), retrying in ${_vdl_delay}s..." "Vendored deps download attempt $_vattempt/$_vdl_attempts failed (code $_vdlrc), retrying in ${_vdl_delay}s...")"
+                sleep "$_vdl_delay"
+            fi
+        done
+        
+        if [ "$_vdlrc" -ne 0 ]; then
+            MANUAL_ITEMS+=("niri — vendored dependencies download failed after $_vdl_attempts attempts (curl exit code $_vdlrc); try online build or install manually: $NIRI_GH")
+            return 1
         fi
         mkdir -p "$srcdir/vendor"
         if ! tar xJf "$vtmp" -C "$srcdir/vendor" 2>/dev/null || [ ! -d "$srcdir/vendor/vendor" ]; then
@@ -1278,43 +1328,56 @@ EOF
         MANUAL_ITEMS+=("niri — Rust toolchain install failed, build manually: $NIRI_GH")
         return 1
     fi
+    
     local bdeps_rc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
-        apt_install_tolerant "${NIRI_BUILD_DEPS[@]}" || bdeps_rc=$?
+        # --- Debian: apply version-specific package name mapping ---
+        local _debian_deps=() _pkg_name
+        for _pkg_name in "${NIRI_BUILD_DEPS[@]}"; do
+            # If package has a mapped name (version-specific), try mapped first; fallback to original
+            if [ -n "${DEB_NIRI_BDEPS_MAP[$_pkg_name]:-}" ] && [ -n "${DEB_NIRI_BDEPS_MAP[$_pkg_name]}" ]; then
+                _debian_deps+=("${DEB_NIRI_BDEPS_MAP[$_pkg_name]}")
+            else
+                _debian_deps+=("$_pkg_name")
+            fi
+        done
+        
+        log "$(_t "Installing niri build dependencies (Debian/Ubuntu)..." "Installing niri build dependencies (Debian/Ubuntu)...")"
+        apt_install_tolerant "${_debian_deps[@]}" || bdeps_rc=$?
+        
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some niri build deps unavailable (continuing; cargo will report the real error if a header is still missing):" "Some niri build deps unavailable (continuing; cargo will report the real error if a header is still missing):") ${BDEPS_MISSING[*]}"
+            warn "$(_t "Some niri build deps unavailable:" "Some niri build deps unavailable:") ${BDEPS_MISSING[*]}"
         fi
+        
+        # --- Debian: hard verification of critical build deps ---
+        # These are absolutely required; cargo will fail with obscure errors if missing
+        local _crit_deps=(build-essential cmake pkg-config clang libclang-dev libwayland-dev wayland-protocols)
+        local _crit _missing_crit=0
+        for _crit in "${_crit_deps[@]}"; do
+            if ! pkg_installed "$_crit"; then
+                warn "$(_t "Critical build dep missing, retrying: " "Critical build dep missing, retrying: ") $_crit"
+                pm_install "$_crit" 2>/dev/null || true
+                if ! pkg_installed "$_crit"; then
+                    error "$(_t "Critical build dependency NOT installed: " "Critical build dependency NOT installed: ") $_crit"
+                    MANUAL_ITEMS+=("niri — critical build dependency '$_crit' unavailable in your Debian/Ubuntu version; install manually or use a newer distribution version, then rerun: $NIRI_GH")
+                    _missing_crit=1
+                fi
+            fi
+        done
+        if [ "$_missing_crit" -eq 1 ]; then return 1; fi
     else
         exe dnf install -y "${NIRI_BUILD_DEPS_RHEL[@]}" || bdeps_rc=$?
     fi
+    
     if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
         MANUAL_ITEMS+=("niri — build dependencies install failed, build manually: $NIRI_GH")
         return 1
     fi
 
-    # Hard-verify the critical build deps that bindgen (libspa-sys / pipewire) needs.
-    # If build-essential or clang is missing, the build produces an obscure "stdbool.h
-    # not found" error instead of a clear diagnostic. Re-try any missing one now.
-    # (Debian/Ubuntu only; RHEL's dnf install above handles the batch atomically.)
-    if [ "$DISTRO_FAMILY" = debian ]; then
-        local _crit _missing=0
-        for _crit in build-essential cmake pkg-config clang libclang-dev; do
-            if ! pkg_installed "$_crit"; then
-                warn "$(_t "Critical build dep missing, retrying: " "Critical build dep missing, retrying: ") $_crit"
-                pm_install "$_crit" 2>/dev/null || true
-                if ! pkg_installed "$_crit"; then
-                    MANUAL_ITEMS+=("niri — critical build dependency $_crit not installed; install manually then rerun: $NIRI_GH")
-                    _missing=1
-                fi
-            fi
-        done
-        if [ "$_missing" -eq 1 ]; then return 1; fi
-    fi
-
     # Build in background so the rest of the install (packages/services/config) proceeds meanwhile
     log "$(_t "Building niri in background; continuing install..." "Building niri in background; continuing install...")"
     bg_build_start niri "$srcdir" "$LOG_DIR/niri-build.log" \
-        bash -c "cd '$srcdir' && cargo build --release -j $(cargo_jobs)"
+        bash -c "cd '$srcdir' && RUST_LOG=info cargo build --release -vv -j $(cargo_jobs) 2>&1"
     return "$BG_PENDING_RC"
 }
 
@@ -1391,8 +1454,23 @@ install_awww() {
     work=$(mktemp -d)
     register_temp_path "$work"
     log "$(_t "Cloning awww source (codeberg)..." "Cloning awww source (codeberg)...")"
-    if ! exe git clone --depth 1 "$AWWW_REPO" "$work/awww" 2>/dev/null; then
-        MANUAL_ITEMS+=("awww — git clone failed (network or Codeberg blocked), build manually: $AWWW_REPO")
+    
+    local _clone_attempts=3 _clone_delay=10 _clonerc=0
+    for (( _cattempt=1; _cattempt<=$_clone_attempts; _cattempt++ )); do
+        if exe git clone --depth 1 "$AWWW_REPO" "$work/awww" 2>/dev/null; then
+            _clonerc=0
+            break
+        fi
+        _clonerc=$?
+        if [ "$_cattempt" -lt "$_clone_attempts" ]; then
+            log "$(_t "Clone attempt $_cattempt/$_clone_attempts failed, retrying in ${_clone_delay}s..." "Clone attempt $_cattempt/$_clone_attempts failed, retrying in ${_clone_delay}s...")"
+            sleep "$_clone_delay"
+            rm -rf "$work/awww"
+        fi
+    done
+    
+    if [ "$_clonerc" -ne 0 ]; then
+        MANUAL_ITEMS+=("awww — git clone failed after $_clone_attempts attempts (network or Codeberg blocked), build manually: $AWWW_REPO")
         return 1
     fi
 
@@ -1471,7 +1549,25 @@ install_satty() {
     register_temp_path "$work"
     url="$SATTY_GH/latest/download/satty-${arch}-unknown-linux-gnu.tar.gz"
     log "$(_t "Downloading satty official prebuilt binary..." "Downloading satty official prebuilt binary...")"
-    if download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; then
+    
+    local _satty_attempts=3 _satty_delay=10 _sattyrc=0
+    for (( _sattempt=1; _sattempt<=$_satty_attempts; _sattempt++ )); do
+        if download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; then
+            _sattyrc=0
+            break
+        fi
+        _sattyrc=$?
+        if [ "$_sattempt" -lt "$_satty_attempts" ]; then
+            log "$(_t "Satty download attempt $_sattempt/$_satty_attempts failed, retrying in ${_satty_delay}s..." "Satty download attempt $_sattempt/$_satty_attempts failed, retrying in ${_satty_delay}s...")"
+            sleep "$_satty_delay"
+            rm -f "$tmp"
+            tmp=$(mktemp)
+            rm -rf "$work"
+            work=$(mktemp -d)
+        fi
+    done
+    
+    if [ "$_sattyrc" -eq 0 ]; then
         satty_bin=""
         if [ -d "$work/bin" ]; then
             for b in "$work"/bin/*; do
@@ -1558,8 +1654,24 @@ install_rime_ice() {
     register_temp_path "$zipfile"
     register_temp_path "$unzipdir"
     log "$(_t "Downloading rime-ice release zip..." "Downloading rime-ice release zip...")"
-    if ! download_gh "$RIME_ICE_ZIP_URL" "$zipfile"; then
-        MANUAL_ITEMS+=("rime-ice — download failed, deploy manually: $RIME_ICE_REPO")
+    
+    local _rime_attempts=3 _rime_delay=10 _rimerc=0
+    for (( _rattempt=1; _rattempt<=$_rime_attempts; _rattempt++ )); do
+        if download_gh "$RIME_ICE_ZIP_URL" "$zipfile"; then
+            _rimerc=0
+            break
+        fi
+        _rimerc=$?
+        if [ "$_rattempt" -lt "$_rime_attempts" ]; then
+            log "$(_t "Rime-ice download attempt $_rattempt/$_rime_attempts failed, retrying in ${_rime_delay}s..." "Rime-ice download attempt $_rattempt/$_rime_attempts failed, retrying in ${_rime_delay}s...")"
+            sleep "$_rime_delay"
+            rm -f "$zipfile"
+            zipfile=$(mktemp)
+        fi
+    done
+    
+    if [ "$_rimerc" -ne 0 ]; then
+        MANUAL_ITEMS+=("rime-ice — download failed after $_rime_attempts attempts, deploy manually: $RIME_ICE_REPO")
         return 1
     fi
     if ! exe unzip -q "$zipfile" -d "$unzipdir"; then
@@ -1672,8 +1784,23 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     work=$(mktemp -d)
     register_temp_path "$work"
     log "$(_t "Cloning " "Cloning ") $pkg ($repo)..."
-    if ! exe git clone --depth 1 "$repo" "$work/$pkg" 2>/dev/null; then
-        MANUAL_ITEMS+=("$pkg — git clone failed, build manually: $repo")
+    
+    local _hypr_attempts=3 _hypr_delay=10 _hyprrc=0
+    for (( _hattempt=1; _hattempt<=$_hypr_attempts; _hattempt++ )); do
+        if exe git clone --depth 1 "$repo" "$work/$pkg" 2>/dev/null; then
+            _hyprrc=0
+            break
+        fi
+        _hyprrc=$?
+        if [ "$_hattempt" -lt "$_hypr_attempts" ]; then
+            log "$(_t "Clone attempt $_hattempt/$_hypr_attempts failed, retrying in ${_hypr_delay}s..." "Clone attempt $_hattempt/$_hypr_attempts failed, retrying in ${_hypr_delay}s...")"
+            sleep "$_hypr_delay"
+            rm -rf "$work/$pkg"
+        fi
+    done
+    
+    if [ "$_hyprrc" -ne 0 ]; then
+        MANUAL_ITEMS+=("$pkg — git clone failed after $_hypr_attempts attempts, build manually: $repo")
         return 1
     fi
 
@@ -2312,7 +2439,7 @@ stage_disable_system() {
         return
     fi
 
-    section "$(_t "System Cleanup" "System Cleanup")" "$(_t "disabling other-DE components (mask / autostart Hidden)" "disabling other-DE components (mask / autostart Hidden)")"
+    section "$(_t "System Cleanup" "System Cleanup")" "$(_t "disabling other-DE components (mask/stop/hidden)" "disabling other-DE components (mask/stop/hidden)")"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "$(_t "[DRY-RUN] Would disable system components of other desktop environments." "[DRY-RUN] Would disable system components of other desktop environments.")"
@@ -2320,56 +2447,139 @@ stage_disable_system() {
         return
     fi
 
-    local line type name reason _rc _adir _afile _valid any_failed=0
+    > "$DISABLE_MANIFEST"  # Clear manifest before rebuild
+    
+    local line type name reason _rc _adir _afile valid
+    local disabled_count=0 skipped_count=0 failed_items=()
+    
     for line in "${DISABLE_SYS[@]}"; do
         IFS='|' read -r type name reason <<< "$line"
         valid=0
+        
         case "$type" in
             autostart)
+                # Check if autostart file exists in system
                 if [ -f "/etc/xdg/autostart/$name" ]; then
                     _adir="$HOME_DIR/.config/autostart"
                     mkdir -p "$_adir"
                     _afile="$_adir/$name"
+                    
+                    # Write Hidden=true override
                     cat > "$_afile" <<ASEOF
 [Desktop Entry]
 Hidden=true
 ASEOF
                     chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_afile" 2>/dev/null || true
-                    log "$(_t "Disabled autostart: " "Disabled autostart: ")$name — $reason"
-                    valid=1
+                    
+                    # Verify file was created and contains Hidden=true
+                    if [ -f "$_afile" ] && grep -q "Hidden=true" "$_afile"; then
+                        log "$(_t "  [✓ DISABLED] autostart: " "  [✓ DISABLED] autostart: ")$name"
+                        echo "   $(_t "   └─ Reason: " "   └─ Reason: ")$reason"
+                        valid=1
+                        disabled_count=$((disabled_count + 1))
+                        
+                        # Try to kill running process (extract binary name from .desktop name)
+                        local _proc_base="${name%.desktop}"
+                        if pkill -u "$TARGET_USER" -f "$_proc_base" 2>/dev/null; then
+                            log "$(_t "   └─ Killed running process: " "   └─ Killed running process: ")$_proc_base"
+                        fi
+                    else
+                        failed_items+=("autostart|$name")
+                    fi
+                else
+                    skipped_count=$((skipped_count + 1))
                 fi
                 ;;
+                
             userunit)
-                if as_user systemctl --user list-unit-files "$name" >/dev/null 2>&1; then
-                    _rc=0; as_user systemctl --user mask "$name" 2>/dev/null || _rc=$?
+                # Check if unit exists for this user
+                local _unit_exists=0
+                if as_user systemctl --user list-unit-files 2>/dev/null | grep -q "^$name"; then
+                    _unit_exists=1
+                fi
+                
+                if [ "$_unit_exists" -eq 1 ]; then
+                    # Stop the unit first (if running)
+                    as_user systemctl --user stop "$name" 2>/dev/null || true
+                    
+                    # Mask the unit
+                    _rc=0
+                    as_user systemctl --user mask "$name" 2>/dev/null || _rc=$?
+                    
                     if [ "$_rc" -eq 0 ]; then
-                        log "$(_t "Masked user unit: " "Masked user unit: ")$name — $reason"
-                        valid=1
+                        # Verify mask was successful
+                        if as_user systemctl --user is-enabled "$name" 2>/dev/null | grep -q "masked"; then
+                            log "$(_t "  [✓ DISABLED] user unit: " "  [✓ DISABLED] user unit: ")$name"
+                            echo "   $(_t "   └─ Reason: " "   └─ Reason: ")$reason"
+                            valid=1
+                            disabled_count=$((disabled_count + 1))
+                        else
+                            failed_items+=("userunit|$name")
+                        fi
+                    else
+                        failed_items+=("userunit|$name")
                     fi
+                else
+                    skipped_count=$((skipped_count + 1))
                 fi
                 ;;
+                
             systemunit)
-                if systemctl list-unit-files "$name" >/dev/null 2>&1; then
-                    _rc=0; systemctl mask "$name" 2>/dev/null || _rc=$?
+                # Check if unit exists on system
+                local _unit_exists=0
+                if systemctl list-unit-files 2>/dev/null | grep -q "^$name"; then
+                    _unit_exists=1
+                fi
+                
+                if [ "$_unit_exists" -eq 1 ]; then
+                    # Stop the unit first (if running)
+                    systemctl stop "$name" 2>/dev/null || true
+                    
+                    # Mask the unit
+                    _rc=0
+                    systemctl mask "$name" 2>/dev/null || _rc=$?
+                    
                     if [ "$_rc" -eq 0 ]; then
-                        log "$(_t "Masked system unit: " "Masked system unit: ")$name — $reason"
-                        valid=1
+                        # Verify mask was successful
+                        if systemctl is-enabled "$name" 2>/dev/null | grep -q "masked"; then
+                            log "$(_t "  [✓ DISABLED] system unit: " "  [✓ DISABLED] system unit: ")$name"
+                            echo "   $(_t "   └─ Reason: " "   └─ Reason: ")$reason"
+                            valid=1
+                            disabled_count=$((disabled_count + 1))
+                        else
+                            failed_items+=("systemunit|$name")
+                        fi
+                    else
+                        failed_items+=("systemunit|$name")
                     fi
+                else
+                    skipped_count=$((skipped_count + 1))
                 fi
                 ;;
         esac
+        
+        # Record successful disables in manifest (for future restore-system)
         if [ "$valid" -eq 1 ]; then
             echo "$type|$name" >> "$DISABLE_MANIFEST"
-        else
-            any_failed=1
         fi
     done
-
-    if [ "$any_failed" -eq 0 ]; then
-        stage_mark sysdisable
-        success "$(_t "System components from other DEs disabled (mask + autostart overrides)." "System components from other DEs disabled (mask + autostart overrides).")"
+    
+    # Summary
+    echo ""
+    info_kv "$(_t "System Components Disabled" "System Components Disabled")" "$disabled_count successfully disabled"
+    if [ "$skipped_count" -gt 0 ]; then
+        info_kv "$(_t "Not Found (Skipped)" "Not Found (Skipped)")" "$skipped_count components (not installed on this system)"
+    fi
+    
+    if [ ${#failed_items[@]} -gt 0 ]; then
+        warn "$(_t "Failed to disable ${#failed_items[@]} components:" "Failed to disable ${#failed_items[@]} components:")"
+        for item in "${failed_items[@]}"; do
+            echo -e "       ${H_YELLOW}-${NC} $item"
+        done
+        warn "$(_t "Stage not marked complete — rerun retries." "Stage not marked complete — rerun retries.")"
     else
-        warn "$(_t "Some system components could not be disabled; stage not marked complete — rerun retries." "Some system components could not be disabled; stage not marked complete — rerun retries.")"
+        stage_mark sysdisable
+        success "$(_t "All replaceable system components disabled successfully." "All replaceable system components disabled successfully.")"
     fi
 }
 
