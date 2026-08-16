@@ -183,4 +183,9 @@ EilNiri/
 - 快照回滚设计：[ech678/NyxNiri](https://github.com/ech678/NyxNiri)
 - 跨发行版思路：[nickjj/dotfriedrice](https://github.com/nickjj/dotfriedrice)
 
-在这里向他/她们表示感谢
+## 贡献者
+
+- **eilthorne** - 项目创建与维护
+- **OpenCode** - Debian 12+ 编译修复、系统组件禁用完善、网络弹性改进
+
+在这里向所有贡献者表示感谢
