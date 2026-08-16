@@ -1103,6 +1103,7 @@ NIRI_BUILD_DEPS=(build-essential cmake pkg-config curl tar clang libclang-dev \
     libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev wayland-protocols \
     libinput-dev libdisplay-info-dev libudev-dev libseat-dev \
     libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
+    libpango1.0-dev \
     libpipewire-0.3-dev libdbus-1-dev \
     libxcb-composite0-dev libxcb-ewmh-dev libxcb-icccm4-dev libxcb-randr0-dev \
     libxcb-xfixes0-dev libxcb-present-dev libxcb-render-util0-dev libxcb-res0-dev \
@@ -1351,7 +1352,8 @@ EOF
         
         # --- Debian: hard verification of critical build deps ---
         # These are absolutely required; cargo will fail with obscure errors if missing
-        local _crit_deps=(build-essential cmake pkg-config clang libclang-dev libwayland-dev wayland-protocols)
+        local _crit_deps=(build-essential cmake pkg-config clang libclang-dev \
+            libwayland-dev wayland-protocols libpango1.0-dev)
         local _crit _missing_crit=0
         for _crit in "${_crit_deps[@]}"; do
             if ! pkg_installed "$_crit"; then
