@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.8.1"
+SCRIPT_VERSION="1.8.2"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -214,7 +214,11 @@ declare -A GROUP_EN=(
 )
 
 declare -A GROUP_PKGS=(
-    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh zsh-autosuggestions zsh-syntax-highlighting"
+    # NOTE: zsh-autosuggestions / zsh-syntax-highlighting are NOT listed here —
+    # distro packages install them in /usr/share or /etc/zsh/zshrc.d, which oh-my-zsh's
+    # plugins=() cannot use. install_zsh_extras clones them into ~/.oh-my-zsh/custom/plugins/
+    # (works identically on Arch / RHEL / Debian families).
+    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh"
     [lock]="hyprlock hypridle"
     [wallpaper]="awww waypaper"
     [clip]="copyq satty grim slurp"
@@ -585,7 +589,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v12"
+PROGRESS_VERSION="v13"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -1110,8 +1114,15 @@ NIRI_BUILD_DEPS=(build-essential cmake pkg-config curl tar clang libclang-dev \
     libxcb-shape0-dev libxcb-util-dev libxcb-xkb-dev libxcb-xinerama0-dev)
 # Debian/Ubuntu version-specific package name mappings for niri build deps
 # (different Debian/Ubuntu versions use different package names for the same library)
+#
+# NOTE: mappings are only a *first try* — install_niri_binary re-verifies each
+# mapped name with apt-cache and falls back to the original name when the mapped
+# one does not exist.  Do NOT hardcode guessed names here (the old
+# libdisplay-info-dev -> libdisplay-info0-dev entry was wrong on Debian 12:
+# display-info 0.1.x ships libdisplay-info-dev / libdisplay-info1, so the mapped
+# package never existed and the build died with "libdisplay-info.pc not found"
+# after 10-20 min of compiling).
 declare -A DEB_NIRI_BDEPS_MAP=(
-    [libdisplay-info-dev]="libdisplay-info0-dev"  # Debian 12, Ubuntu <24.04
     [libhyprutils-dev]=""                         # optional, only in newer versions
     [libhyprlang-dev]=""                          # optional, only in newer versions
 )
@@ -1138,6 +1149,27 @@ ensure_rust() {
     fi
     export PATH="$HOME/.cargo/bin:$PATH"
     exe rustup default stable 2>/dev/null || true
+    if ! command -v cargo >/dev/null 2>&1; then
+        error "$(_t "cargo not available after rustup setup — check network to static.rust-lang.org" "cargo not available after rustup setup — check network to static.rust-lang.org")"
+        return 1
+    fi
+    # Hard guard: never build niri with a distro cargo.  Debian 12 / Ubuntu 22.04
+    # ship rustc 1.63/1.75 via apt; if the rustup shim or its default toolchain is
+    # missing, `cargo` silently resolves to /usr/bin/cargo and the build dies with
+    # obscure "edition 2024" errors.  Verify a recent version and retry the update
+    # once before failing loudly.
+    local _cver
+    _cver=$(cargo --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$_cver" ] && awk -v v="$_cver" 'BEGIN{exit !(v < 1.85)}'; then
+        warn "$(_t "cargo $_cver too old for niri (needs >= 1.85); retrying rustup toolchain update..." "cargo $_cver too old for niri (needs >= 1.85); retrying rustup toolchain update...")"
+        exe rustup update stable 2>/dev/null || true
+        exe rustup default stable 2>/dev/null || true
+        _cver=$(cargo --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    fi
+    if [ -n "$_cver" ] && awk -v v="$_cver" 'BEGIN{exit !(v < 1.85)}'; then
+        error "$(_t "Rust toolchain still too old (cargo $_cver, need >= 1.85) — install rustup manually and rerun" "Rust toolchain still too old (cargo $_cver, need >= 1.85) — install rustup manually and rerun")"
+        return 1
+    fi
     command -v cargo >/dev/null
 }
 
@@ -1314,12 +1346,16 @@ install_niri_binary() {
         fi
         # point cargo at the vendored crates so the build is fully offline
         mkdir -p "$srcdir/.cargo"
-        cat > "$srcdir/.cargo/config.toml" <<'EOF'
+        # IMPORTANT: cargo resolves relative paths in config.toml against the
+        # *config file's* directory, not the cwd — `directory = "vendor/vendor"`
+        # here would look in $srcdir/.cargo/vendor/vendor and fail with
+        # "failed to load source".  Always emit an absolute path.
+        cat > "$srcdir/.cargo/config.toml" <<EOF
 [source.crates-io]
 replace-with = "vendored-sources"
 
 [source.vendored-sources]
-directory = "vendor/vendor"
+directory = "$srcdir/vendor/vendor"
 EOF
         log "$(_t "Vendored dependencies ready — building fully offline." "Vendored dependencies ready — building fully offline.")"
     fi
@@ -1333,11 +1369,15 @@ EOF
     local bdeps_rc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
         # --- Debian: apply version-specific package name mapping ---
-        local _debian_deps=() _pkg_name
+        # Each mapped name is verified at runtime with apt-cache: if the mapped
+        # package does not exist in this release, the ORIGINAL name is used instead.
+        # (A wrong hardcoded mapping used to silently drop libdisplay-info-dev and
+        # make the build die with "libdisplay-info.pc not found" after 10-20 min.)
+        local _debian_deps=() _pkg_name _mapped
         for _pkg_name in "${NIRI_BUILD_DEPS[@]}"; do
-            # If package has a mapped name (version-specific), try mapped first; fallback to original
-            if [ -n "${DEB_NIRI_BDEPS_MAP[$_pkg_name]:-}" ] && [ -n "${DEB_NIRI_BDEPS_MAP[$_pkg_name]}" ]; then
-                _debian_deps+=("${DEB_NIRI_BDEPS_MAP[$_pkg_name]}")
+            _mapped="${DEB_NIRI_BDEPS_MAP[$_pkg_name]:-}"
+            if [ -n "$_mapped" ] && apt-cache policy "$_mapped" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+                _debian_deps+=("$_mapped")
             else
                 _debian_deps+=("$_pkg_name")
             fi
@@ -1351,9 +1391,12 @@ EOF
         fi
         
         # --- Debian: hard verification of critical build deps ---
-        # These are absolutely required; cargo will fail with obscure errors if missing
+        # These are absolutely required; cargo will fail with obscure errors if missing.
+        # libdisplay-info-dev is included because a missing display-info produces the
+        # confusing "libdisplay-info.pc not found" build-script error after a long build.
         local _crit_deps=(build-essential cmake pkg-config clang libclang-dev \
-            libwayland-dev wayland-protocols libpango1.0-dev)
+            libwayland-dev wayland-protocols libpango1.0-dev libdisplay-info-dev \
+            libxkbcommon-dev libinput-dev)
         local _crit _missing_crit=0
         for _crit in "${_crit_deps[@]}"; do
             if ! pkg_installed "$_crit"; then
@@ -1374,6 +1417,30 @@ EOF
     if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
         MANUAL_ITEMS+=("niri — build dependencies install failed, build manually: $NIRI_GH")
         return 1
+    fi
+
+    # pkg-config pre-check (Debian + RHEL families): verify every .pc file the
+    # build needs actually exists BEFORE starting the 10-20 min background build.
+    # A missing .pc surfaces as "The system library X required by crate Y was not
+    # found" only at the end of the build — this catches it in seconds instead.
+    if command -v pkg-config >/dev/null 2>&1; then
+        local _pc _missing_pc=0 _pc_list=(libdisplay-info xkbcommon wayland-client \
+            libinput libseat libpipewire-0.3 dbus-1 pango gbm egl \
+            xcb-composite xcb-ewmh xcb-icccm xcb-randr xcb-xfixes \
+            xcb-present xcb-render-util xcb-res xcb-shape xcb-util xcb-xkb xcb-xinerama)
+        for _pc in "${_pc_list[@]}"; do
+            if ! pkg-config --exists "$_pc" 2>/dev/null; then
+                warn "$(_t "niri build prerequisite missing: " "niri build prerequisite missing: ") $_pc.pc"
+                _missing_pc=1
+            fi
+        done
+        if [ "$_missing_pc" -eq 1 ]; then
+            error "$(_t "niri — required system libraries (.pc files) are missing; install the -dev/-devel packages listed above, then rerun: $NIRI_GH" "niri — required system libraries (.pc files) are missing; install the -dev/-devel packages listed above, then rerun: $NIRI_GH")"
+            MANUAL_ITEMS+=("niri — system libraries missing (.pc files not found); install the -dev packages listed above, then rerun: $NIRI_GH")
+            return 1
+        fi
+    else
+        warn "$(_t "pkg-config not found; skipping niri build prerequisite check" "pkg-config not found; skipping niri build prerequisite check")"
     fi
 
     # Build in background so the rest of the install (packages/services/config) proceeds meanwhile
@@ -2307,6 +2374,95 @@ stage_backup() {
 
 # --- 4.7 config deploy ---
 
+# Install the zsh runtime that configs/.zshrc depends on (oh-my-zsh + its custom
+# plugins + starship + eza + bat).  The distro packages for zsh-autosuggestions /
+# zsh-syntax-highlighting cannot satisfy oh-my-zsh's plugins=() list, and
+# oh-my-zsh itself is not packaged in Debian/RHEL at all — this is why the
+# collected .zshrc only ever worked on the Arch reference machine.  Runs only
+# when zsh was selected; every step is best-effort with a MANUAL_ITEMS note on
+# failure (the .zshrc itself is tolerant of missing pieces).
+install_zsh_extras() {
+    local _has_zsh=0 _p
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        [ "$_p" = "zsh" ] && _has_zsh=1
+    done
+    [ "$_has_zsh" -eq 1 ] || return 0
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("oh-my-zsh (git clone) starship eza bat")
+        return "$DRY_RUN_RC"
+    fi
+
+    # git is needed for the clones; not guaranteed present on Debian/RHEL.
+    command -v git >/dev/null 2>&1 || pm_install git 2>/dev/null || true
+
+    # 1) oh-my-zsh itself (official repo; shallow clone is enough)
+    if [ ! -d "$HOME_DIR/.oh-my-zsh" ]; then
+        log "$(_t "Installing oh-my-zsh..." "Installing oh-my-zsh...")"
+        if as_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null; then
+            INSTALLED_PKGS+=("oh-my-zsh")
+        else
+            MANUAL_ITEMS+=("oh-my-zsh — clone failed; run: git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git $HOME_DIR/.oh-my-zsh")
+        fi
+    else
+        log "$(_t "oh-my-zsh already present, skipping." "oh-my-zsh already present, skipping.")"
+    fi
+
+    # 2) the two plugins listed in configs/.zshrc — must live in $ZSH_CUSTOM/plugins
+    #    for oh-my-zsh's plugins=() to find them (distro packages don't).
+    if [ -d "$HOME_DIR/.oh-my-zsh" ]; then
+        mkdir -p "$HOME_DIR/.oh-my-zsh/custom/plugins"
+        local _plugin _plug_url
+        for _plugin in zsh-autosuggestions zsh-syntax-highlighting; do
+            if [ ! -d "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" ]; then
+                case "$_plugin" in
+                    zsh-autosuggestions)   _plug_url="https://github.com/zsh-users/zsh-autosuggestions" ;;
+                    zsh-syntax-highlighting) _plug_url="https://github.com/zsh-users/zsh-syntax-highlighting" ;;
+                esac
+                log "$(_t "Installing oh-my-zsh plugin: " "Installing oh-my-zsh plugin: ") $_plugin"
+                as_user git clone --depth=1 "$_plug_url" \
+                    "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" 2>/dev/null \
+                    || MANUAL_ITEMS+=("oh-my-zsh plugin $_plugin — clone failed")
+            fi
+        done
+        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+            "$HOME_DIR/.oh-my-zsh" 2>/dev/null || true
+    fi
+
+    # 3) starship (configs/.zshrc evals `starship init zsh`); not packaged on Debian
+    if ! command -v starship >/dev/null 2>&1; then
+        log "$(_t "Installing starship..." "Installing starship...")"
+        if exe bash -c 'curl -sSfL https://starship.rs/install.sh | sh -s -- -y -b /usr/local/bin' 2>/dev/null; then
+            INSTALLED_PKGS+=("starship")
+        else
+            MANUAL_ITEMS+=("starship — install failed; run: curl -sSfL https://starship.rs/install.sh | sh -s -- -y")
+        fi
+    fi
+
+    # 4) eza (aliased in .zshrc): repo package first, cargo --root /usr/local as fallback
+    #    (Debian 12 / Ubuntu 24.04 have no eza package yet)
+    if ! command -v eza >/dev/null 2>&1; then
+        log "$(_t "Installing eza..." "Installing eza...")"
+        pm_install eza 2>/dev/null || true
+        if ! command -v eza >/dev/null 2>&1; then
+            if ensure_rust && exe cargo install --locked --root /usr/local eza 2>/dev/null; then
+                INSTALLED_PKGS+=("eza (cargo build)")
+            else
+                MANUAL_ITEMS+=("eza — no repo package and cargo build failed; install manually (apt/dnf/cargo)")
+            fi
+        fi
+    fi
+
+    # 5) bat (aliased in .zshrc): on Debian/Ubuntu the binary is named batcat,
+    #    so provide /usr/local/bin/bat -> batcat when needed.
+    if ! command -v bat >/dev/null 2>&1; then
+        pm_install bat 2>/dev/null || true
+        if ! command -v bat >/dev/null 2>&1 && command -v batcat >/dev/null 2>&1; then
+            ln -sf /usr/bin/batcat /usr/local/bin/bat
+        fi
+    fi
+}
+
 deploy_one() { # $1 = source path, $2 = destination path
     local src="$1" dst="$2" ts="$3"
     if [ -e "$dst" ] || [ -L "$dst" ]; then
@@ -2423,6 +2579,9 @@ IMEEOF
             break
         fi
     done
+
+    # oh-my-zsh + starship + eza + bat (the runtime configs/.zshrc needs)
+    install_zsh_extras
 
     success "$(_t "Config deploy complete." "Config deploy complete.")"
     stage_mark configs
