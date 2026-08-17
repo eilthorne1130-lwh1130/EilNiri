@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.8.2"
+SCRIPT_VERSION="1.8.3"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -569,14 +569,16 @@ BDEPS_MISSING=()
 apt_install_tolerant() {
     BDEPS_MISSING=()
     [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$@"); return "$DRY_RUN_RC"; }
-    if exe apt-get install -y "$@" 2>/dev/null; then
+    # apt stderr goes to LOG_DIR/apt-errors.log (never /dev/null) so a systemic
+    # apt failure (broken dpkg state, unreachable repos) stays diagnosable.
+    if exe apt-get install -y "$@" 2>>"$LOG_DIR/apt-errors.log"; then
         return 0   # whole batch installed
     fi
     # batch failed (at least one name missing) — retry one-by-one so the available ones still install
     local p erc
     for p in "$@"; do
         erc=0
-        exe apt-get install -y "$p" 2>/dev/null || erc=$?
+        exe apt-get install -y "$p" 2>>"$LOG_DIR/apt-errors.log" || erc=$?
         [ "$erc" -ne 0 ] && BDEPS_MISSING+=("$p")
     done
     [ ${#BDEPS_MISSING[@]} -eq 0 ]
@@ -589,7 +591,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v13"
+PROGRESS_VERSION="v14"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -756,8 +758,21 @@ stage_preflight() {
                 if [ "$UBUNTU_VER_NUM" -gt 0 ] && [ "$UBUNTU_VER_NUM" -lt 2404 ]; then
                     warn "$(_t "Ubuntu $UBUNTU_VER_NUM detected: most niri-suite packages require Ubuntu 24.04+ (universe) or Debian 13+. Continue at your own risk." "Ubuntu $UBUNTU_VER_NUM detected: most niri-suite packages require Ubuntu 24.04+ (universe) or Debian 13+. Continue at your own risk.")"
                 fi
+                # Fresh log for apt errors this run (apt_install_tolerant and the
+                # critical-deps retry append here instead of swallowing stderr).
+                : > "$LOG_DIR/apt-errors.log" 2>/dev/null || true
+                # Repair a broken dpkg state left by an interrupted previous run:
+                # without this, EVERY later apt-get install fails and unrelated
+                # packages all report "unavailable" (classic symptom: build deps
+                # AND service provider packages failing at the same time).
+                local _dpkg_audit
+                _dpkg_audit=$(dpkg --audit 2>/dev/null)
+                if [ -n "$_dpkg_audit" ]; then
+                    log "$(_t "dpkg reports half-installed packages; running dpkg --configure -a ..." "dpkg reports half-installed packages; running dpkg --configure -a ...")"
+                    exe dpkg --configure -a 2>>"$LOG_DIR/apt-errors.log" || warn "$(_t "dpkg repair failed; see " "dpkg repair failed; see ") $LOG_DIR/apt-errors.log"
+                fi
                 if ! exe apt-get update; then
-                    warn "$(_t "apt-get update failed, continuing." "apt-get update failed, continuing.")"
+                    warn "$(_t "apt-get update FAILED — package installs will fail too. Check network / apt sources (mirror), run 'sudo apt-get update' manually, then rerun." "apt-get update FAILED — package installs will fail too. Check network / apt sources (mirror), run 'sudo apt-get update' manually, then rerun.")"
                 fi
                 # Ubuntu: the niri-suite packages (fuzzel, mako-notifier, waybar, fcitx5-rime, hyprlock, ...) live in
                 # universe, which is NOT enabled by default on Ubuntu Server/minimal/cloud images. Enable it automatically.
@@ -1401,10 +1416,14 @@ EOF
         for _crit in "${_crit_deps[@]}"; do
             if ! pkg_installed "$_crit"; then
                 warn "$(_t "Critical build dep missing, retrying: " "Critical build dep missing, retrying: ") $_crit"
-                pm_install "$_crit" 2>/dev/null || true
+                pm_install "$_crit" 2>>"$LOG_DIR/apt-errors.log" || true
                 if ! pkg_installed "$_crit"; then
-                    error "$(_t "Critical build dependency NOT installed: " "Critical build dependency NOT installed: ") $_crit"
-                    MANUAL_ITEMS+=("niri — critical build dependency '$_crit' unavailable in your Debian/Ubuntu version; install manually or use a newer distribution version, then rerun: $NIRI_GH")
+                    # Surface the REAL apt error (broken dpkg, unreachable repos,
+                    # missing package) instead of a generic "unavailable" message.
+                    local _aperr
+                    _aperr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
+                    error "$(_t "Critical build dependency NOT installed: " "Critical build dependency NOT installed: ") $_crit (apt error: $_aperr)"
+                    MANUAL_ITEMS+=("niri — critical build dependency '$_crit' failed to install (apt error: $_aperr); check apt sources/network, run 'sudo apt-get update' / 'sudo dpkg --configure -a', then rerun: $NIRI_GH")
                     _missing_crit=1
                 fi
             fi

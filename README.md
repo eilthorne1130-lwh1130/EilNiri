@@ -49,7 +49,7 @@ sudo ./install.sh restore-system
 
 | 分组 | 默认 | 内容 |
 |---|---|---|
-| 核心组件 | ✅ | niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh zsh-autosuggestions zsh-syntax-highlighting |
+| 核心组件 | ✅ | niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh（oh-my-zsh 及插件、starship、eza、bat 由脚本自动安装，见下方说明） |
 | 锁屏/空闲 | ✅ | hyprlock hypridle |
 | 壁纸 | ✅ | awww、waypaper (pip) |
 | 剪贴板/截图 | ✅ | copyq satty grim slurp |
@@ -71,13 +71,13 @@ sudo ./install.sh restore-system
 
 ## restore 流程（共 11 步）
 
-1. **Logo 展示** → **Pre-Flight**：Arch 系（pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新）；RHEL 系（dnf upgrade）；Debian 系（apt-get update + 自动开启 Ubuntu universe + upgrade，确保 curl/tar/unzip，并自动 `locale-gen` 生成 `zh_CN.UTF-8`/`en_US.UTF-8`）
+1. **Logo 展示** → **Pre-Flight**：Arch 系（pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新）；RHEL 系（dnf upgrade）；Debian 系（apt-get update + 自动开启 Ubuntu universe + upgrade，确保 curl/tar/unzip，并自动 `locale-gen` 生成 `zh_CN.UTF-8`/`en_US.UTF-8`）；**Debian 系自动修复破损的 dpkg 状态**（`dpkg --audit` 发现半完成包即 `dpkg --configure -a`，否则后续所有 apt 安装都会失败且报"unavailable"），**apt 错误统一写入 `~/.local/state/eilNiri/apt-errors.log`** 供排查
 2. **目标用户检测**：默认 UID 1000，30s 超时可选创建新用户
 3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）；**CN 时区自动启用 cargo/rustup 镜像（rsproxy.cn）**；niri/awww 的 cargo 编译**转入后台**（日志 `~/.local/state/eilNiri/{niri,awww}-build.log`）
 4. **服务启用**：fzf 勾选内置服务（bluetooth / libvirtd / power-profiles-daemon，默认全选）→ `systemctl enable --now`（后台编译同时进行）
 5. **显示管理器**：自动安装脚本选择的 DM 并**替换现有 DM**（Arch→ly；Debian/RHEL→gdm（gdm3 兜底），装不上自动尝试 sddm）——现有 DM（如 Ubuntu Desktop 预装 gdm3）会被自动禁用、`display-manager.service` 指向新 DM；**先装新的再禁旧的**，安装失败则保留现有 DM 不动；**默认启动目标自动设为 `graphical.target`**（否则重启只会进纯文本 tty、任何 DM 都不启动）；**gdm 默认会话自动设为 niri**（AccountsService `Session=niri` + 自动清除 `custom.conf` 的 `DefaultSession`/`AutomaticLogin` 覆盖 + 自动装/启 `accountsservice` + 重启 `accounts-daemon`；**每次 restore 幂等重检**——niri 后台构建晚完成也会被补上；否则登录会进系统默认桌面如 GNOME）；niri.desktop 同时安装到 `/usr/share/wayland-sessions/` 和 `/usr/local/share/wayland-sessions/` 确保所有 DM 都能发现；**若 niri.desktop 意外缺失（编译中断等），restore 自动从 GitHub 下载源码轻量修复（仅提取 niri.desktop，无需重新编译）**；`EILNIRI_KEEP_DM=1` 可保留现有 DM——重启后直接进 niri 登录
 6. **配置快照**：部署前将已有配置打包至 `backups/`（tar.gz）
-7. **配置部署**：已有文件自动备份为 `.bak-时间戳` → PipeWire 用户服务自启 → **waypaper 用户服务（waypaper.service + 定时换壁纸 timer）自启** → **fcitx5 选中时兜底写入 `~/.config/environment.d/ime.conf`（IME 环境变量；`.pam_environment` 在 Debian 12+/Ubuntu 22.04+ 已默认失效）** → zsh 设为默认 shell
+7. **配置部署**：已有文件自动备份为 `.bak-时间戳` → PipeWire 用户服务自启 → **waypaper 用户服务（waypaper.service + 定时换壁纸 timer）自启** → **fcitx5 选中时兜底写入 `~/.config/environment.d/ime.conf`（IME 环境变量；`.pam_environment` 在 Debian 12+/Ubuntu 22.04+ 已默认失效）** → zsh 设为默认 shell → **自动安装 oh-my-zsh 及所需运行时（starship / eza / bat；见下方"zsh / oh-my-zsh"）**
 8. **系统清理（禁用其他桌面组件）**：目标机若有多套桌面环境（如 Ubuntu 预装 GNOME），自动**禁用（不卸载）**其他 DE 的冲突组件——通知 daemon（evolution-alarm-notify / xfce4-notifyd）、GNOME 设置守护（媒体键/电源/声音/剪贴板）、gnome-remote-desktop。机制为写 `~/.config/autostart/*.desktop` 覆盖（`Hidden=true`）+ `systemctl mask`，**只禁用不删除任何包**；每次操作记录到 `$BASE_DIR/.system_disabled` 清单，可用 `./install.sh restore-system` 一键重新启用。`EILNIRI_KEEP_SYS=1` 跳过。
 9. **等待后台构建**：轮询 niri/awww 编译进度（每 15s 显示已用时间 + **当前正在编译的 crate**，如 `Compiling smithay v0.4.0`）→ 编译完成后自动安装二进制到 `/usr/local/bin`；失败读取日志尾部进手动报告。**restore 运行时可在另一终端用 `./install.sh status` 实时查看每个构建的状态/耗时/当前编译项**（日志：`~/.local/state/eilNiri/{niri,awww}-build.log`，`tail -f` 可实时跟看）
 10. **硬件适配**：自动检测显示器输出名+分辨率 → 修复 niri config → 注释 waybar 硬件 sink → polkit agent 路径按家族改写 → GPU 驱动提示
@@ -113,7 +113,7 @@ sudo ./install.sh restore-system
 - **Ubuntu 版本**：建议 24.04+。低于 24.04 时 Pre-Flight 会明确警告（22.04 等旧版仓库基本没有 niri 套件包）；26.04+ 的 universe 已自带 hyprlock / hypridle，会直接 apt 装成功
 - **debconf 不卡流程**：Debian 系自动 `DEBIAN_FRONTEND=noninteractive`，apt 安装（如 libvirt）不会弹出交互提示
 - **编译提速（后台并行 + 资源感知）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。编译并行度按内存自动限制（每任务约 1.5GB，防小 VM OOM；<8GB 内存时 awww 自动等 niri 完成再编译）。编译日志：`~/.local/state/eilNiri/{niri,awww,xwayland-satellite}-build.log`
-- **niri 自动安装（分层策略 + 修复）**：官方仓库无 niri 包。restore 时下载**源码小 tarball（~1MB）**后台 `cargo build --release`（依赖从 crates.io 拉取，rsproxy 镜像兜底；约 10-20 分钟）。**仅当任何 cargo 注册源都不可达时**才额外下载 40MB `vendored-dependencies` 归档离线构建。niri 的 pipewire 特性依赖 `libspa-sys`（bindgen），因此 `NIRI_BUILD_DEPS` 强制包含 `clang`/`libclang-dev`（**缺失时会爆 `stdbool.h not found`**）；构建依赖采用**容忍式安装**（个别缺失的次要包不中断），但**关键依赖（build-essential/cmake/pkg-config/clang/libclang-dev）硬校验**，缺失即明确报错并中止，避免模糊错误。
+- **niri 自动安装（分层策略 + 多项可靠性修复）**：官方仓库无 niri 包。restore 时下载**源码小 tarball（~1MB）**后台 `cargo build --release`（依赖从 crates.io 拉取，rsproxy 镜像兜底；约 10-20 分钟）。**仅当任何 cargo 注册源都不可达时**才额外下载 40MB `vendored-dependencies` 归档离线构建（此路径的 `.cargo/config.toml` 使用绝对路径指向 vendored 目录，修掉了相对路径解析 bug）。构建依赖的按版本改名采用**运行时 `apt-cache policy` 探测 + 回退原名**（不再硬编码猜测，旧版错误的 `libdisplay-info-dev→libdisplay-info0-dev` 映射会让依赖被静默丢弃、编译 15 分钟后才报 `libdisplay-info.pc not found`）；**关键依赖硬校验**（build-essential/cmake/pkg-config/clang/libclang-dev/libwayland-dev/wayland-protocols/libpango1.0-dev/**libdisplay-info-dev/libxkbcommon-dev/libinput-dev**）缺失即明确报错中止，并把真实 apt 错误尾部带进报错信息；niri 的 pipewire 特性依赖 `libspa-sys`（bindgen），因此强制包含 `clang`/`libclang-dev`。**启动构建前做 pkg-config 预检**：一次性验证 build 需要的全部 23 个 `.pc` 文件（libdisplay-info/xkbcommon/wayland-client/libseat/pipewire/dbus/pango/gbm/egl/xcb-*），任一缺失几秒内即报错并进入手动报告，不再等 10-20 分钟。
 - **hyprlock / hypridle 源码编译兜底**：Ubuntu 26.04+ 的 universe 已自带 hyprlock/hypridle（直接 apt 装）；**Debian 13 / 旧版 Ubuntu 无包时，restore 自动从源码构建**（`git clone` 官方仓库 + `cargo build --release` + 装 `/usr/local/bin`），不再只给手动提示。源码构建的 hyprlock 会**自动写入 `/etc/pam.d/hyprlock`**（apt 包自带 PAM，源码构建不会）。此兜底由 `SOURCE_PKGS` 表驱动，可扩展更多"仓库没有的包一律源码编译"。
 - **awww 自动安装**：无 .deb 也无预编译二进制，且上游已从 GitHub 迁到 Codeberg。restore 自动浅克隆 `codeberg.org/LGFae/awww` → 后台 `cargo build --release`（约 5 分钟）→ 安装 `awww` 与 `awww-daemon` 到 `/usr/local/bin`。
 - **satty 自动安装**：无 .deb，但官方（Satty-org/Satty）发布预编译二进制。restore 直接走 `releases/latest/download` 稳定 URL（免 GitHub API，CN 更稳）下载 `satty-<arch>-unknown-linux-gnu.tar.gz`（x86_64/aarch64）→ 安装到 `/usr/local/bin`，并确保 GTK4/libadwaita/librsvg 运行时库；预编译不可用时回退 `cargo install`。
@@ -124,6 +124,15 @@ sudo ./install.sh restore-system
 - **rime-ice 雾凇拼音自动部署**：无 .deb，但官方发布 release zip（`full.zip`）——restore 自动从 GitHub 直连下载 → 解压复制到 `~/.local/share/fcitx5/rime`（fcitx5-rime 包提供引擎）。Arch 上仍走 archlinuxcn 包，不受影响。
 - **登录管理器自动安装**：Debian/RHEL 自动装并启用 `gdm`（gdm3 兜底）；现有 DM 被自动禁用替换，`EILNIRI_KEEP_DM=1` 可保留。
 - **ly**：仅 Arch 有包（自动安装）；Debian/RHEL 上由脚本改用 gdm。
+- **Rust 工具链版本守卫**：`rustup` 工具链/默认版本缺失时防止静默使用发行版自带的过老 cargo（Debian 12 的 rustc 1.63、Ubuntu 22.04 的 1.75 编译 niri 会报 "edition 2024" 错误）。`ensure_rust` 校验 cargo ≥ 1.85，不足时自动 `rustup update stable` 重试一次，仍不满足则明确报错中止，不再用老工具链硬编译。
+
+## zsh / oh-my-zsh（桌面终端体验）
+
+- **自动安装 oh-my-zsh**：Debian/RHEL 的官方仓库都没有 oh-my-zsh 包（[Arch 参考机靠 AUR 才有](https://github.com/ohmyzsh/ohmyzsh)），参考机收集的 `configs/.zshrc` 也因此只在 Arch 上生效。restore 在 zsh 选中时自动以目标用户身份 `git clone --depth=1` 官方仓库到 `~/.oh-my-zsh`，跨 Arch/RHEL/Debian 三家一致生效。
+- **OMZ 插件放到 `custom/plugins/`**：`zsh-autosuggestions` / `zsh-syntax-highlighting` 不再走 apt/dnf 包（它们装到 `/usr/share` 或 `/etc/zsh/zshrc.d`，OMZ 的 `plugins=()` 用不上），而是克隆到 `~/.oh-my-zsh/custom/plugins/` 供 .zshrc 插件表识别。
+- **配套运行时自动装**：starship（`configs/.zshrc` 里 `init zsh` 依赖，官方脚本装到 `/usr/local/bin`）、eza（repo 优先，无包则 `cargo install --root /usr/local`）、bat（Debian/Ubuntu 上自动建 `bat`→`batcat` 符号链接）。
+- **`.zshrc` 全防护**：`source $ZSH/oh-my-zsh.sh`、`starship init zsh`、eza/bat/rg 别名均改为"命令存在才加载"，参考机写死的 `/home/eilthorne` 绝对路径改为主目录相对（`$HOME`）；即使某个组件没装上，shell 也不会报错。
+- 每步失败都会进入"手动安装报告"（MANUAL_ITEMS）并给出具体命令，不会静默抛错。
 
 ## 网络（CN 友好）
 
@@ -165,7 +174,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore/collect-config 开头都会显示 `v版本号`（当前 v1.8.1）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore/collect-config 开头都会显示 `v版本号`（当前 v1.8.3）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
 - **多桌面环境**：restore 会自动禁用（不卸载）其他 DE 的冲突组件（通知/设置守护等），清单存 `.system_disabled`；切回其他 DE 前用 `sudo ./install.sh restore-system` 重新启用，或 `EILNIRI_KEEP_SYS=1` 跳过禁用
 - **诊断**：restore 结尾打印 `NIRI STATUS`（niri 二进制/desktop/gdm Session 三态）+ `Boot Environment Check`（gdm 是否真能启动 niri）+ 生成 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包（各 build 日志 + AccountsService + custom.conf + 包清单），排查时直接分享该包
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
@@ -175,7 +184,7 @@ EilNiri/
 - 中断恢复：重跑自动跳过已完成阶段，删除 `.replicate_progress` 可强制全量重跑；**进度文件带脚本版本标记，旧版本脚本写的进度自动作废**（失败阶段不再标记完成，重跑自动重试，无需手动删文件）
 - dry-run：不对系统做任何改动（唯一例外：fzf 是交互前提，dry-run 下也会实际安装）
 - 临时文件在退出时自动清理（sudoers、构建目录、解包目录）
-- 日志：`~/.local/state/eilNiri/replicate.log`，自动截断保留最近 800 行
+- 日志：`~/.local/state/eilNiri/replicate.log`，自动截断保留最近 800 行；**apt 报错单独记在 `~/.local/state/eilNiri/apt-errors.log`**（apt stderr 不再被丢弃，包装不上时能直接看到真实原因）
 
 ## 参考
 
@@ -186,6 +195,6 @@ EilNiri/
 ## 贡献者
 
 - **eilthorne** - 项目创建与维护
-- **Claude** - Debian 12+ 编译修复、系统组件禁用完善、网络弹性改进
+- **Claude** - Debian 12+ 编译修复、系统组件禁用完善、网络弹性改进；niri 依赖探测/硬校验与 pkg-config 预检、oh-my-zsh 并行安装与 .zshrc 防护、pre-flight dpkg 适配修复、apt 错误日志化
 
 在这里向所有贡献者表示感谢
