@@ -124,6 +124,7 @@ sudo ./install.sh restore-system
 - **rime-ice 雾凇拼音自动部署**：无 .deb，但官方发布 release zip（`full.zip`）——restore 自动从 GitHub 直连下载 → 解压复制到 `~/.local/share/fcitx5/rime`（fcitx5-rime 包提供引擎）。Arch 上仍走 archlinuxcn 包，不受影响。
 - **登录管理器自动安装**：Debian/RHEL 自动装并启用 `gdm`（gdm3 兜底）；现有 DM 被自动禁用替换，`EILNIRI_KEEP_DM=1` 可保留。
 - **ly**：仅 Arch 有包（自动安装）；Debian/RHEL 上由脚本改用 gdm。
+- **apt 镜像源自动换源（404 / 无法下载自愈）**：当 `apt-get update` 失败、或安装时 apt 报 `404`/`无法下载`/`Failed to fetch`（典型：`cn.archive.ubuntu.com` 等镜像同步滞后——索引里已有新版但 pool 里的 .deb 尚未同步，如 Ubuntu 26.04 的 `libudev-dev_259.5-0ubuntu3.3`、`libinput10 1.31.1-1`）时，脚本按 **tuna → 阿里云 → 中科大** 顺序询问并自动换源：备份原源文件（`*.mirror-bak-时间戳`）→ 改写 `.list`/`.sources` 里的 host → `apt-get update` → **用 curl 探测之前 404 的 .deb 是否真被新镜像同步**（只有显式 404 才换下一个候选）→ 换源成功后自动重试关键依赖一轮（带 `--fix-missing`）。fzf 可用时用 fzf 菜单选择，未装时退化为编号提示。手动报告只追加一次。
 - **Rust 工具链版本守卫**：`rustup` 工具链/默认版本缺失时防止静默使用发行版自带的过老 cargo（Debian 12 的 rustc 1.63、Ubuntu 22.04 的 1.75 编译 niri 会报 "edition 2024" 错误）。`ensure_rust` 校验 cargo ≥ 1.85，不足时自动 `rustup update stable` 重试一次，仍不满足则明确报错中止，不再用老工具链硬编译。
 
 ## zsh / oh-my-zsh（桌面终端体验）
@@ -174,7 +175,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore/collect-config 开头都会显示 `v版本号`（当前 v1.8.3）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore/collect-config 开头都会显示 `v版本号`（当前 v1.9.1）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
 - **多桌面环境**：restore 会自动禁用（不卸载）其他 DE 的冲突组件（通知/设置守护等），清单存 `.system_disabled`；切回其他 DE 前用 `sudo ./install.sh restore-system` 重新启用，或 `EILNIRI_KEEP_SYS=1` 跳过禁用
 - **诊断**：restore 结尾打印 `NIRI STATUS`（niri 二进制/desktop/gdm Session 三态）+ `Boot Environment Check`（gdm 是否真能启动 niri）+ 生成 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包（各 build 日志 + AccountsService + custom.conf + 包清单），排查时直接分享该包
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）

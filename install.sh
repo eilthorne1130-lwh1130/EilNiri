@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.0"
+SCRIPT_VERSION="1.9.1"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -591,7 +591,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v15"
+PROGRESS_VERSION="v16"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -714,11 +714,22 @@ fzf_single() {
 # --- Debian/Ubuntu apt mirror switch (offered when apt-get update or install fails ---
 # with 404 / 无法下载 / connection errors).  Rewrites the apt host in the source
 # files (both deb-format .list and deb822 .sources) to a selected mirror, backs up
-# the originals, then reruns apt-get update.
+# the originals, then reruns apt-get update and VERIFIES the previously-missing
+# .deb is actually served by the new mirror (curl probe).
 # NOTE: fzf may not be installed yet at this point (ensure_fzf runs after
 # preflight, and apt being broken can block its install), so this falls back to a
 # plain numbered prompt when fzf is absent.
-set_debian_mirror() {
+_url_http_code() { # $1 = URL; echoes HTTP status code (000 on network failure)
+    curl -sI -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || echo "000"
+}
+
+# 从 apt 错误日志里提取第一个 404 的 .deb 下载 URL（用于换源后验证新镜像是否已同步）
+_apt_404_url() {
+    grep -aoE 'https?://[^ ]+\.deb' "$LOG_DIR/apt-errors.log" 2>/dev/null | head -n 1
+}
+
+set_debian_mirror() { # $1 = 可选：直接指定镜像 (tuna|aliyun|ustc)，缺省时弹 fzf/编号菜单
+    local _force="${1:-}"
     local _src_files=()
     # Debian/Ubuntu 的源文件分散在 /etc/apt/sources.list 和 /etc/apt/sources.list.d/
     while IFS= read -r -d '' _f; do
@@ -727,26 +738,28 @@ set_debian_mirror() {
     done < <(find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
     [ ${#_src_files[@]} -eq 0 ] && { warn "$(_t "No Ubuntu/Debian apt source files found to rewrite." "No Ubuntu/Debian apt source files found to rewrite.")"; return 1; }
 
-    # fzf 可用时用菜单；否则退化为编号选择
-    local choice=""
-    if command -v fzf >/dev/null 2>&1; then
-        choice=$(printf "%s\n" \
-            "tuna\t清华大学镜像 (mirrors.tuna.tsinghua.edu.cn)" \
-            "aliyun\t阿里云镜像 (mirrors.aliyun.com)" \
-            "ustc\t中科大镜像 (mirrors.ustc.edu.cn)" \
-            "skip\t不更换，继续" \
-            | fzf_single " Debian/Ubuntu 软件源异常（更新失败或 404），选择是否更换镜像源 ") || choice="skip"
-        choice=${choice%%$'\t'*}
-    else
-        section "$(_t "Mirror Switch" "Mirror Switch")" "$(_t "use plain prompt (fzf not available)" "use plain prompt (fzf not available)")"
-        echo -e "   ${H_CYAN}[1]${NC} 清华大学镜像 (tuna)   ${H_CYAN}[2]${NC} 阿里云 (aliyun)   ${H_CYAN}[3]${NC} 中科大 (ustc)   ${H_CYAN}[4]${NC} 不更换继续"
-        local _ans; read -r -t 30 _ans || _ans="4"
-        case "$_ans" in
-            1) choice="tuna" ;;
-            2) choice="aliyun" ;;
-            3) choice="ustc" ;;
-            *) choice="skip" ;;
-        esac
+    local choice="$1"
+    if [ -z "$choice" ]; then
+        # fzf 可用时用菜单；否则退化为编号选择
+        if command -v fzf >/dev/null 2>&1; then
+            choice=$(printf "%s\n" \
+                "tuna\t清华大学镜像 (mirrors.tuna.tsinghua.edu.cn)" \
+                "aliyun\t阿里云镜像 (mirrors.aliyun.com)" \
+                "ustc\t中科大镜像 (mirrors.ustc.edu.cn)" \
+                "skip\t不更换，继续" \
+                | fzf_single " Debian/Ubuntu 软件源异常（更新失败或 404），选择是否更换镜像源 ") || choice="skip"
+            choice=${choice%%$'\t'*}
+        else
+            section "$(_t "Mirror Switch" "Mirror Switch")" "$(_t "use plain prompt (fzf not available)" "use plain prompt (fzf not available)")"
+            echo -e "   ${H_CYAN}[1]${NC} 清华大学镜像 (tuna)   ${H_CYAN}[2]${NC} 阿里云 (aliyun)   ${H_CYAN}[3]${NC} 中科大 (ustc)   ${H_CYAN}[4]${NC} 不更换继续"
+            local _ans; read -r -t 30 _ans || _ans="4"
+            case "$_ans" in
+                1) choice="tuna" ;;
+                2) choice="aliyun" ;;
+                3) choice="ustc" ;;
+                *) choice="skip" ;;
+            esac
+        fi
     fi
 
     [ "$choice" = "skip" ] && { log "$(_t "Keeping current apt sources." "Keeping current apt sources.")"; return 0; }
@@ -770,7 +783,21 @@ set_debian_mirror() {
         log "$(_t "Rewrote " "Rewrote ") $_f -> $_mirror (backup: $_bak)"
     done
     log "$(_t "Reloading package index from new mirror..." "Reloading package index from new mirror...")"
-    exe apt-get update 2>>"$LOG_DIR/apt-errors.log"
+    exe apt-get update 2>>"$LOG_DIR/apt-errors.log" || true
+
+    # 验证新镜像确实同步了之前 404 的 .deb：把 apt 错误里的第一个 .deb URL 换到新
+    # 镜像域名再探测。只有显式 404 才判为"镜像也未同步"（网络不通/无法验证不阻塞）。
+    local _probe _code
+    _probe=$(_apt_404_url)
+    if [ -n "$_probe" ]; then
+        _probe=$(printf '%s' "$_probe" | sed -E "s#https?://[^/]+#http://$_mirror#")
+        _code=$(_url_http_code "$_probe")
+        if [ "$_code" = "404" ]; then
+            warn "$(_t "New mirror " "New mirror ") $_mirror$(_t " also returns 404 for the missing .deb (同步滞后？) — trying next mirror." " also returns 404 for the missing .deb (sync lag?) — trying next mirror.")"
+            return 1
+        fi
+        log "$(_t "New mirror verified: " "New mirror verified: ") $_probe -> HTTP $_code"
+    fi
     return 0
 }
 
@@ -1478,15 +1505,21 @@ EOF
         local _crit_deps=(build-essential cmake pkg-config clang libclang-dev \
             libwayland-dev wayland-protocols libpango1.0-dev libdisplay-info-dev \
             libxkbcommon-dev libinput-dev)
-        local _crit _missing_crit=0 _tried_mirror=0
-        # 关键依赖校验（带"换源后重试一次"）：当 apt 报 404 / 无法下载 / Failed to fetch
-        # （典型：cn.archive.ubuntu.com 镜像同步滞后返回 404）时，弹 fzf 换源选择，
-        # 换源成功则重试整轮校验；最多重试一次，仍失败才中止。
+        local _crit _missing_crit=0 _tried_mirror=0 _last_crit=""
+        # 关键依赖校验（带"换源后自动重试"）：当 apt 报 404 / 无法下载 / Failed to fetch
+        # （典型：cn.archive.ubuntu.com 镜像同步滞后，索引有新版本但 pool 里 .deb 404）
+        # 时，按 tuna → aliyun → ustc 顺序自动尝试换源；每个候选源换完会用 curl 探测
+        # 之前 404 的 .deb 是否真的被新镜像同步（显式 404 才换下一个），换源成功则重试
+        # 整轮校验。MANUAL 报告只在最终失败时追加一次。
         while :; do
             _missing_crit=0
             for _crit in "${_crit_deps[@]}"; do
                 if ! pkg_installed "$_crit"; then
                     warn "$(_t "Critical build dep missing, retrying: " "Critical build dep missing, retrying: ") $_crit"
+                    # apt 建议的 --fix-missing 一并带上：镜像缺个别 .deb 时能跳过继续
+                    if [ "$DISTRO_FAMILY" = debian ] && command -v apt-get >/dev/null 2>&1; then
+                        exe apt-get install -y --fix-missing "$_crit" 2>>"$LOG_DIR/apt-errors.log" || true
+                    fi
                     pm_install "$_crit" 2>>"$LOG_DIR/apt-errors.log" || true
                     if ! pkg_installed "$_crit"; then
                         # Surface the REAL apt error (broken dpkg, unreachable repos,
@@ -1494,28 +1527,40 @@ EOF
                         local _aperr
                         _aperr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
                         error "$(_t "Critical build dependency NOT installed: " "Critical build dependency NOT installed: ") $_crit (apt error: $_aperr)"
-                        MANUAL_ITEMS+=("niri — critical build dependency '$_crit' failed to install (apt error: $_aperr); check apt sources/network, run 'sudo apt-get update' / 'sudo dpkg --configure -a', then rerun: $NIRI_GH")
                         _missing_crit=1
+                        _last_crit="$_crit"
                     fi
                 fi
             done
             # 命中镜像源故障特征（404 / 无法下载 / Failed to fetch / Hash Sum mismatch）
-            # 且尚未换过源 → 提供 fzf 换源选择，成功后重试一轮
+            # 且尚未换过源 → 依次尝试 tuna / aliyun / ustc，成功后重试一轮
             if [ "$_missing_crit" -eq 1 ] && [ "$_tried_mirror" -eq 0 ] \
                 && grep -qiE '404|无法下载|Failed to fetch|Unable to fetch|Hash Sum mismatch' "$LOG_DIR/apt-errors.log" 2>/dev/null; then
-                warn "$(_t "apt 错误疑似镜像源问题（404 / 无法下载）——提供换源选择..." "apt 错误疑似镜像源问题（404 / 无法下载）——提供换源选择...")"
-                if confirm "$(_t "Switch the Debian/Ubuntu apt mirror to a CN mirror? [Y/n] (default Y):" "Switch the Debian/Ubuntu apt mirror to a CN mirror? [Y/n] (default Y):")" "Y" 15 2>/dev/null; then
-                    if set_debian_mirror; then
-                        _tried_mirror=1
-                        log "$(_t "Retrying critical build deps after mirror switch..." "Retrying critical build deps after mirror switch...")"
-                        continue
+                warn "$(_t "apt 错误疑似镜像源问题（404 / 无法下载）——自动尝试换源..." "apt 错误疑似镜像源问题（404 / 无法下载）——自动尝试换源...")"
+                local _m _switched=0
+                for _m in tuna aliyun ustc; do
+                    if confirm "$(_t "Try mirror $_m? [Y/n] (default Y):" "Try mirror $_m? [Y/n] (default Y):")" "Y" 10 2>/dev/null; then
+                        if set_debian_mirror "$_m"; then
+                            _switched=1
+                            break
+                        fi
                     fi
+                done
+                if [ "$_switched" -eq 1 ]; then
+                    _tried_mirror=1
+                    log "$(_t "Retrying critical build deps after mirror switch..." "Retrying critical build deps after mirror switch...")"
+                    continue
                 fi
-                _tried_mirror=1   # 用户拒绝换源或换源失败，不再重试
+                _tried_mirror=1   # 用户全部拒绝 / 所有候选源都未同步，不再重试
             fi
             break
         done
-        if [ "$_missing_crit" -eq 1 ]; then return 1; fi
+        if [ "$_missing_crit" -eq 1 ]; then
+            local _aperr_final
+            _aperr_final=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
+            MANUAL_ITEMS+=("niri — critical build dependency '${_last_crit:-?}' failed to install (apt error: $_aperr_final); 源镜像可能滞后/未同步——已尝试换源仍失败：检查网络与代理 (如 198.18.x.x TUN)，手动换 tuna/aliyun 源或运行 'sudo apt-get update' / 'sudo dpkg --configure -a' 后重跑: $NIRI_GH")
+            return 1
+        fi
     else
         exe dnf install -y "${NIRI_BUILD_DEPS_RHEL[@]}" || bdeps_rc=$?
     fi
