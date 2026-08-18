@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.17"
+SCRIPT_VERSION="1.9.18"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -609,7 +609,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v32"
+PROGRESS_VERSION="v33"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -2037,10 +2037,11 @@ install_awww_from_build() { # $1 = srcdir, $2 = logfile
 _ensure_wallpaper() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     command -v awww >/dev/null 2>&1 || return 0   # awww 缺失由 install_awww 处理
-    [ -s "$HOME_DIR/.config/awww/wallpaper" ] 2>/dev/null && return 0
 
     local _img="" _cand _ext=""
-    # 1) 仓库根目录的壁纸图（用户放在 install.sh 旁边的图片）优先
+    # 1) 固定使用仓库根目录的壁纸图（用户放在 script 旁的那张 QQ图片.../wallpaper 图）。
+    #    每次部署都会把它复制到 ~/.local/share/backgrounds/wallpaper.<ext>（若文件已存在且
+    #    相同则跳过；之前不显示是因为早退逻辑/未主动 set——这里不早退，并最终主动 set）。
     for _cand in "$BASE_DIR"/*.jpg "$BASE_DIR"/*.jpeg "$BASE_DIR"/*.png "$BASE_DIR"/*.webp; do
         [ -f "$_cand" ] || continue
         case "$_cand" in *.jpg|*.jpeg) _ext=jpg;; *.png) _ext=png;; *.webp) _ext=webp;; *) continue;; esac
@@ -2118,6 +2119,13 @@ PYEOF
             log "$(_t "hyprlock wallpaper path -> " "hyprlock wallpaper path -> ") $_img"
             sed -i -E "s#^(\s*path\s*=).*#\1 $_img#" "$_hlconf" 2>/dev/null || true
             chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_hlconf" 2>/dev/null || true
+        fi
+        # 主动 set：只写状态文件不够——显式让 awww-daemon 应用这张壁纸（daemon 若已响应
+        # 自己读状态文件并应用；此处再主动调用一次确保生效，失败不影响已写状态）。
+        if [ -x /usr/local/bin/awww-daemon ] && command -v as_user >/dev/null 2>&1; then
+            exe as_user awww-daemon set-wallpaper "$_img" 2>>"$LOG_DIR/awww-set.log" || \
+                exe as_user awww set-wallpaper "$_img" 2>>"$LOG_DIR/awww-set.log" || true
+            log "$(_t "awww set-wallpaper invoked: " "awww set-wallpaper invoked: ") $_img"
         fi
     fi
 }
