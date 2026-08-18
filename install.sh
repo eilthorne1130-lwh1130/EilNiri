@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.4"
+SCRIPT_VERSION="1.9.5"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -591,7 +591,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v19"
+PROGRESS_VERSION="v20"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -1362,6 +1362,7 @@ _pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔）
         pango)             echo "libpango1.0-dev" ;;
         gbm)               echo "libgbm-dev" ;;
         egl)               echo "libegl1-mesa-dev" ;;
+        liblz4)            echo "liblz4-dev" ;;
         lz4)               echo "liblz4-dev" ;;
         dav1d)             echo "libdav1d-dev" ;;
         xcb-cursor)        echo "libxcb-cursor-dev" ;;
@@ -1396,21 +1397,39 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
     PC_STILL_MISSING=()
     command -v pkg-config >/dev/null 2>&1 || pm_install pkg-config 2>/dev/null || true
     command -v pkg-config >/dev/null 2>&1 || return 1
-    local _pc
-    # pass 1: 收集缺失 + Debian 自愈
-    for _pc in "$@"; do
-        if ! pkg-config --exists "$_pc" 2>/dev/null; then
-            warn "$(_t "build prerequisite missing: " "build prerequisite missing: ") $_pc.pc"
-            if [ "$DISTRO_FAMILY" = debian ] && [ "$DRY_RUN" -eq 0 ]; then
-                _pc_auto_install "$_pc"
+    local _attempt=0 _pc
+    while [ "$_attempt" -lt 2 ]; do
+        PC_STILL_MISSING=()
+        # pass 1: 收集缺失 + Debian 自愈
+        for _pc in "$@"; do
+            if ! pkg-config --exists "$_pc" 2>/dev/null; then
+                warn "$(_t "build prerequisite missing: " "build prerequisite missing: ") $_pc.pc"
+                if [ "$DISTRO_FAMILY" = debian ] && [ "$DRY_RUN" -eq 0 ]; then
+                    _pc_auto_install "$_pc"
+                fi
+            fi
+        done
+        # pass 2: 重新校验
+        for _pc in "$@"; do
+            if ! pkg-config --exists "$_pc" 2>/dev/null; then
+                PC_STILL_MISSING+=("$_pc.pc")
+            fi
+        done
+        [ ${#PC_STILL_MISSING[@]} -eq 0 ] && return 0
+        # 仍缺且 apt 报镜像/源故障特征（404 / 无法下载 / 找不到包 / Release 过期）→
+        # 先查时钟，再换源重试一轮（最多一次）
+        if [ "$_attempt" -eq 0 ] && [ "$DISTRO_FAMILY" = debian ] && [ "$DRY_RUN" -eq 0 ] \
+            && grep -qiE '404|无法下载|Failed to fetch|Unable to fetch|Unable to locate package|has no installation candidate|Release 文件已经过期|expired|Valid-Until' "$LOG_DIR/apt-errors.log" 2>/dev/null; then
+            check_clock_drift
+            if confirm "$(_t "apt cannot fetch some packages (mirror/source issue) — switch mirror and retry? [Y/n] (default Y):" "apt cannot fetch some packages (mirror/source issue) — switch mirror and retry? [Y/n] (default Y):")" "Y" 10 2>/dev/null; then
+                if set_debian_mirror; then
+                    _attempt=1
+                    log "$(_t "Retrying .pc pre-check after mirror switch..." "Retrying .pc pre-check after mirror switch...")"
+                    continue
+                fi
             fi
         fi
-    done
-    # pass 2: 重新校验
-    for _pc in "$@"; do
-        if ! pkg-config --exists "$_pc" 2>/dev/null; then
-            PC_STILL_MISSING+=("$_pc.pc")
-        fi
+        break
     done
     [ ${#PC_STILL_MISSING[@]} -eq 0 ]
 }
@@ -1683,8 +1702,10 @@ EOF
             libinput libseat libpipewire-0.3 dbus-1 pango gbm egl \
             xcb-composite xcb-ewmh xcb-icccm xcb-randr xcb-xfixes \
             xcb-present xcb-render-util xcb-res xcb-shape xcb-util xcb-xkb xcb-xinerama; then
+        local _nperr
+        _nperr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
         error "$(_t "niri — required system libraries still missing: " "niri — required system libraries still missing: ") ${PC_STILL_MISSING[*]}$(_t " — install the -dev/-devel packages, then rerun: $NIRI_GH" " — install the -dev/-devel packages, then rerun: $NIRI_GH")"
-        MANUAL_ITEMS+=("niri — 系统库缺失: ${PC_STILL_MISSING[*]}（.pc 未找到，已尝试自动安装对应 -dev 包仍失败）; 手动安装后重跑: $NIRI_GH")
+        MANUAL_ITEMS+=("niri — 系统库缺失: ${PC_STILL_MISSING[*]}（apt error: $_nperr）; 手动安装对应 -dev 包后重跑: $NIRI_GH")
         return 1
     fi
     [ "$PC_AUTO_INSTALLED" -gt 0 ] && log "$(_t "pkg-config pre-check passed after auto-install." "pkg-config pre-check passed after auto-install.")"
@@ -1753,9 +1774,12 @@ install_awww() {
             warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
         exe apt-get install -y libdav1d6 2>/dev/null || true
-        # pkg-config 预检 + 自愈：wayland-client / xkbcommon / lz4 / dav1d 缺哪个自动装哪个
-        if ! ensure_pc_deps wayland-client xkbcommon lz4 dav1d; then
-            MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（.pc 未找到，已尝试自动安装仍失败）; 手动安装后重跑: $AWWW_REPO")
+        # pkg-config 预检 + 自愈：wayland-client / xkbcommon / liblz4 / dav1d 缺哪个自动装哪个
+        # （注意 lz4 的 .pc 文件名是 liblz4.pc，lz4-sys 探测的也是 liblz4）
+        if ! ensure_pc_deps wayland-client xkbcommon liblz4 dav1d; then
+            local _awperr
+            _awperr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
+            MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（apt error: $_awperr）; 手动安装对应 -dev 包后重跑: $AWWW_REPO")
             return 1
         fi
     else
@@ -2047,7 +2071,9 @@ install_xwayland_satellite() {
         fi
         # pkg-config 预检 + 自愈：wayland-client / xkbcommon / xcb-cursor 缺哪个自动装哪个
         if ! ensure_pc_deps wayland-client xkbcommon xcb-cursor; then
-            MANUAL_ITEMS+=("xwayland-satellite — 系统库缺失: ${PC_STILL_MISSING[*]}（.pc 未找到，已尝试自动安装仍失败）; 手动安装后重跑: $XWS_REPO")
+            local _xwsperr
+            _xwsperr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
+            MANUAL_ITEMS+=("xwayland-satellite — 系统库缺失: ${PC_STILL_MISSING[*]}（apt error: $_xwsperr）; 手动安装对应 -dev 包后重跑: $XWS_REPO")
             return 1
         fi
     else
