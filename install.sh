@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.11"
+SCRIPT_VERSION="1.9.12"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -593,7 +593,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v26"
+PROGRESS_VERSION="v27"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -1542,10 +1542,51 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
     [ ${#PC_STILL_MISSING[@]} -eq 0 ]
 }
 
+# niri 已装但 systemd user units 缺失时（旧版脚本装的 niri / 手动装的）补装：
+# niri-session 启动需要 systemctl --user start niri.service，缺 unit 会 GDM 登录循环。
+# 下载源码 tarball，从 resources/ 提取 *.service / *.target 到 /usr/lib/systemd/user/。
+_ensure_niri_units() {
+    [ -x /usr/local/bin/niri ] || return 0
+    [ -f /usr/lib/systemd/user/niri.service ] && [ -f /usr/lib/systemd/user/niri-shutdown.target ] && return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("niri (systemd user units)")
+        return "$DRY_RUN_RC"
+    fi
+    log "$(_t "niri installed but systemd user units missing — installing..." "niri installed but systemd user units missing — installing...")"
+    local ver tmp work url _unit _ok=0
+    ver=$(curl -fsSI --retry 2 https://github.com/niri-wm/niri/releases/latest 2>/dev/null \
+        | grep -i '^location:' | sed -n 's#.*/tag/\(v[^/]*\).*#\1#p' | head -n 1 | sed 's/^v//' | tr -d '\r')
+    if [ -z "$ver" ]; then
+        ver=$(curl -fsSL https://api.github.com/repos/niri-wm/niri/releases/latest 2>/dev/null \
+            | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/' | tr -d '\r')
+    fi
+    if [ -z "$ver" ]; then
+        MANUAL_ITEMS+=("niri — 无法获取版本号来自动补装 systemd user units; 手动创建 /usr/lib/systemd/user/niri.service 与 niri-shutdown.target（见 README）")
+        return 1
+    fi
+    tmp=$(mktemp); work=$(mktemp -d)
+    register_temp_path "$tmp"; register_temp_path "$work"
+    url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
+    if download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; then
+        mkdir -p /usr/lib/systemd/user
+        for _unit in "$work"/*/resources/*.service "$work"/*/resources/*.target; do
+            [ -f "$_unit" ] || continue
+            exe install -Dm644 "$_unit" "/usr/lib/systemd/user/$(basename "$_unit")" 2>/dev/null && _ok=1
+        done
+    fi
+    if [ "$_ok" -eq 1 ]; then
+        log "$(_t "niri systemd user units installed (/usr/lib/systemd/user)" "niri systemd user units installed (/usr/lib/systemd/user)")"
+        return 0
+    fi
+    MANUAL_ITEMS+=("niri — 未能自动补装 systemd user units; 手动创建 /usr/lib/systemd/user/niri.service 与 niri-shutdown.target")
+    return 1
+}
+
 install_niri_binary() {
     if command -v niri >/dev/null 2>&1; then
         if [ -f /usr/share/wayland-sessions/niri.desktop ] || [ -f /usr/local/share/wayland-sessions/niri.desktop ]; then
             SKIPPED_PKGS+=("niri (already installed)")
+            _ensure_niri_units   # 旧版脚本/手动装的 niri 可能缺 systemd units → GDM 登录循环
             return 0
         fi
         log "$(_t "niri binary found but niri.desktop missing; repairing session file..." "niri binary found but niri.desktop missing; repairing session file...")"
@@ -2797,13 +2838,14 @@ install_zsh_extras() {
     # git is needed for the clones; not guaranteed present on Debian/RHEL.
     command -v git >/dev/null 2>&1 || pm_install git 2>/dev/null || true
 
-    # 1) oh-my-zsh itself (official repo; shallow clone is enough)
+    # 1) oh-my-zsh itself (official repo first; gitee mirror fallback for CN networks)
     if [ ! -d "$HOME_DIR/.oh-my-zsh" ]; then
         log "$(_t "Installing oh-my-zsh..." "Installing oh-my-zsh...")"
-        if as_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null; then
+        if as_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null \
+            || as_user git clone --depth=1 https://gitee.com/mirrors/oh-my-zsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null; then
             INSTALLED_PKGS+=("oh-my-zsh")
         else
-            MANUAL_ITEMS+=("oh-my-zsh — clone failed; run: git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git $HOME_DIR/.oh-my-zsh")
+            MANUAL_ITEMS+=("oh-my-zsh — clone failed (GitHub 与 gitee 镜像均不可达); 手动: git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git $HOME_DIR/.oh-my-zsh")
         fi
     else
         log "$(_t "oh-my-zsh already present, skipping." "oh-my-zsh already present, skipping.")"
