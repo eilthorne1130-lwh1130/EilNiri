@@ -109,7 +109,7 @@ sudo ./install.sh restore-system
 | libnotify | libnotify-bin |
 | polkit-gnome | polkit-gnome |
 
-- **Ubuntu universe 自动开启**：fuzzel / mako-notifier / waybar / fcitx5-rime / hyprlock 等全部在 universe 组件。Ubuntu Server / minimal / 云镜像默认不开 universe —— restore 的 Pre-Flight 会自动检测并开启（`add-apt-repository universe`），无需手动操作
+- **Ubuntu universe 自动开启（硬校验）**：fuzzel / mako-notifier / waybar / fcitx5-rime / hyprlock 等全部在 universe 组件。Ubuntu Server / minimal / 云镜像默认不开 universe —— Pre-Flight 自动检测并开启（`add-apt-repository universe`，无该命令时直接改写 deb822 `.sources` 的 `Components` 行），开启后**必须能看到 universe 包才算成功**，否则明确警告并给出手动命令；构建依赖自愈时若发现候选 `-dev` 包不在 apt 列表（如 `libxcb-render-util0-dev` 这类 universe 包），也会自动重试启用 universe 后再装。
 - **Ubuntu 版本**：建议 24.04+。低于 24.04 时 Pre-Flight 会明确警告（22.04 等旧版仓库基本没有 niri 套件包）；26.04+ 的 universe 已自带 hyprlock / hypridle，会直接 apt 装成功
 - **debconf 不卡流程**：Debian 系自动 `DEBIAN_FRONTEND=noninteractive`，apt 安装（如 libvirt）不会弹出交互提示
 - **编译提速（后台并行 + 资源感知）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。编译并行度按内存自动限制（每任务约 1.5GB，防小 VM OOM；<8GB 内存时 awww 自动等 niri 完成再编译）。编译日志：`~/.local/state/eilNiri/{niri,awww,xwayland-satellite}-build.log`
@@ -177,7 +177,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore/collect-config 开头都会显示 `v版本号`（当前 v1.9.3）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore/collect-config 开头都会显示 `v版本号`（当前 v1.9.6）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
 - **多桌面环境**：restore 会自动禁用（不卸载）其他 DE 的冲突组件（通知/设置守护等），清单存 `.system_disabled`；切回其他 DE 前用 `sudo ./install.sh restore-system` 重新启用，或 `EILNIRI_KEEP_SYS=1` 跳过禁用
 - **诊断**：restore 结尾打印 `NIRI STATUS`（niri 二进制/desktop/gdm Session 三态）+ `Boot Environment Check`（gdm 是否真能启动 niri）+ 生成 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包（各 build 日志 + AccountsService + custom.conf + 包清单），排查时直接分享该包
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）

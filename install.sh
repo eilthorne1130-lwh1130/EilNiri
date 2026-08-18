@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.5"
+SCRIPT_VERSION="1.9.6"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -591,7 +591,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v20"
+PROGRESS_VERSION="v21"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -889,17 +889,13 @@ stage_preflight() {
                     fi
                 fi
                 # Ubuntu: the niri-suite packages (fuzzel, mako-notifier, waybar, fcitx5-rime, hyprlock, ...) live in
-                # universe, which is NOT enabled by default on Ubuntu Server/minimal/cloud images. Enable it automatically.
-                if [ "$DISTRO_ID" = ubuntu ] && ! apt-cache show mako-notifier >/dev/null 2>&1; then
-                    log "$(_t "universe repository not enabled, enabling it..." "universe repository not enabled, enabling it...")"
-                    if ! command -v add-apt-repository &>/dev/null; then
-                        exe apt-get install -y software-properties-common || warn "$(_t "software-properties-common install failed, universe may stay disabled." "software-properties-common install failed, universe may stay disabled.")"
-                    fi
-                    if command -v add-apt-repository &>/dev/null; then
-                        exe add-apt-repository -y universe || warn "$(_t "add-apt-repository universe failed, packages from universe will not install." "add-apt-repository universe failed, packages from universe will not install.")"
-                        exe apt-get update
+                # universe, which is NOT enabled by default on Ubuntu Server/minimal/cloud images. Enable it automatically
+                # (硬校验：启用后必须能看到 universe 包，否则警告并给出手动命令）。
+                if [ "$DISTRO_ID" = ubuntu ]; then
+                    if _ensure_ubuntu_universe; then
+                        log "$(_t "universe component OK." "universe component OK.")"
                     else
-                        warn "$(_t "Cannot enable universe automatically; install packages from universe will fail." "Cannot enable universe automatically; install packages from universe will fail.")"
+                        warn "$(_t "universe 仍未启用/不可见 — 部分构建依赖（universe 组件，如 libxcb-render-util0-dev）将无法安装。手动执行: sudo add-apt-repository universe && sudo apt-get update" "universe 仍未启用/不可见 — 部分构建依赖（universe 组件，如 libxcb-render-util0-dev）将无法安装。手动执行: sudo add-apt-repository universe && sudo apt-get update")"
                     fi
                 fi
                 if ! exe apt-get -y upgrade; then
@@ -1348,6 +1344,33 @@ _repair_niri_session() {
 # 哪个存在装哪个），装完重新校验；仍缺则把清单放进 PC_STILL_MISSING。
 PC_STILL_MISSING=()
 PC_AUTO_INSTALLED=0
+PC_FAIL_HINT=""   # ensure_pc_deps 失败时的原因说明（apt 报错尾部 / 候选包不在列表等）
+# 确保 Ubuntu 的 universe 组件已启用（很多构建 -dev 包在 universe，如 libxcb-render-util0-dev）。
+# 返回 0 = universe 可见；1 = 仍不可见。
+_ensure_ubuntu_universe() {
+    [ "$DISTRO_ID" = ubuntu ] || return 0
+    # 已能看到 universe 包就算启用（两个代表性包）
+    apt-cache show libxcb-render-util0-dev >/dev/null 2>&1 && return 0
+    apt-cache show mako-notifier >/dev/null 2>&1 && return 0
+    if ! command -v add-apt-repository >/dev/null 2>&1; then
+        pm_install software-properties-common 2>>"$LOG_DIR/apt-errors.log" || true
+    fi
+    if command -v add-apt-repository >/dev/null 2>&1; then
+        exe add-apt-repository -y universe 2>>"$LOG_DIR/apt-errors.log" || true
+    else
+        # 无 add-apt-repository：直接往 deb822 .sources 的 Components 行追加 universe
+        local _f
+        for _f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$_f" ] || continue
+            grep -q '^Components:' "$_f" 2>/dev/null || continue
+            grep -qE '^\s*Components:.*\buniverse\b' "$_f" 2>/dev/null || {
+                exe sed -i -E 's/^(Components:.*)$/\1 universe/' "$_f" || true
+            }
+        done
+    fi
+    exe apt-get update 2>>"$LOG_DIR/apt-errors.log" || true
+    apt-cache show libxcb-render-util0-dev >/dev/null 2>&1 || apt-cache show mako-notifier >/dev/null 2>&1
+}
 _pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔）
     case "$1" in
         libdisplay-info)  echo "libdisplay-info-dev" ;;
@@ -1382,13 +1405,25 @@ _pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔）
     esac
 }
 _pc_auto_install() { # $1 = .pc 名（Debian 系专用）
-    local _cand
-    for _cand in $(_pc_pkg_map "$1"); do
-        if apt-cache policy "$_cand" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
-            log "$(_t "Auto-installing missing build dep: " "Auto-installing missing build dep: ") $_cand"
-            pm_install "$_cand" 2>>"$LOG_DIR/apt-errors.log" || true
-            PC_AUTO_INSTALLED=$(( PC_AUTO_INSTALLED + 1 ))
-            pkg-config --exists "$1" 2>/dev/null && return 0
+    local _cand _found=0 _try
+    for _try in 1 2; do
+        for _cand in $(_pc_pkg_map "$1"); do
+            if apt-cache policy "$_cand" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+                _found=1
+                log "$(_t "Auto-installing missing build dep: " "Auto-installing missing build dep: ") $_cand"
+                pm_install "$_cand" 2>>"$LOG_DIR/apt-errors.log" || true
+                PC_AUTO_INSTALLED=$(( PC_AUTO_INSTALLED + 1 ))
+                pkg-config --exists "$1" 2>/dev/null && return 0
+            fi
+        done
+        # 候选包一个都不在 apt 列表里 → 大概率 universe 未启用（这些 -dev 包多在
+        # universe，如 libxcb-render-util0-dev）或源列表缺失；启用 universe 后重试一轮
+        if [ "$_found" -eq 0 ] && [ "$_try" -eq 1 ]; then
+            warn "$(_t "No apt candidate for " "No apt candidate for ") $1$(_t " — 尝试启用 universe 并刷新索引..." " — 尝试启用 universe 并刷新索引...")"
+            _ensure_ubuntu_universe || true
+            _found=0
+        else
+            break
         fi
     done
     return 1
@@ -1431,6 +1466,14 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
         fi
         break
     done
+    # 失败原因说明：有 apt 报错就带尾部；无报错说明候选包不在 apt 列表（universe 未启用等）
+    local _perr
+    _perr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
+    if [ -n "$_perr" ]; then
+        PC_FAIL_HINT="apt error: $_perr"
+    else
+        PC_FAIL_HINT="apt 无报错 — 候选 -dev 包不在 apt 列表中（大概率 universe 未启用或源列表缺失）"
+    fi
     [ ${#PC_STILL_MISSING[@]} -eq 0 ]
 }
 
@@ -1702,10 +1745,8 @@ EOF
             libinput libseat libpipewire-0.3 dbus-1 pango gbm egl \
             xcb-composite xcb-ewmh xcb-icccm xcb-randr xcb-xfixes \
             xcb-present xcb-render-util xcb-res xcb-shape xcb-util xcb-xkb xcb-xinerama; then
-        local _nperr
-        _nperr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
         error "$(_t "niri — required system libraries still missing: " "niri — required system libraries still missing: ") ${PC_STILL_MISSING[*]}$(_t " — install the -dev/-devel packages, then rerun: $NIRI_GH" " — install the -dev/-devel packages, then rerun: $NIRI_GH")"
-        MANUAL_ITEMS+=("niri — 系统库缺失: ${PC_STILL_MISSING[*]}（apt error: $_nperr）; 手动安装对应 -dev 包后重跑: $NIRI_GH")
+        MANUAL_ITEMS+=("niri — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -dev 包后重跑: $NIRI_GH")
         return 1
     fi
     [ "$PC_AUTO_INSTALLED" -gt 0 ] && log "$(_t "pkg-config pre-check passed after auto-install." "pkg-config pre-check passed after auto-install.")"
@@ -1777,9 +1818,7 @@ install_awww() {
         # pkg-config 预检 + 自愈：wayland-client / xkbcommon / liblz4 / dav1d 缺哪个自动装哪个
         # （注意 lz4 的 .pc 文件名是 liblz4.pc，lz4-sys 探测的也是 liblz4）
         if ! ensure_pc_deps wayland-client xkbcommon liblz4 dav1d; then
-            local _awperr
-            _awperr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
-            MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（apt error: $_awperr）; 手动安装对应 -dev 包后重跑: $AWWW_REPO")
+            MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -dev 包后重跑: $AWWW_REPO")
             return 1
         fi
     else
@@ -2071,9 +2110,7 @@ install_xwayland_satellite() {
         fi
         # pkg-config 预检 + 自愈：wayland-client / xkbcommon / xcb-cursor 缺哪个自动装哪个
         if ! ensure_pc_deps wayland-client xkbcommon xcb-cursor; then
-            local _xwsperr
-            _xwsperr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
-            MANUAL_ITEMS+=("xwayland-satellite — 系统库缺失: ${PC_STILL_MISSING[*]}（apt error: $_xwsperr）; 手动安装对应 -dev 包后重跑: $XWS_REPO")
+            MANUAL_ITEMS+=("xwayland-satellite — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -dev 包后重跑: $XWS_REPO")
             return 1
         fi
     else
