@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.1"
+SCRIPT_VERSION="1.9.3"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -591,7 +591,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v16"
+PROGRESS_VERSION="v18"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -723,6 +723,25 @@ _url_http_code() { # $1 = URL; echoes HTTP status code (000 on network failure)
     curl -sI -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || echo "000"
 }
 
+# 检测系统时钟偏差：与官方源服务器 Last-Modified 对比，偏差 >= 3 天时警告。
+# apt 报 "Release 文件已经过期 / expired / Valid-Until" 的常见原因不是镜像滞后，
+# 而是本地时钟偏快（VM 常见，无 NTP）——此时换任何镜像都没用，必须先校准时间。
+check_clock_drift() {
+    local _cname _lastmod _mod_epoch _local_epoch _drift
+    _cname=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
+    [ -z "$_cname" ] && _cname="stable"
+    _lastmod=$(curl -sI --max-time 8 "http://security.ubuntu.com/ubuntu/dists/$_cname-security/InRelease" 2>/dev/null \
+        | awk -F': ' 'tolower($1)=="last-modified"{print $2; exit}' | tr -d '\r')
+    if [ -n "$_lastmod" ] && _mod_epoch=$(date -d "$_lastmod" +%s 2>/dev/null) && [ -n "$_mod_epoch" ]; then
+        _local_epoch=$(date +%s)
+        _drift=$(( (_local_epoch - _mod_epoch) / 86400 ))
+        [ "$_drift" -lt 0 ] && _drift=$(( -_drift ))
+        if [ "$_drift" -ge 3 ]; then
+            warn "$(_t "SYSTEM CLOCK seems off by about $_drift days (local: " "SYSTEM CLOCK seems off by about $_drift days (local: ") $(date '+%F %T %z')$(_t ", server Last-Modified: " ", server Last-Modified: ") $_lastmod$(_t ") — this makes ALL apt sources report 'Release file expired'. Calibrate first: sudo timedatectl set-ntp true (or: sudo ntpdate -u time.nist.gov), then rerun." ") — this makes ALL apt sources report 'Release file expired'. Calibrate first: sudo timedatectl set-ntp true (or: sudo ntpdate -u time.nist.gov), then rerun.")"
+        fi
+    fi
+}
+
 # 从 apt 错误日志里提取第一个 404 的 .deb 下载 URL（用于换源后验证新镜像是否已同步）
 _apt_404_url() {
     grep -aoE 'https?://[^ ]+\.deb' "$LOG_DIR/apt-errors.log" 2>/dev/null | head -n 1
@@ -738,7 +757,7 @@ set_debian_mirror() { # $1 = 可选：直接指定镜像 (tuna|aliyun|ustc)，�
     done < <(find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
     [ ${#_src_files[@]} -eq 0 ] && { warn "$(_t "No Ubuntu/Debian apt source files found to rewrite." "No Ubuntu/Debian apt source files found to rewrite.")"; return 1; }
 
-    local choice="$1"
+    local choice="${1:-}"
     if [ -z "$choice" ]; then
         # fzf 可用时用菜单；否则退化为编号选择
         if command -v fzf >/dev/null 2>&1; then
@@ -862,6 +881,8 @@ stage_preflight() {
                 fi
                 if ! exe apt-get update; then
                     warn "$(_t "apt-get update FAILED — package installs will fail too. Check network / apt sources (mirror), run 'sudo apt-get update' manually, then rerun." "apt-get update FAILED — package installs will fail too. Check network / apt sources (mirror), run 'sudo apt-get update' manually, then rerun.")"
+                    # 若报 "Release 文件已经过期/expired"，先查系统时钟（常见根因，换镜像无效）
+                    check_clock_drift
                     # 网络受限于当前源时，提供一键换源（fzf 选择；fzf 未装则退化编号提示）
                     if confirm "$(_t "Switch the Debian/Ubuntu apt mirror to a CN mirror? [Y/n] (default Y):" "Switch the Debian/Ubuntu apt mirror to a CN mirror? [Y/n] (default Y):")" "Y" 15 2>/dev/null; then
                         set_debian_mirror
@@ -1532,11 +1553,12 @@ EOF
                     fi
                 fi
             done
-            # 命中镜像源故障特征（404 / 无法下载 / Failed to fetch / Hash Sum mismatch）
-            # 且尚未换过源 → 依次尝试 tuna / aliyun / ustc，成功后重试一轮
+            # 命中镜像源故障特征（404 / 无法下载 / Failed to fetch / Hash Sum mismatch /
+            # Release 过期）且尚未换过源 → 先查时钟，再依次尝试 tuna / aliyun / ustc，成功后重试一轮
             if [ "$_missing_crit" -eq 1 ] && [ "$_tried_mirror" -eq 0 ] \
-                && grep -qiE '404|无法下载|Failed to fetch|Unable to fetch|Hash Sum mismatch' "$LOG_DIR/apt-errors.log" 2>/dev/null; then
-                warn "$(_t "apt 错误疑似镜像源问题（404 / 无法下载）——自动尝试换源..." "apt 错误疑似镜像源问题（404 / 无法下载）——自动尝试换源...")"
+                && grep -qiE '404|无法下载|Failed to fetch|Unable to fetch|Hash Sum mismatch|Release 文件已经过期|expired|Valid-Until' "$LOG_DIR/apt-errors.log" 2>/dev/null; then
+                check_clock_drift   # 时钟偏快会让所有源报过期，换镜像无效——先提示
+                warn "$(_t "apt 错误疑似镜像源问题（404 / 无法下载 / Release 过期）——自动尝试换源..." "apt 错误疑似镜像源问题（404 / 无法下载 / Release 过期）——自动尝试换源...")"
                 local _m _switched=0
                 for _m in tuna aliyun ustc; do
                     if confirm "$(_t "Try mirror $_m? [Y/n] (default Y):" "Try mirror $_m? [Y/n] (default Y):")" "Y" 10 2>/dev/null; then
@@ -1574,22 +1596,74 @@ EOF
     # build needs actually exists BEFORE starting the 10-20 min background build.
     # A missing .pc surfaces as "The system library X required by crate Y was not
     # found" only at the end of the build — this catches it in seconds instead.
+    # Debian 系缺失时自动安装对应的 -dev 包（新旧命名都试），装完重新校验。
+    _pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔，apt-cache 探测存在者优先）
+        case "$1" in
+            libdisplay-info)  echo "libdisplay-info-dev" ;;
+            xkbcommon)         echo "libxkbcommon-dev" ;;
+            wayland-client)    echo "libwayland-dev" ;;
+            libinput)          echo "libinput-dev" ;;
+            libseat)           echo "libseat-dev" ;;
+            libpipewire-0.3)   echo "libpipewire-0.3-dev" ;;
+            dbus-1)            echo "libdbus-1-dev" ;;
+            pango)             echo "libpango1.0-dev" ;;
+            gbm)               echo "libgbm-dev" ;;
+            egl)               echo "libegl1-mesa-dev" ;;
+            xcb-composite)     echo "libxcb-composite0-dev libxcb-composite-dev" ;;
+            xcb-ewmh)          echo "libxcb-ewmh-dev" ;;
+            xcb-icccm)         echo "libxcb-icccm4-dev libxcb-icccm-dev" ;;
+            xcb-randr)         echo "libxcb-randr0-dev libxcb-randr-dev" ;;
+            xcb-xfixes)        echo "libxcb-xfixes0-dev libxcb-xfixes-dev" ;;
+            xcb-present)       echo "libxcb-present-dev" ;;
+            xcb-render-util)   echo "libxcb-render-util0-dev libxcb-render-util-dev" ;;
+            xcb-res)           echo "libxcb-res0-dev libxcb-res-dev" ;;
+            xcb-shape)         echo "libxcb-shape0-dev" ;;
+            xcb-util)          echo "libxcb-util-dev" ;;
+            xcb-xkb)           echo "libxcb-xkb-dev" ;;
+            xcb-xinerama)      echo "libxcb-xinerama0-dev libxcb-xinerama-dev" ;;
+            *)                 echo "" ;;
+        esac
+    }
+    _pc_auto_install() { # $1 = .pc 名（Debian 系专用）
+        local _cand
+        for _cand in $(_pc_pkg_map "$1"); do
+            if apt-cache policy "$_cand" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+                log "$(_t "Auto-installing missing build dep: " "Auto-installing missing build dep: ") $_cand"
+                pm_install "$_cand" 2>>"$LOG_DIR/apt-errors.log" || true
+                pkg-config --exists "$1" 2>/dev/null && return 0
+            fi
+        done
+        return 1
+    }
     if command -v pkg-config >/dev/null 2>&1; then
-        local _pc _missing_pc=0 _pc_list=(libdisplay-info xkbcommon wayland-client \
+        local _pc _missing_pcs=()
+        local _pc_list=(libdisplay-info xkbcommon wayland-client \
             libinput libseat libpipewire-0.3 dbus-1 pango gbm egl \
             xcb-composite xcb-ewmh xcb-icccm xcb-randr xcb-xfixes \
             xcb-present xcb-render-util xcb-res xcb-shape xcb-util xcb-xkb xcb-xinerama)
+        # pass 1: 收集缺失并对 Debian 系尝试自愈安装
         for _pc in "${_pc_list[@]}"; do
             if ! pkg-config --exists "$_pc" 2>/dev/null; then
                 warn "$(_t "niri build prerequisite missing: " "niri build prerequisite missing: ") $_pc.pc"
-                _missing_pc=1
+                _missing_pcs+=("$_pc.pc")
+                if [ "$DISTRO_FAMILY" = debian ] && [ "$DRY_RUN" -eq 0 ]; then
+                    _pc_auto_install "$_pc"
+                fi
             fi
         done
-        if [ "$_missing_pc" -eq 1 ]; then
-            error "$(_t "niri — required system libraries (.pc files) are missing; install the -dev/-devel packages listed above, then rerun: $NIRI_GH" "niri — required system libraries (.pc files) are missing; install the -dev/-devel packages listed above, then rerun: $NIRI_GH")"
-            MANUAL_ITEMS+=("niri — system libraries missing (.pc files not found); install the -dev packages listed above, then rerun: $NIRI_GH")
+        # pass 2: 自愈后重新校验，产出最终缺失清单
+        local _pc2 _still_missing=()
+        for _pc2 in "${_pc_list[@]}"; do
+            if ! pkg-config --exists "$_pc2" 2>/dev/null; then
+                _still_missing+=("$_pc2.pc")
+            fi
+        done
+        if [ ${#_still_missing[@]} -gt 0 ]; then
+            error "$(_t "niri — required system libraries still missing: " "niri — required system libraries still missing: ") ${_still_missing[*]}$(_t " — install the -dev/-devel packages, then rerun: $NIRI_GH" " — install the -dev/-devel packages, then rerun: $NIRI_GH")"
+            MANUAL_ITEMS+=("niri — 系统库缺失: ${_still_missing[*]}（.pc 未找到，已尝试自动安装对应 -dev 包仍失败）; 手动安装后重跑: $NIRI_GH")
             return 1
         fi
+        [ ${#_missing_pcs[@]} -gt 0 ] && log "$(_t "pkg-config pre-check passed after auto-install." "pkg-config pre-check passed after auto-install.")"
     else
         warn "$(_t "pkg-config not found; skipping niri build prerequisite check" "pkg-config not found; skipping niri build prerequisite check")"
     fi
