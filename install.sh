@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.12"
+SCRIPT_VERSION="1.9.13"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -593,7 +593,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v27"
+PROGRESS_VERSION="v28"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -2443,6 +2443,41 @@ install_debian() {
     done
 }
 
+# [fonts] 分组的 ttf-jetbrains-mono-nerd 在 Debian/RHEL 上 apt/dnf 装的只是普通
+# JetBrains Mono（无 Nerd Font 图标）。waybar 等用 Nerd Font 字形渲染图标，缺了
+# 图标就显示成方框。从 nerd-fonts 官方 release 下载带图标的版本装到用户字体目录
+# （download_gh 自动带 GitHub 代理回退，CN 可用）。
+install_nerd_font() {
+    local _has_nf=0 _p
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        [ "$_p" = "ttf-jetbrains-mono-nerd" ] && _has_nf=1
+    done
+    [ "$_has_nf" -eq 1 ] || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("JetBrainsMono Nerd Font (download)")
+        return "$DRY_RUN_RC"
+    fi
+    fc-list 2>/dev/null | grep -qi 'JetBrainsMono.*Nerd' && { log "$(_t "Nerd Font already installed, skipping." "Nerd Font already installed, skipping.")"; return 0; }
+    command -v fc-cache >/dev/null 2>&1 || pm_install fontconfig 2>/dev/null || true
+    local _font_dir="$HOME_DIR/.local/share/fonts"
+    mkdir -p "$_font_dir"
+    log "$(_t "Downloading JetBrainsMono Nerd Font (icons)..." "Downloading JetBrainsMono Nerd Font (icons)...")"
+    local _zip
+    _zip=$(mktemp); register_temp_path "$_zip"
+    if download_gh "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/JetBrainsMono.zip" "$_zip"; then
+        if command -v unzip >/dev/null 2>&1; then
+            exe unzip -o "$_zip" -d "$_font_dir" >/dev/null 2>&1 || true
+        else
+            exe python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$_zip" "$_font_dir" 2>/dev/null || true
+        fi
+        exe fc-cache -f "$_font_dir" >/dev/null 2>&1 || true
+        INSTALLED_PKGS+=("JetBrainsMono Nerd Font")
+        success "$(_t "Nerd Font installed (waybar icons)" "Nerd Font installed (waybar icons)")"
+    else
+        MANUAL_ITEMS+=("JetBrainsMono Nerd Font — 下载失败; 手动: 从 github.com/ryanoasis/nerd-fonts/releases 下载 JetBrainsMono.zip 解压到 ~/.local/share/fonts 并运行 fc-cache -f")
+    fi
+}
+
 stage_apps_install() {
     if stage_done apps; then
         log "$(_t "App install stage done, skipping." "App install stage done, skipping.")"
@@ -2463,6 +2498,7 @@ stage_apps_install() {
         rhel)   install_rhel ;;
         debian) install_debian ;;
     esac
+    install_nerd_font   # waybar 图标字体（Debian/RHEL 的 apt 包不带 Nerd Font 图标）
     # Defer the progress mark while background builds (niri/awww) are still running
     # (stage_wait_builds marks the stage complete once they finish), and when anything
     # failed in this run — otherwise a rerun would skip retrying the failed installs.
@@ -3001,6 +3037,16 @@ stage_configs() {
                 fi
             done < <(sed -n 's/^ExecStart=//p' "$_sf" 2>/dev/null)
         done
+
+        # waybar 去重：niri config 用 spawn-at-startup "waybar" 时，禁用从参考机收集来的
+        # waybar.service（否则 niri spawn 一个 + systemd 启一个 = 屏幕上两个 waybar）。
+        if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
+            && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null \
+            && [ -f "$HOME_DIR/.config/systemd/user/waybar.service" ]; then
+            log "$(_t "niri spawns waybar at startup — disabling duplicate waybar.service" "niri spawns waybar at startup — disabling duplicate waybar.service")"
+            as_user systemctl --user disable waybar.service 2>/dev/null || true
+            rm -f "$HOME_DIR/.config/systemd/user/default.target.wants/waybar.service" 2>/dev/null || true
+        fi
 
         local _has_wp=0
         for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
