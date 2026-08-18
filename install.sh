@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.16"
+SCRIPT_VERSION="1.9.17"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -433,6 +433,22 @@ collect_config() {
     # Remove useless cache directories
     rm -rf "$CFG_DIR/.config/mako/__pycache__" 2>/dev/null
 
+    # --- 3.1b privacy scrub: 本脚本面向大众分发，收集的配置绝不允许携带参考机的 ---
+    # 个人信息。删除 copyQ 剪贴板历史/锁/加密 key（*.dat 可能含密码、token、聊天记录），
+    # 并把所有文件里的参考机主目录绝对路径替换为 $HOME 字面量（防用户名/路径泄露）。
+    rm -f "$CFG_DIR"/.config/copyq/*.dat \
+          "$CFG_DIR"/.config/copyq/*.lock \
+          "$CFG_DIR"/.config/copyq/.copyq_s \
+          "$CFG_DIR"/.config/copyq/copyq.pub 2>/dev/null
+    if [ -n "$HOME" ]; then
+        local _prf
+        while IFS= read -r _prf; do
+            [ -f "$_prf" ] || continue
+            sed -i "s#$HOME#\$HOME#g" "$_prf" 2>/dev/null || true
+            log "  [privacy] scrubbed path in $_prf"
+        done < <(grep -rlI -- "$HOME" "$CFG_DIR" 2>/dev/null | head -50)
+    fi
+
     # --- 3.2 fix known typos in the collected copy (never touch live config) ---
     local NIRI_KDL="$CFG_DIR/.config/niri/config.kdl"
     if [ -f "$NIRI_KDL" ]; then
@@ -593,7 +609,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v31"
+PROGRESS_VERSION="v32"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -2078,14 +2094,23 @@ PYEOF
         log "$(_t "Wallpaper state written: " "Wallpaper state written: ") $_img"
         # 修正 waypaper config.ini 里指向参考机的绝对路径（新机器上不存在则换成壁纸图）
         local _wpconf="$HOME_DIR/.config/waypaper/config.ini"
-        if [ -f "$_wpconf" ] && grep -qE '^wallpaper\s*=' "$_wpconf" 2>/dev/null; then
+        if [ -f "$_wpconf" ]; then
             local _oldwp
-            _oldwp=$(grep -E '^wallpaper\s*=' "$_wpconf" | head -n1 | cut -d= -f2- | tr -d ' \r')
+            _oldwp=$(grep -E '^wallpaper\s*=' "$_wpconf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \r')
             if [ -n "$_oldwp" ] && [ ! -f "$_oldwp" ]; then
                 log "$(_t "waypaper config.ini points to missing path " "waypaper config.ini points to missing path ") $_oldwp$(_t " -> " " -> ") $_img"
                 sed -i "s#^wallpaper\s*=.*#wallpaper = $_img#" "$_wpconf" 2>/dev/null || true
-                chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_wpconf" 2>/dev/null || true
             fi
+            # stylesheet 键：参考机绝对路径已由 collect-config 擦除为 $HOME，这里展开成绝对路径
+            local _oldss
+            _oldss=$(grep -E '^stylesheet\s*=' "$_wpconf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \r')
+            if [ -n "$_oldss" ] && [ ! -f "$_oldss" ]; then
+                local _newss="${_oldss/#\~/$HOME_DIR}"
+                if [ -f "$_newss" ]; then
+                    sed -i "s#^stylesheet\s*=.*#stylesheet = $_newss#" "$_wpconf" 2>/dev/null || true
+                fi
+            fi
+            chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_wpconf" 2>/dev/null || true
         fi
         # 修正 hyprlock 锁屏壁纸路径（参考机绝对路径在新机器上无效 → 锁屏背景空白）
         local _hlconf="$HOME_DIR/.config/hypr/hyprlock.conf"
@@ -2094,6 +2119,31 @@ PYEOF
             sed -i -E "s#^(\s*path\s*=).*#\1 $_img#" "$_hlconf" 2>/dev/null || true
             chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_hlconf" 2>/dev/null || true
         fi
+    fi
+}
+
+# pip --user 装的 waypaper 没有 .desktop 入口 → fuzzel 启动器里不显示/无图标。
+# 生成一个标准桌面入口（图标用 Adwaita 的 preferences-desktop-wallpaper）。
+_ensure_waypaper_desktop() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    command -v waypaper >/dev/null 2>&1 || [ -x "$HOME_DIR/.local/bin/waypaper" ] || return 0
+    local _wp
+    _wp=$(command -v waypaper 2>/dev/null || echo "$HOME_DIR/.local/bin/waypaper")
+    mkdir -p "$HOME_DIR/.local/share/applications"
+    local _wpd="$HOME_DIR/.local/share/applications/waypaper.desktop"
+    if [ ! -f "$_wpd" ] || ! grep -q "^Exec=" "$_wpd" 2>/dev/null; then
+        cat > "$_wpd" <<EOF
+[Desktop Entry]
+Name=Waypaper
+Comment=Wallpaper manager (awww/swww)
+Exec=$_wp
+Icon=preferences-desktop-wallpaper
+Terminal=false
+Type=Application
+Categories=Utility;Graphics;
+EOF
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_wpd" 2>/dev/null || true
+        log "$(_t "waypaper.desktop created (fuzzel icon)" "waypaper.desktop created (fuzzel icon)")"
     fi
 }
 
@@ -3131,12 +3181,16 @@ stage_configs() {
 
         # waybar 去重：niri config 用 spawn-at-startup "waybar" 时，禁用从参考机收集来的
         # waybar.service（否则 niri spawn 一个 + systemd 启一个 = 屏幕上两个 waybar）。
+        # 同时删掉所有 enable 链接并停止运行中的实例（systemd --user 在 root 下可能
+        # 连不上用户 bus，删 symlink 是最可靠的方式）。
         if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
             && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null \
             && [ -f "$HOME_DIR/.config/systemd/user/waybar.service" ]; then
             log "$(_t "niri spawns waybar at startup — disabling duplicate waybar.service" "niri spawns waybar at startup — disabling duplicate waybar.service")"
-            as_user systemctl --user disable waybar.service 2>/dev/null || true
-            rm -f "$HOME_DIR/.config/systemd/user/default.target.wants/waybar.service" 2>/dev/null || true
+            as_user systemctl --user disable --now waybar.service 2>/dev/null || true
+            rm -f "$HOME_DIR/.config/systemd/user/default.target.wants/waybar.service" \
+                  "$HOME_DIR/.config/systemd/user/graphical-session.target.wants/waybar.service" \
+                  "$HOME_DIR/.config/systemd/user/waybar.service" 2>/dev/null || true
         fi
 
         local _has_wp=0
@@ -3151,6 +3205,7 @@ stage_configs() {
 
         # 壁纸自愈：awww 已装则确保有壁纸状态文件（生成默认渐变壁纸 / 修正 waypaper 路径）
         _ensure_wallpaper
+        _ensure_waypaper_desktop   # pip 装的 waypaper 无 .desktop → fuzzel 无图标
     fi
 
     # fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
