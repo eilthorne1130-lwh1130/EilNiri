@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.3"
+SCRIPT_VERSION="1.9.4"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -591,7 +591,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v18"
+PROGRESS_VERSION="v19"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -1343,6 +1343,78 @@ _repair_niri_session() {
     return 1
 }
 
+# --- 通用 .pc 预检 + Debian 自愈（niri / awww / xwayland-satellite 共用）---
+# 缺失的 .pc 在 Debian 系会自动安装对应的 -dev 包（新旧命名都试，apt-cache 探测
+# 哪个存在装哪个），装完重新校验；仍缺则把清单放进 PC_STILL_MISSING。
+PC_STILL_MISSING=()
+PC_AUTO_INSTALLED=0
+_pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔）
+    case "$1" in
+        libdisplay-info)  echo "libdisplay-info-dev" ;;
+        xkbcommon)         echo "libxkbcommon-dev" ;;
+        xkbcommon-x11)     echo "libxkbcommon-x11-dev" ;;
+        wayland-client)    echo "libwayland-dev" ;;
+        wayland-server)    echo "libwayland-dev" ;;
+        libinput)          echo "libinput-dev" ;;
+        libseat)           echo "libseat-dev" ;;
+        libpipewire-0.3)   echo "libpipewire-0.3-dev" ;;
+        dbus-1)            echo "libdbus-1-dev" ;;
+        pango)             echo "libpango1.0-dev" ;;
+        gbm)               echo "libgbm-dev" ;;
+        egl)               echo "libegl1-mesa-dev" ;;
+        lz4)               echo "liblz4-dev" ;;
+        dav1d)             echo "libdav1d-dev" ;;
+        xcb-cursor)        echo "libxcb-cursor-dev" ;;
+        xcb-composite)     echo "libxcb-composite0-dev libxcb-composite-dev" ;;
+        xcb-ewmh)          echo "libxcb-ewmh-dev" ;;
+        xcb-icccm)         echo "libxcb-icccm4-dev libxcb-icccm-dev" ;;
+        xcb-randr)         echo "libxcb-randr0-dev libxcb-randr-dev" ;;
+        xcb-xfixes)        echo "libxcb-xfixes0-dev libxcb-xfixes-dev" ;;
+        xcb-present)       echo "libxcb-present-dev" ;;
+        xcb-render-util)   echo "libxcb-render-util0-dev libxcb-render-util-dev" ;;
+        xcb-res)           echo "libxcb-res0-dev libxcb-res-dev" ;;
+        xcb-shape)         echo "libxcb-shape0-dev" ;;
+        xcb-util)          echo "libxcb-util-dev" ;;
+        xcb-xkb)           echo "libxcb-xkb-dev" ;;
+        xcb-xinerama)      echo "libxcb-xinerama0-dev libxcb-xinerama-dev" ;;
+        *)                 echo "" ;;
+    esac
+}
+_pc_auto_install() { # $1 = .pc 名（Debian 系专用）
+    local _cand
+    for _cand in $(_pc_pkg_map "$1"); do
+        if apt-cache policy "$_cand" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+            log "$(_t "Auto-installing missing build dep: " "Auto-installing missing build dep: ") $_cand"
+            pm_install "$_cand" 2>>"$LOG_DIR/apt-errors.log" || true
+            PC_AUTO_INSTALLED=$(( PC_AUTO_INSTALLED + 1 ))
+            pkg-config --exists "$1" 2>/dev/null && return 0
+        fi
+    done
+    return 1
+}
+ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_STILL_MISSING 列出）
+    PC_STILL_MISSING=()
+    command -v pkg-config >/dev/null 2>&1 || pm_install pkg-config 2>/dev/null || true
+    command -v pkg-config >/dev/null 2>&1 || return 1
+    local _pc
+    # pass 1: 收集缺失 + Debian 自愈
+    for _pc in "$@"; do
+        if ! pkg-config --exists "$_pc" 2>/dev/null; then
+            warn "$(_t "build prerequisite missing: " "build prerequisite missing: ") $_pc.pc"
+            if [ "$DISTRO_FAMILY" = debian ] && [ "$DRY_RUN" -eq 0 ]; then
+                _pc_auto_install "$_pc"
+            fi
+        fi
+    done
+    # pass 2: 重新校验
+    for _pc in "$@"; do
+        if ! pkg-config --exists "$_pc" 2>/dev/null; then
+            PC_STILL_MISSING+=("$_pc.pc")
+        fi
+    done
+    [ ${#PC_STILL_MISSING[@]} -eq 0 ]
+}
+
 install_niri_binary() {
     if command -v niri >/dev/null 2>&1; then
         if [ -f /usr/share/wayland-sessions/niri.desktop ] || [ -f /usr/local/share/wayland-sessions/niri.desktop ]; then
@@ -1412,8 +1484,18 @@ install_niri_binary() {
         return 1
     fi
     if ! tar xzf "$tmp" -C "$work" 2>/dev/null; then
-        MANUAL_ITEMS+=("niri — source archive extraction failed, install manually: $url")
-        return 1
+        # 解压失败 = 下载损坏（代理/断点续传可能产生坏文件）：删掉重下一次（强制全新），再解压一次
+        log "$(_t "Extraction failed (corrupt download?), re-downloading once..." "Extraction failed (corrupt download?), re-downloading once...")"
+        rm -f "$tmp"
+        if download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; then
+            :   # 重试成功
+        else
+            local _ft2 _fs2
+            _ft2=$(file -b "$tmp" 2>/dev/null || echo unknown)
+            _fs2=$(stat -c%s "$tmp" 2>/dev/null || echo "?")
+            MANUAL_ITEMS+=("niri — source archive extraction failed (file type: $_ft2, size: $_fs2 bytes, url: $url); 下载可能被代理损坏，手动下载后安装: $NIRI_GH")
+            return 1
+        fi
     fi
 
     # Locate the source root (top level may be the source directly or wrapped in a version dir)
@@ -1596,77 +1678,16 @@ EOF
     # build needs actually exists BEFORE starting the 10-20 min background build.
     # A missing .pc surfaces as "The system library X required by crate Y was not
     # found" only at the end of the build — this catches it in seconds instead.
-    # Debian 系缺失时自动安装对应的 -dev 包（新旧命名都试），装完重新校验。
-    _pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔，apt-cache 探测存在者优先）
-        case "$1" in
-            libdisplay-info)  echo "libdisplay-info-dev" ;;
-            xkbcommon)         echo "libxkbcommon-dev" ;;
-            wayland-client)    echo "libwayland-dev" ;;
-            libinput)          echo "libinput-dev" ;;
-            libseat)           echo "libseat-dev" ;;
-            libpipewire-0.3)   echo "libpipewire-0.3-dev" ;;
-            dbus-1)            echo "libdbus-1-dev" ;;
-            pango)             echo "libpango1.0-dev" ;;
-            gbm)               echo "libgbm-dev" ;;
-            egl)               echo "libegl1-mesa-dev" ;;
-            xcb-composite)     echo "libxcb-composite0-dev libxcb-composite-dev" ;;
-            xcb-ewmh)          echo "libxcb-ewmh-dev" ;;
-            xcb-icccm)         echo "libxcb-icccm4-dev libxcb-icccm-dev" ;;
-            xcb-randr)         echo "libxcb-randr0-dev libxcb-randr-dev" ;;
-            xcb-xfixes)        echo "libxcb-xfixes0-dev libxcb-xfixes-dev" ;;
-            xcb-present)       echo "libxcb-present-dev" ;;
-            xcb-render-util)   echo "libxcb-render-util0-dev libxcb-render-util-dev" ;;
-            xcb-res)           echo "libxcb-res0-dev libxcb-res-dev" ;;
-            xcb-shape)         echo "libxcb-shape0-dev" ;;
-            xcb-util)          echo "libxcb-util-dev" ;;
-            xcb-xkb)           echo "libxcb-xkb-dev" ;;
-            xcb-xinerama)      echo "libxcb-xinerama0-dev libxcb-xinerama-dev" ;;
-            *)                 echo "" ;;
-        esac
-    }
-    _pc_auto_install() { # $1 = .pc 名（Debian 系专用）
-        local _cand
-        for _cand in $(_pc_pkg_map "$1"); do
-            if apt-cache policy "$_cand" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
-                log "$(_t "Auto-installing missing build dep: " "Auto-installing missing build dep: ") $_cand"
-                pm_install "$_cand" 2>>"$LOG_DIR/apt-errors.log" || true
-                pkg-config --exists "$1" 2>/dev/null && return 0
-            fi
-        done
-        return 1
-    }
-    if command -v pkg-config >/dev/null 2>&1; then
-        local _pc _missing_pcs=()
-        local _pc_list=(libdisplay-info xkbcommon wayland-client \
+    # Debian 系缺失时自动安装对应的 -dev 包（见全局 ensure_pc_deps）。
+    if ! ensure_pc_deps libdisplay-info xkbcommon wayland-client \
             libinput libseat libpipewire-0.3 dbus-1 pango gbm egl \
             xcb-composite xcb-ewmh xcb-icccm xcb-randr xcb-xfixes \
-            xcb-present xcb-render-util xcb-res xcb-shape xcb-util xcb-xkb xcb-xinerama)
-        # pass 1: 收集缺失并对 Debian 系尝试自愈安装
-        for _pc in "${_pc_list[@]}"; do
-            if ! pkg-config --exists "$_pc" 2>/dev/null; then
-                warn "$(_t "niri build prerequisite missing: " "niri build prerequisite missing: ") $_pc.pc"
-                _missing_pcs+=("$_pc.pc")
-                if [ "$DISTRO_FAMILY" = debian ] && [ "$DRY_RUN" -eq 0 ]; then
-                    _pc_auto_install "$_pc"
-                fi
-            fi
-        done
-        # pass 2: 自愈后重新校验，产出最终缺失清单
-        local _pc2 _still_missing=()
-        for _pc2 in "${_pc_list[@]}"; do
-            if ! pkg-config --exists "$_pc2" 2>/dev/null; then
-                _still_missing+=("$_pc2.pc")
-            fi
-        done
-        if [ ${#_still_missing[@]} -gt 0 ]; then
-            error "$(_t "niri — required system libraries still missing: " "niri — required system libraries still missing: ") ${_still_missing[*]}$(_t " — install the -dev/-devel packages, then rerun: $NIRI_GH" " — install the -dev/-devel packages, then rerun: $NIRI_GH")"
-            MANUAL_ITEMS+=("niri — 系统库缺失: ${_still_missing[*]}（.pc 未找到，已尝试自动安装对应 -dev 包仍失败）; 手动安装后重跑: $NIRI_GH")
-            return 1
-        fi
-        [ ${#_missing_pcs[@]} -gt 0 ] && log "$(_t "pkg-config pre-check passed after auto-install." "pkg-config pre-check passed after auto-install.")"
-    else
-        warn "$(_t "pkg-config not found; skipping niri build prerequisite check" "pkg-config not found; skipping niri build prerequisite check")"
+            xcb-present xcb-render-util xcb-res xcb-shape xcb-util xcb-xkb xcb-xinerama; then
+        error "$(_t "niri — required system libraries still missing: " "niri — required system libraries still missing: ") ${PC_STILL_MISSING[*]}$(_t " — install the -dev/-devel packages, then rerun: $NIRI_GH" " — install the -dev/-devel packages, then rerun: $NIRI_GH")"
+        MANUAL_ITEMS+=("niri — 系统库缺失: ${PC_STILL_MISSING[*]}（.pc 未找到，已尝试自动安装对应 -dev 包仍失败）; 手动安装后重跑: $NIRI_GH")
+        return 1
     fi
+    [ "$PC_AUTO_INSTALLED" -gt 0 ] && log "$(_t "pkg-config pre-check passed after auto-install." "pkg-config pre-check passed after auto-install.")"
 
     # Build in background so the rest of the install (packages/services/config) proceeds meanwhile
     log "$(_t "Building niri in background; continuing install..." "Building niri in background; continuing install...")"
@@ -1726,11 +1747,17 @@ install_awww() {
     # dav1d/lz4 runtime libs are best effort.
     local bdeps_rc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
-        apt_install_tolerant git libwayland-dev wayland-protocols liblz4-dev || bdeps_rc=$?
+        apt_install_tolerant git libwayland-dev wayland-protocols liblz4-dev \
+            libxkbcommon-dev libdav1d-dev || bdeps_rc=$?
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
             warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
         exe apt-get install -y libdav1d6 2>/dev/null || true
+        # pkg-config 预检 + 自愈：wayland-client / xkbcommon / lz4 / dav1d 缺哪个自动装哪个
+        if ! ensure_pc_deps wayland-client xkbcommon lz4 dav1d; then
+            MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（.pc 未找到，已尝试自动安装仍失败）; 手动安装后重跑: $AWWW_REPO")
+            return 1
+        fi
     else
         exe dnf install -y git wayland-devel wayland-protocols-devel lz4-devel || bdeps_rc=$?
         exe dnf install -y dav1d lz4 2>/dev/null || true
@@ -2009,12 +2036,19 @@ install_xwayland_satellite() {
     if ! command -v Xwayland >/dev/null 2>&1; then
         pm_install xwayland 2>/dev/null || warn "$(_t "xwayland package not available; xwayland-satellite needs Xwayland at runtime." "xwayland package not available; xwayland-satellite needs Xwayland at runtime.")"
     fi
-    # build deps: upstream needs clang (bindgen) + xcb-cursor dev headers + git (cargo --git)
+    # build deps: upstream needs clang (bindgen) + xcb-cursor dev headers + git (cargo --git);
+    # wayland-client / xkbcommon / xcb-util .pc 也由下面的 ensure_pc_deps 兜底
     local bdeps_rc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
-        apt_install_tolerant git clang libclang-dev libxcb-cursor-dev || bdeps_rc=$?
+        apt_install_tolerant git clang libclang-dev libxcb-cursor-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libxcb-util-dev || bdeps_rc=$?
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
             warn "$(_t "Some xwayland-satellite build deps unavailable (continuing):" "Some xwayland-satellite build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+        fi
+        # pkg-config 预检 + 自愈：wayland-client / xkbcommon / xcb-cursor 缺哪个自动装哪个
+        if ! ensure_pc_deps wayland-client xkbcommon xcb-cursor; then
+            MANUAL_ITEMS+=("xwayland-satellite — 系统库缺失: ${PC_STILL_MISSING[*]}（.pc 未找到，已尝试自动安装仍失败）; 手动安装后重跑: $XWS_REPO")
+            return 1
         fi
     else
         exe dnf install -y git clang libxcb-cursor-devel || bdeps_rc=$?
