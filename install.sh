@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.13"
+SCRIPT_VERSION="1.9.16"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -222,7 +222,7 @@ declare -A GROUP_PKGS=(
     [lock]="hyprlock hypridle"
     [wallpaper]="awww waypaper"
     [clip]="copyq satty grim slurp"
-    [media]="playerctl brightnessctl"
+    [media]="playerctl brightnessctl btop"
     [audio]="pipewire-pulse wireplumber"
     [ime]="fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git"
     [fonts]="ttf-jetbrains-mono-nerd wqy-zenhei"
@@ -593,7 +593,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v28"
+PROGRESS_VERSION="v31"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -2012,6 +2012,91 @@ install_awww_from_build() { # $1 = srcdir, $2 = logfile
     return 1
 }
 
+# 壁纸缺失自愈：参考机的壁纸图片不在 configs/ 内，新机器上 awww-daemon 无图可设，
+# 导致壁纸不生效（awww-daemon 必须启动时就有壁纸状态，见 mylinuxforwork/dotfiles#1574）。
+# 优先使用仓库根目录的壁纸图（复制到 ~/.local/share/backgrounds/，同时作为锁屏壁纸），
+# 没有则找现有图片，再没有就生成一张深蓝紫渐变 PNG（python3 标准库，无 PIL 依赖）；
+# 写入 awww 状态文件 ~/.config/awww/wallpaper 供 awww-daemon 加载；
+# 修正 waypaper config.ini 与 hyprlock.conf（锁屏壁纸）里指向参考机的绝对路径。
+_ensure_wallpaper() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    command -v awww >/dev/null 2>&1 || return 0   # awww 缺失由 install_awww 处理
+    [ -s "$HOME_DIR/.config/awww/wallpaper" ] 2>/dev/null && return 0
+
+    local _img="" _cand _ext=""
+    # 1) 仓库根目录的壁纸图（用户放在 install.sh 旁边的图片）优先
+    for _cand in "$BASE_DIR"/*.jpg "$BASE_DIR"/*.jpeg "$BASE_DIR"/*.png "$BASE_DIR"/*.webp; do
+        [ -f "$_cand" ] || continue
+        case "$_cand" in *.jpg|*.jpeg) _ext=jpg;; *.png) _ext=png;; *.webp) _ext=webp;; *) continue;; esac
+        mkdir -p "$HOME_DIR/.local/share/backgrounds"
+        _img="$HOME_DIR/.local/share/backgrounds/wallpaper.$_ext"
+        if [ ! -f "$_img" ] || ! cmp -s "$_cand" "$_img" 2>/dev/null; then
+            cp -f "$_cand" "$_img" 2>/dev/null || true
+        fi
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_img" 2>/dev/null || true
+        log "$(_t "Wallpaper deployed from repo: " "Wallpaper deployed from repo: ") $(basename "$_cand") -> $_img"
+        break
+    done
+    # 2) 仓库没有图 → 用现有图片
+    if [ -z "$_img" ]; then
+        for _cand in "$HOME_DIR"/Pictures/*.png "$HOME_DIR"/Pictures/*.jpg "$HOME_DIR"/Pictures/*.jpeg \
+                     "$HOME_DIR"/.local/share/backgrounds/*.png "$HOME_DIR"/.local/share/backgrounds/*.jpg; do
+            [ -f "$_cand" ] && { _img="$_cand"; break; }
+        done
+    fi
+    # 3) 都没有 → 生成默认渐变壁纸
+    if [ -z "$_img" ]; then
+        _img="$HOME_DIR/.local/share/backgrounds/eilniri-default.png"
+        mkdir -p "$(dirname "$_img")"
+        log "$(_t "No wallpaper found — generating a default gradient wallpaper..." "No wallpaper found — generating a default gradient wallpaper...")"
+        exe python3 - "$_img" <<'PYEOF' 2>/dev/null || true
+import struct, zlib, sys
+w, h = 1920, 1080
+out = sys.argv[1]
+def chunk(t, data):
+    c = t + data
+    return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+raw = bytearray()
+for y in range(h):
+    raw.append(0)
+    for x in range(w):
+        t = y / h
+        raw.extend((int(18 + 30*t), int(28 + 55*t), int(58 + 130*t)))
+png = b'\x89PNG\r\n\x1a\n'
+png += chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+png += chunk(b'IDAT', zlib.compress(bytes(raw), 6))
+png += chunk(b'IEND', b'')
+open(out, 'wb').write(png)
+PYEOF
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_img" 2>/dev/null || true
+    fi
+
+    if [ -f "$_img" ]; then
+        mkdir -p "$HOME_DIR/.config/awww"
+        printf '%s\n' "$_img" > "$HOME_DIR/.config/awww/wallpaper"
+        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/awww" 2>/dev/null || true
+        log "$(_t "Wallpaper state written: " "Wallpaper state written: ") $_img"
+        # 修正 waypaper config.ini 里指向参考机的绝对路径（新机器上不存在则换成壁纸图）
+        local _wpconf="$HOME_DIR/.config/waypaper/config.ini"
+        if [ -f "$_wpconf" ] && grep -qE '^wallpaper\s*=' "$_wpconf" 2>/dev/null; then
+            local _oldwp
+            _oldwp=$(grep -E '^wallpaper\s*=' "$_wpconf" | head -n1 | cut -d= -f2- | tr -d ' \r')
+            if [ -n "$_oldwp" ] && [ ! -f "$_oldwp" ]; then
+                log "$(_t "waypaper config.ini points to missing path " "waypaper config.ini points to missing path ") $_oldwp$(_t " -> " " -> ") $_img"
+                sed -i "s#^wallpaper\s*=.*#wallpaper = $_img#" "$_wpconf" 2>/dev/null || true
+                chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_wpconf" 2>/dev/null || true
+            fi
+        fi
+        # 修正 hyprlock 锁屏壁纸路径（参考机绝对路径在新机器上无效 → 锁屏背景空白）
+        local _hlconf="$HOME_DIR/.config/hypr/hyprlock.conf"
+        if [ -f "$_hlconf" ] && grep -qE '^\s*path\s*=' "$_hlconf" 2>/dev/null; then
+            log "$(_t "hyprlock wallpaper path -> " "hyprlock wallpaper path -> ") $_img"
+            sed -i -E "s#^(\s*path\s*=).*#\1 $_img#" "$_hlconf" 2>/dev/null || true
+            chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_hlconf" 2>/dev/null || true
+        fi
+    fi
+}
+
 # --- satty install (Debian/RHEL families; no package) ---
 # Strategy: 1) official prebuilt binary from GitHub releases (satty-<arch>-unknown-linux-gnu.tar.gz)
 #           2) cargo install fallback (needs GTK4/libadwaita/librsvg dev packages) 3) manual report
@@ -2915,6 +3000,12 @@ install_zsh_extras() {
             INSTALLED_PKGS+=("starship")
         else
             MANUAL_ITEMS+=("starship — install failed; run: curl -sSfL https://starship.rs/install.sh | sh -s -- -y")
+            # 兜底：.zshrc 是 ZSH_THEME="" + starship 的组合，starship 不可用时提示符会零美化。
+            # 把 ZSH_THEME 从空改成 OMZ 默认主题，保证至少有一个主题美化。
+            if [ -f "$HOME_DIR/.zshrc" ] && grep -q '^ZSH_THEME=""' "$HOME_DIR/.zshrc" 2>/dev/null; then
+                sed -i 's/^ZSH_THEME=""/ZSH_THEME="robbyrussell"/' "$HOME_DIR/.zshrc" 2>/dev/null || true
+                log "$(_t "starship unavailable — fallback ZSH_THEME=robbyrussell" "starship unavailable — fallback ZSH_THEME=robbyrussell")"
+            fi
         fi
     fi
 
@@ -3057,6 +3148,9 @@ stage_configs() {
             as_user systemctl --user daemon-reload 2>/dev/null || true
             as_user systemctl --user enable --now waypaper.service waypaper-random.timer 2>/dev/null || true
         fi
+
+        # 壁纸自愈：awww 已装则确保有壁纸状态文件（生成默认渐变壁纸 / 修正 waypaper 路径）
+        _ensure_wallpaper
     fi
 
     # fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
