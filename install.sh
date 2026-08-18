@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.9"
+SCRIPT_VERSION="1.9.11"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -593,7 +593,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v24"
+PROGRESS_VERSION="v26"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -1333,6 +1333,13 @@ _repair_niri_session() {
             mkdir -p /usr/local/share/wayland-sessions /usr/share/wayland-sessions
             exe install -Dm644 "$desktop_file" /usr/local/share/wayland-sessions/niri.desktop
             exe install -Dm644 "$desktop_file" /usr/share/wayland-sessions/niri.desktop
+            # 顺手补上 systemd user units（GDM 登录循环的根因：缺 niri.service）
+            mkdir -p /usr/lib/systemd/user
+            local _unit
+            for _unit in "$work"/*/resources/*.service "$work"/*/resources/*.target; do
+                [ -f "$_unit" ] || continue
+                exe install -Dm644 "$_unit" "/usr/lib/systemd/user/$(basename "$_unit")" 2>/dev/null || true
+            done
             INSTALLED_PKGS+=("niri (session file repaired from source v$ver)")
             success "$(_t "niri session file repaired" "niri session file repaired")"
             return 0
@@ -1837,6 +1844,20 @@ install_niri_from_build() { # $1 = srcdir, $2 = logfile
         exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/local/share/wayland-sessions/niri.desktop 2>/dev/null || true
         exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/share/wayland-sessions/niri.desktop 2>/dev/null || true
         exe install -Dm644 "$srcdir/resources/niri-portals.conf" /usr/local/share/xdg-desktop-portal/niri-portals.conf 2>/dev/null || true
+        # 关键：niri-session 用 systemd user session 启动 niri（systemctl --user start niri.service）。
+        # 必须把 niri 源码 resources/ 里的 systemd user unit 装到 /usr/lib/systemd/user/，
+        # 否则 GDM 登录时 "Unit niri.service not found" → niri 起不来 → 跳回登录界面（登录循环）。
+        local _unit _unit_installed=0
+        mkdir -p /usr/lib/systemd/user
+        for _unit in "$srcdir"/resources/*.service "$srcdir"/resources/*.target "$srcdir"/resources/niri.session; do
+            [ -f "$_unit" ] || continue
+            exe install -Dm644 "$_unit" "/usr/lib/systemd/user/$(basename "$_unit")" 2>/dev/null && _unit_installed=1
+        done
+        if [ "$_unit_installed" -eq 1 ]; then
+            log "$(_t "niri systemd user units installed (/usr/lib/systemd/user)" "niri systemd user units installed (/usr/lib/systemd/user)")"
+        else
+            warn "$(_t "niri systemd user units not found in source resources/ — GDM 登录可能循环; 手动创建 /usr/lib/systemd/user/niri.service 与 niri-shutdown.target" "niri systemd user units not found in source resources/ — GDM 登录可能循环; 手动创建 /usr/lib/systemd/user/niri.service 与 niri-shutdown.target")"
+        fi
         INSTALLED_PKGS+=("niri (source build)")
         success "$(_t "niri built from source" "niri built from source")"
         return 0
@@ -2916,6 +2937,29 @@ stage_configs() {
     # enable waypaper user services (wallpaper restore on login + random-change timer),
     # deployed from configs/.config/systemd/user/. Only when waypaper was selected.
     if [ "$DRY_RUN" -eq 0 ]; then
+        # 修正 user unit 里 ExecStart 的二进制绝对路径：参考机是 Arch，二进制多在
+        # /usr/bin；Debian/RHEL 系 pip(--user)、源码构建装到的可能是 /usr/local/bin
+        # 或 ~/.local/bin。路径对不上会 "Failed at step EXEC spawning ... No such file"
+        # （waypaper/hypridle 都中过招）。按 basename 在三个常见位置找真实二进制并改写。
+        local _sf _exe _base _new _cand
+        for _sf in "$HOME_DIR"/.config/systemd/user/*.service; do
+            [ -f "$_sf" ] || continue
+            while IFS= read -r _exe; do
+                _exe=${_exe%% *}                    # 去掉尾部参数
+                case "$_exe" in /*) ;; *) continue ;; esac
+                [ -x "$_exe" ] && continue          # 路径存在就不用改
+                _base=$(basename "$_exe")
+                _new=""
+                for _cand in /usr/bin/$_base /usr/local/bin/$_base "$HOME_DIR/.local/bin/$_base"; do
+                    [ -x "$_cand" ] && { _new="$_cand"; break; }
+                done
+                if [ -n "$_new" ]; then
+                    log "$(_t "fix ExecStart in " "fix ExecStart in ") $(basename "$_sf")$(_t ": " ": ") $_exe -> $_new"
+                    sed -i "s#^ExecStart=$_exe#ExecStart=$_new#" "$_sf" 2>/dev/null || true
+                fi
+            done < <(sed -n 's/^ExecStart=//p' "$_sf" 2>/dev/null)
+        done
+
         local _has_wp=0
         for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
             [ "$_p" = "waypaper" ] && _has_wp=1
