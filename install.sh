@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.6"
+SCRIPT_VERSION="1.9.9"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -502,6 +502,7 @@ DESKTOP_EOF
 
 DISTRO_FAMILY=""   # arch | rhel | debian
 DISTRO_ID=""       # os-release ID (e.g. ubuntu, debian, arch)
+DISTRO_ID_LIKE=""  # os-release ID_LIKE (detect Ubuntu-derived distros like openkylin/deepin)
 UBUNTU_VER_NUM=0   # numeric Ubuntu version (e.g. 2404), 0 = not Ubuntu
 TARGET_USER=""
 HOME_DIR=""
@@ -522,6 +523,7 @@ detect_distro() {
         id_like=$(. /etc/os-release; echo "${ID_LIKE:-}")
     fi
     DISTRO_ID="$id"
+    DISTRO_ID_LIKE="$id_like"
     case " $id $id_like " in
         *arch*|*manjaro*|*endeavouros*) DISTRO_FAMILY=arch ;;
         *rhel*|*fedora*|*centos*)       DISTRO_FAMILY=rhel ;;
@@ -591,7 +593,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v21"
+PROGRESS_VERSION="v24"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -891,7 +893,8 @@ stage_preflight() {
                 # Ubuntu: the niri-suite packages (fuzzel, mako-notifier, waybar, fcitx5-rime, hyprlock, ...) live in
                 # universe, which is NOT enabled by default on Ubuntu Server/minimal/cloud images. Enable it automatically
                 # (硬校验：启用后必须能看到 universe 包，否则警告并给出手动命令）。
-                if [ "$DISTRO_ID" = ubuntu ]; then
+                # 注意：openkylin/deepin 等 Ubuntu 衍生版 ID 不是 ubuntu，但同样需要 universe。
+                if _is_ubuntu_like; then
                     if _ensure_ubuntu_universe; then
                         log "$(_t "universe component OK." "universe component OK.")"
                     else
@@ -1344,11 +1347,35 @@ _repair_niri_session() {
 # 哪个存在装哪个），装完重新校验；仍缺则把清单放进 PC_STILL_MISSING。
 PC_STILL_MISSING=()
 PC_AUTO_INSTALLED=0
+PC_NO_CANDIDATE=0   # _pc_auto_install 未找到任何 apt 候选包时置 1
 PC_FAIL_HINT=""   # ensure_pc_deps 失败时的原因说明（apt 报错尾部 / 候选包不在列表等）
+# 已知的 .pc 命名分歧补丁：Ubuntu 26.04 的 libxcb-render-util0-dev 装的是上游原名
+# xcb-renderutil.pc，而 Debian 系传统命名（和 niri 构建探测）用 xcb-render-util.pc。
+# 双向补符号链接，让两种名字都能被 pkg-config 解析。
+_pc_alias_patch() {
+    local _dir
+    for _dir in /usr/lib/*/pkgconfig /usr/lib/pkgconfig /usr/share/pkgconfig; do
+        [ -d "$_dir" ] || continue
+        [ -f "$_dir/xcb-renderutil.pc" ] && [ ! -e "$_dir/xcb-render-util.pc" ] \
+            && ln -sf xcb-renderutil.pc "$_dir/xcb-render-util.pc" 2>/dev/null
+        [ -f "$_dir/xcb-render-util.pc" ] && [ ! -e "$_dir/xcb-renderutil.pc" ] \
+            && ln -sf xcb-render-util.pc "$_dir/xcb-renderutil.pc" 2>/dev/null
+    done
+}
 # 确保 Ubuntu 的 universe 组件已启用（很多构建 -dev 包在 universe，如 libxcb-render-util0-dev）。
 # 返回 0 = universe 可见；1 = 仍不可见。
+# 是否为 Ubuntu 或 Ubuntu 衍生发行版（openkylin/deepin/UOS 等 ID_LIKE 含 ubuntu）
+_is_ubuntu_like() {
+    case " $DISTRO_ID $DISTRO_ID_LIKE " in
+        *" ubuntu "*) return 0 ;;
+        *" linuxmint "*) return 0 ;;
+        *" pop "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 _ensure_ubuntu_universe() {
-    [ "$DISTRO_ID" = ubuntu ] || return 0
+    _is_ubuntu_like || return 0
     # 已能看到 universe 包就算启用（两个代表性包）
     apt-cache show libxcb-render-util0-dev >/dev/null 2>&1 && return 0
     apt-cache show mako-notifier >/dev/null 2>&1 && return 0
@@ -1368,7 +1395,15 @@ _ensure_ubuntu_universe() {
             }
         done
     fi
+    # 捕获 update 输出：若成功但索引里没有 universe 行，说明当前源/镜像不含 universe 组件
+    local _upout _univ_lines
+    _upout=$(apt-get update 2>&1)
     exe apt-get update 2>>"$LOG_DIR/apt-errors.log" || true
+    _univ_lines=$(printf '%s\n' "$_upout" | grep -iE 'universe' | head -n 3)
+    if [ -z "$_univ_lines" ] && ! apt-cache show mako-notifier >/dev/null 2>&1; then
+        warn "$(_t "apt-get update 未获取到 universe 索引（当前源/镜像可能不含 universe 组件）— 需要换源或手动确认 sources。当前源:" "apt-get update 未获取到 universe 索引（当前源/镜像可能不含 universe 组件）— 需要换源或手动确认 sources。当前源:")"
+        grep -hE '^(URIs|Components):' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null | head -n 6 || true
+    fi
     apt-cache show libxcb-render-util0-dev >/dev/null 2>&1 || apt-cache show mako-notifier >/dev/null 2>&1
 }
 _pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔）
@@ -1419,6 +1454,7 @@ _pc_auto_install() { # $1 = .pc 名（Debian 系专用）
         # 候选包一个都不在 apt 列表里 → 大概率 universe 未启用（这些 -dev 包多在
         # universe，如 libxcb-render-util0-dev）或源列表缺失；启用 universe 后重试一轮
         if [ "$_found" -eq 0 ] && [ "$_try" -eq 1 ]; then
+            PC_NO_CANDIDATE=1
             warn "$(_t "No apt candidate for " "No apt candidate for ") $1$(_t " — 尝试启用 universe 并刷新索引..." " — 尝试启用 universe 并刷新索引...")"
             _ensure_ubuntu_universe || true
             _found=0
@@ -1426,10 +1462,30 @@ _pc_auto_install() { # $1 = .pc 名（Debian 系专用）
             break
         fi
     done
+    # 兜底：包已装但 pkg-config 仍找不到（.pc 在磁盘但不在搜索路径 / Requires 依赖缺失）——
+    # 在磁盘上找到 .pc 就把所在目录加入 PKG_CONFIG_PATH（cargo 构建继承该环境变量）
+    if ! pkg-config --exists "$1" 2>/dev/null; then
+        local _pcerr2
+        _pcerr2=$(pkg-config --print-errors "$1" 2>&1 | tail -n 1)
+        local _pcf _pcdir
+        _pcf=$(find /usr /lib /opt -name "$1.pc" -type f 2>/dev/null | head -n 1)
+        if [ -n "$_pcf" ]; then
+            _pcdir=$(dirname "$_pcf")
+            case ":${PKG_CONFIG_PATH:-}:" in
+                *":$_pcdir:"*) ;;
+                *) export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$_pcdir" ;;
+            esac
+            log "$(_t "Found " "Found ") $1.pc$(_t " at " " at ") $_pcf$(_t " — added " " — added ") $_pcdir$(_t " to PKG_CONFIG_PATH" " to PKG_CONFIG_PATH")"
+            pkg-config --exists "$1" 2>/dev/null && return 0
+        else
+            warn "$(_t "pkg-config error for " "pkg-config error for ") $1.pc: $_pcerr2"
+        fi
+    fi
     return 1
 }
 ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_STILL_MISSING 列出）
     PC_STILL_MISSING=()
+    _pc_alias_patch   # xcb-renderutil.pc ↔ xcb-render-util.pc 命名分歧兼容
     command -v pkg-config >/dev/null 2>&1 || pm_install pkg-config 2>/dev/null || true
     command -v pkg-config >/dev/null 2>&1 || return 1
     local _attempt=0 _pc
@@ -1451,14 +1507,16 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
             fi
         done
         [ ${#PC_STILL_MISSING[@]} -eq 0 ] && return 0
-        # 仍缺且 apt 报镜像/源故障特征（404 / 无法下载 / 找不到包 / Release 过期）→
-        # 先查时钟，再换源重试一轮（最多一次）
+        # 仍缺且 (a) apt 报镜像/源故障特征，或 (b) 候选包根本不在 apt 列表（universe 缺失/
+        # 源列表陈旧，apt 无报错）→ 先查时钟，再换源重试一轮（最多一次）
         if [ "$_attempt" -eq 0 ] && [ "$DISTRO_FAMILY" = debian ] && [ "$DRY_RUN" -eq 0 ] \
-            && grep -qiE '404|无法下载|Failed to fetch|Unable to fetch|Unable to locate package|has no installation candidate|Release 文件已经过期|expired|Valid-Until' "$LOG_DIR/apt-errors.log" 2>/dev/null; then
+            && { [ "$PC_NO_CANDIDATE" -eq 1 ] \
+                 || grep -qiE '404|无法下载|Failed to fetch|Unable to fetch|Unable to locate package|has no installation candidate|Release 文件已经过期|expired|Valid-Until' "$LOG_DIR/apt-errors.log" 2>/dev/null; }; then
             check_clock_drift
             if confirm "$(_t "apt cannot fetch some packages (mirror/source issue) — switch mirror and retry? [Y/n] (default Y):" "apt cannot fetch some packages (mirror/source issue) — switch mirror and retry? [Y/n] (default Y):")" "Y" 10 2>/dev/null; then
                 if set_debian_mirror; then
                     _attempt=1
+                    PC_NO_CANDIDATE=0
                     log "$(_t "Retrying .pc pre-check after mirror switch..." "Retrying .pc pre-check after mirror switch...")"
                     continue
                 fi
