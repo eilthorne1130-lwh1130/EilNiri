@@ -314,17 +314,22 @@ declare -A SOURCE_PKGS=(
 # hyprlock / hypridle system build dependencies (Debian/Ubuntu names).
 # NOTE: upstream migrated hyprlock/hypridle from Rust to C++/CMake (repos no longer
 # contain a Cargo.toml), so the list covers BOTH the old Rust build and the new CMake
-# build. Missing entries are tolerated (apt_install_tolerant / dnf_install_tolerant),
-# so a package absent on an older release never aborts the whole build-deps step.
-HYPR_BUILD_DEPS_DEB=(build-essential cmake ninja-build pkg-config git libwayland-dev wayland-protocols
+# build. On distros where the hypr C++ stack (hyprwayland-scanner/hyprutils/hyprlang/
+# hyprgraphics/hyprcursor) is NOT packaged (Rocky/Alma/CentOS Stream), those deps are
+# absent and build_hypr_stack() compiles them from source in dependency order first.
+# Missing entries are tolerated (apt_install_tolerant / dnf_install_tolerant), so a
+# package absent on an older release never aborts the whole build-deps step.
+HYPR_BUILD_DEPS_DEB=(build-essential cmake ninja-build pkg-config git libwayland-dev wayland-protocols hyprland-protocols
     libpango1.0-dev libgbm-dev libdrm-dev libxkbcommon-dev libxcb1-dev
-    libcairo2-dev libpam0g-dev
+    libcairo2-dev libpam0g-dev libpixman-1-dev libjpeg-dev libwebp-dev
+    librsvg2-dev libmagic-dev libpng-dev libpugixml-dev
     libhyprutils-dev libhyprlang-dev libhyprgraphics-dev libhyprcursor-dev
     libsdbus-c++-dev hyprwayland-scanner)
 # hyprlock / hypridle system build dependencies (RHEL family names)
-HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git wayland-devel wayland-protocols-devel
-    pango-devel mesa-libgbm-devel mesa-libEGL-devel libdrm-devel libxkbcommon-devel libxcb-devel
-    cairo-gobject-devel libpam-devel
+HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git wayland-devel wayland-protocols-devel hyprland-protocols
+    pango-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel libdrm-devel libxkbcommon-devel libxcb-devel
+    cairo-gobject-devel cairo-devel libpam-devel pixman-devel libjpeg-turbo-devel libwebp-devel
+    librsvg2-devel file-devel libpng-devel pugixml-devel
     hyprutils-devel hyprlang-devel hyprgraphics-devel hyprcursor-devel
     sdbus-c++-devel hyprwayland-scanner)
 
@@ -2088,16 +2093,18 @@ install_awww() {
             return 1
         fi
     else
-        # RHEL: awww's common crate links xkbcommon + lz4 + dav1d (all need -devel .pc);
-        # tolerant so a missing name (e.g. dav1d-devel on older EL) never aborts the batch.
+        # RHEL: awww's common crate links xkbcommon + lz4 (mandatory); dav1d is an
+        # optional runtime codec, so only lz4/xkbcommon are hard pre-checks. Tolerant
+        # so a missing name (e.g. dav1d-devel on older EL) never aborts the batch.
         dnf_install_tolerant git wayland-devel wayland-protocols-devel lz4-devel \
             xkbcommon-devel dav1d-devel || bdeps_rc=$?
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
             warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
         exe dnf install -y dav1d lz4 2>/dev/null || true
-        # pkg-config 预检（RHEL 只校验不自愈）：wayland-client / xkbcommon / liblz4 / dav1d
-        if ! ensure_pc_deps wayland-client xkbcommon liblz4 dav1d; then
+        # pkg-config 预检（RHEL 只校验不自愈）：wayland-client / xkbcommon / liblz4
+        # 必装；dav1d 可选，缺了不阻塞（awww 仍能编译/运行）。
+        if ! ensure_pc_deps wayland-client xkbcommon liblz4; then
             MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -devel 包后重跑: $AWWW_REPO")
             return 1
         fi
@@ -2426,9 +2433,15 @@ install_rime_ice() {
         return 1
     fi
 
-    # fcitx5-rime must exist for this to be useful
+    # fcitx5-rime must exist for this to be useful — try to install it first, since
+    # it can be absent if the ime group selection skipped it or its dnf/apt install
+    # was deferred (rime-ice-pinyin-git is only usable with the rime engine present).
     if ! pkg_installed fcitx5-rime; then
-        MANUAL_ITEMS+=("rime-ice — fcitx5-rime not installed, skip deploy")
+        log "$(_t "fcitx5-rime not installed — installing it before deploying rime-ice..." "fcitx5-rime not installed — installing it before deploying rime-ice...")"
+        pm_install fcitx5-rime 2>>"$LOG_DIR/pkg-errors.log"
+    fi
+    if ! pkg_installed fcitx5-rime; then
+        MANUAL_ITEMS+=("rime-ice — fcitx5-rime not installed (and could not be installed), skip deploy")
         return 1
     fi
     if ! command -v unzip &>/dev/null; then
@@ -2564,6 +2577,61 @@ install_xwayland_satellite() {
     return 1
 }
 
+# Build the hypr C++ build-tool stack that hyprlock/hypridle require, from source,
+# in dependency order. On distros where the stack is packaged (Fedora base, Ubuntu
+# 25.10+/Debian 13+ universe) these -devel packages were already installed above and
+# this whole function is a no-op. On Rocky/Alma/CentOS Stream none of it is packaged,
+# so we compile hyprwayland-scanner -> hyprutils -> hyprlang -> hyprgraphics and
+# install each to /usr (cmake configs land in /usr/lib64/cmake/), letting each later
+# component's find_package/hyprutils-config.cmake resolve in the default search path.
+# Each component is skipped if it is already resolvable (installed as a package).
+build_hypr_stack() {
+    [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
+    local _log="$LOG_DIR/hypr-stack.log"
+    local _work
+    _work=$(mktemp -d)
+    register_temp_path "$_work"
+
+    # Build+install one component into /usr. Returns 0 on success.
+    _build_hypr_one() { # $1 = name
+        local n="$1"
+        if git_clone_gh "https://github.com/hyprwm/$n" "$_work/$n" >/dev/null 2>&1 \
+           && ( cd "$_work/$n" \
+                && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr . \
+                && cmake --build build -j"$(nproc)" \
+                && cmake --install build ) >> "$_log" 2>&1; then
+            INSTALLED_PKGS+=("hypr-$n (source build)")
+            log "$(_t "Built " "Built ") hypr-$n$(_t " from source" " from source")"
+            return 0
+        fi
+        return 1
+    }
+
+    # Skip a component when the packaged -devel is already available:
+    #   hyprwayland-scanner  -> `hyprwayland-scanner` binary on PATH
+    #   hyprutils/hyprlang/...-> its cmake config under /usr/lib{,64}/cmake/<name>/
+    _hypr_ok() { # $1 = name (also the cmake config dir basename)
+        local n="$1" d
+        case "$n" in
+            hyprwayland-scanner) command -v hyprwayland-scanner >/dev/null 2>&1 && return 0 ;;
+            *)
+                for d in /usr/lib/cmake/"$n" /usr/lib64/cmake/"$n" /usr/local/lib/cmake/"$n" /usr/local/lib64/cmake/"$n"; do
+                    [ -d "$d" ] && find "$d" -maxdepth 1 -iname '*.cmake' 2>/dev/null | grep -qi . && return 0
+                done
+                ;;
+        esac
+        return 1
+    }
+
+    # Strict dependency order. hyprcursor is not required by hyprlock/hypridle builds,
+    # so don't force it (keeps the chain shorter and less likely to fail).
+    _hypr_ok hyprwayland-scanner "hyprwayland" || _build_hypr_one hyprwayland-scanner || return 1
+    _hypr_ok hyprutils "hyprutils" || _build_hypr_one hyprutils || return 1
+    _hypr_ok hyprlang "hyprlang" || _build_hypr_one hyprlang || return 1
+    _hypr_ok hyprgraphics "hyprgraphics" || _build_hypr_one hyprgraphics || return 1
+    return 0
+}
+
 # --- hyprlock / hypridle source build (fallback when no apt/dnf package) ---
 # Used for any package listed in SOURCE_PKGS. Clones the upstream repo (CN-mirror
 # aware), installs the hyprwm build deps tolerantly, then builds — auto-detecting
@@ -2619,11 +2687,14 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         ( cd "$work/$pkg" && cargo build --release ) > "$logf" 2>&1
         _bin="$work/$pkg/target/release/$pkg"
     elif [ -f "$work/$pkg/CMakeLists.txt" ]; then
-        # CMake build needs hyprwayland-scanner + hyprlang/hyprgraphics/hyprcursor/
-        # sdbus-c++ -devel; absent ones were reported above as BDEPS_MISSING and the
-        # build will fail here — a clear manual hint follows instead of a cargo error.
+        # CMake build needs hyprwayland-scanner + hyprlang/hyprgraphics/hyprutils;
+        # build the hypr C++ stack from source iff those aren't already packaged.
+        if ! build_hypr_stack; then
+            MANUAL_ITEMS+=("$pkg — hypr C++ build stack (hyprwayland-scanner/hyprutils/hyprlang/hyprgraphics) could not be built; see $LOG_DIR/hypr-stack.log. Build manually: $repo")
+            return 1
+        fi
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
-        ( cd "$work/$pkg" && cmake -B build -DCMAKE_BUILD_TYPE=Release . \
+        ( cd "$work/$pkg" && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr . \
             && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
         _bin="$work/$pkg/build/$pkg"
     else
