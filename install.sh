@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.20"
+SCRIPT_VERSION="1.9.21"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -615,7 +615,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v35"
+PROGRESS_VERSION="v36"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -3224,10 +3224,11 @@ stage_configs() {
 
         # waybar 去重：niri config 用 spawn-at-startup "waybar" 时，只保留 niri 这一个启动
         # 来源，彻底清除 systemd 侧的 waybar.service（无论文件在用户/系统 user 目录、有无
-        # enable 链接）——否则开机 niri spawn 一个 + systemd 启一个 = 两个 waybar。
+        # enable 链接），并杀掉运行中残留的 waybar 进程——否则开机 niri spawn 一个 +
+        # 残留 systemd/手动实例 = 两个 waybar。
         if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
             && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
-            log "$(_t "niri spawns waybar at startup — removing systemd waybar.service (dedup)" "niri spawns waybar at startup — removing systemd waybar.service (dedup)")"
+            log "$(_t "niri spawns waybar at startup — removing duplicate waybar (systemd + running)" "niri spawns waybar at startup — removing duplicate waybar (systemd + running)")"
             as_user systemctl --user disable --now waybar.service 2>/dev/null || true
             rm -f "$HOME_DIR/.config/systemd/user/default.target.wants/waybar.service" \
                   "$HOME_DIR/.config/systemd/user/graphical-session.target.wants/waybar.service" \
@@ -3235,6 +3236,35 @@ stage_configs() {
                   /etc/systemd/user/default.target.wants/waybar.service \
                   /etc/systemd/user/waybar.service 2>/dev/null || true
             as_user systemctl --user daemon-reload 2>/dev/null || true
+            # 杀掉运行中的 waybar（无论来源）；重启后 niri 会重新 spawn 唯一的一个。
+            # root 下直接对目标用户进程 pkill，避免残留实例与新实例并存。
+            pkill -u "$TARGET_USER" -x waybar 2>/dev/null || true
+            sleep 1
+            log "$(_t "Killed running waybar instances (niri will spawn one on next login)" "Killed running waybar instances (niri will spawn one on next login)")"
+        fi
+
+        # niri cursor 配置：统一光标主题/尺寸（若配置里没有则注入，KDL 顶层块顺序无关）
+        if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
+            && ! grep -q '^cursor\s*{' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
+            cat >> "$HOME_DIR/.config/niri/config.kdl" <<'EOF'
+
+cursor {
+    xcursor-theme = "Adwaita"
+    xcursor-size = 24
+}
+EOF
+            chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
+            log "$(_t "niri config: cursor block injected" "niri config: cursor block injected")"
+        fi
+
+        # 光标拖影：QEMU/KVM 虚拟机在合成器下常见（无硬件 cursor plane / 软件渲染）。
+        # guest 侧无法根本解决——提示用户调整 VM 显示配置（virtio-gpu + 3D 加速）。
+        if command -v systemd-detect-virt >/dev/null 2>&1; then
+            case "$(systemd-detect-virt 2>/dev/null)" in
+                qemu|kvm)
+                    warn "$(_t "检测到 QEMU/KVM 虚拟机：若鼠标光标仍有拖影，请在 VM 配置把显卡设为 virtio-gpu 并开启 3D 加速（gl=on），或改用 spice 显示协议（spice-vdagent 已安装）。" "QEMU/KVM VM detected: if the mouse cursor still has ghosting/trailing, set the VM display to virtio-gpu with 3D acceleration (gl=on), or use the SPICE display protocol (spice-vdagent is installed).")"
+                    ;;
+            esac
         fi
 
         local _has_wp=0
