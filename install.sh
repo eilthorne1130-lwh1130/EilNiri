@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.18"
+SCRIPT_VERSION="1.9.19"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -440,6 +440,12 @@ collect_config() {
           "$CFG_DIR"/.config/copyq/*.lock \
           "$CFG_DIR"/.config/copyq/.copyq_s \
           "$CFG_DIR"/.config/copyq/copyq.pub 2>/dev/null
+    # 输入法只保留基础功能（profile 启用 fcitx5+rime），去掉候选框皮肤等美化配置
+    # 与无意义缓存（classicui.conf / cached_layouts）。
+    rm -f "$CFG_DIR"/.config/fcitx5/conf/classicui.conf \
+          "$CFG_DIR"/.config/fcitx5/conf/cached_layouts \
+          "$CFG_DIR"/.config/fcitx5/fcitx5/conf/classicui.conf \
+          "$CFG_DIR"/.config/fcitx5/fcitx5/conf/cached_layouts 2>/dev/null
     if [ -n "$HOME" ]; then
         local _prf
         while IFS= read -r _prf; do
@@ -609,7 +615,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v33"
+PROGRESS_VERSION="v34"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -2621,6 +2627,21 @@ install_nerd_font() {
     fi
 }
 
+# QEMU/KVM 虚拟机：安装并启用 spice-vdagent。
+# 解决两个常见问题：① 宿主机↔虚拟机 剪贴板/复制粘贴不通；② 光标在合成器下无硬件
+# cursor plane 时的拖影/残影（spice 提供客户端光标同步）。
+install_vm_agent() {
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("spice-vdagent"); return "$DRY_RUN_RC"; }
+    command -v spice-vdagent >/dev/null 2>&1 && return 0
+    log "$(_t "Installing spice-vdagent (VM clipboard + cursor sync)..." "Installing spice-vdagent (VM clipboard + cursor sync)...")"
+    pm_install spice-vdagent 2>/dev/null || { warn "$(_t "spice-vdagent install failed (non-VM?)" "spice-vdagent install failed (non-VM?)")"; return 0; }
+    # 系统 daemon（spice-vdagentd）与用户会话 agent（spice-vdagent）
+    systemctl enable --now spice-vdagentd 2>/dev/null || true
+    as_user systemctl --user enable --now spice-vdagent 2>/dev/null || true
+    INSTALLED_PKGS+=("spice-vdagent")
+    success "$(_t "spice-vdagent installed" "spice-vdagent installed")"
+}
+
 stage_apps_install() {
     if stage_done apps; then
         log "$(_t "App install stage done, skipping." "App install stage done, skipping.")"
@@ -2642,6 +2663,7 @@ stage_apps_install() {
         debian) install_debian ;;
     esac
     install_nerd_font   # waybar 图标字体（Debian/RHEL 的 apt 包不带 Nerd Font 图标）
+    install_vm_agent    # QEMU/虚拟机：spice-vdagent（剪贴板桥 + 光标同步）
     # Defer the progress mark while background builds (niri/awww) are still running
     # (stage_wait_builds marks the stage complete once they finish), and when anything
     # failed in this run — otherwise a rerun would skip retrying the failed installs.
@@ -3058,13 +3080,14 @@ install_zsh_extras() {
             INSTALLED_PKGS+=("starship")
         else
             MANUAL_ITEMS+=("starship — install failed; run: curl -sSfL https://starship.rs/install.sh | sh -s -- -y")
-            # 兜底：.zshrc 是 ZSH_THEME="" + starship 的组合，starship 不可用时提示符会零美化。
-            # 把 ZSH_THEME 从空改成 OMZ 默认主题，保证至少有一个主题美化。
-            if [ -f "$HOME_DIR/.zshrc" ] && grep -q '^ZSH_THEME=""' "$HOME_DIR/.zshrc" 2>/dev/null; then
-                sed -i 's/^ZSH_THEME=""/ZSH_THEME="robbyrussell"/' "$HOME_DIR/.zshrc" 2>/dev/null || true
-                log "$(_t "starship unavailable — fallback ZSH_THEME=robbyrussell" "starship unavailable — fallback ZSH_THEME=robbyrussell")"
-            fi
         fi
+    fi
+    # 保证 .zshrc 有可用的主题美化：即使 starship 没装上、或参考机配置是空主题，
+    # 也把 ZSH_THEME 设为内置主题（agnoster，nerd font 提供 powerline 符号）。
+    # 若 starship 可用，其 eval 在 .zshrc 末尾会覆盖 PROMPT，主题作为兜底。
+    if [ -f "$HOME_DIR/.zshrc" ] && grep -q '^ZSH_THEME=""' "$HOME_DIR/.zshrc" 2>/dev/null; then
+        sed -i 's/^ZSH_THEME=""/ZSH_THEME="agnoster"/' "$HOME_DIR/.zshrc" 2>/dev/null || true
+        log "$(_t "Set ZSH_THEME=agnoster (oh-my-zsh beautification)" "Set ZSH_THEME=agnoster (oh-my-zsh beautification)")"
     fi
 
     # 4) eza (aliased in .zshrc): repo package first, cargo --root /usr/local as fallback
@@ -3187,18 +3210,19 @@ stage_configs() {
             done < <(sed -n 's/^ExecStart=//p' "$_sf" 2>/dev/null)
         done
 
-        # waybar 去重：niri config 用 spawn-at-startup "waybar" 时，禁用从参考机收集来的
-        # waybar.service（否则 niri spawn 一个 + systemd 启一个 = 屏幕上两个 waybar）。
-        # 同时删掉所有 enable 链接并停止运行中的实例（systemd --user 在 root 下可能
-        # 连不上用户 bus，删 symlink 是最可靠的方式）。
+        # waybar 去重：niri config 用 spawn-at-startup "waybar" 时，只保留 niri 这一个启动
+        # 来源，彻底清除 systemd 侧的 waybar.service（无论文件在用户/系统 user 目录、有无
+        # enable 链接）——否则开机 niri spawn 一个 + systemd 启一个 = 两个 waybar。
         if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
-            && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null \
-            && [ -f "$HOME_DIR/.config/systemd/user/waybar.service" ]; then
-            log "$(_t "niri spawns waybar at startup — disabling duplicate waybar.service" "niri spawns waybar at startup — disabling duplicate waybar.service")"
+            && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
+            log "$(_t "niri spawns waybar at startup — removing systemd waybar.service (dedup)" "niri spawns waybar at startup — removing systemd waybar.service (dedup)")"
             as_user systemctl --user disable --now waybar.service 2>/dev/null || true
             rm -f "$HOME_DIR/.config/systemd/user/default.target.wants/waybar.service" \
                   "$HOME_DIR/.config/systemd/user/graphical-session.target.wants/waybar.service" \
-                  "$HOME_DIR/.config/systemd/user/waybar.service" 2>/dev/null || true
+                  "$HOME_DIR/.config/systemd/user/waybar.service" \
+                  /etc/systemd/user/default.target.wants/waybar.service \
+                  /etc/systemd/user/waybar.service 2>/dev/null || true
+            as_user systemctl --user daemon-reload 2>/dev/null || true
         fi
 
         local _has_wp=0
