@@ -1491,6 +1491,13 @@ _repair_niri_session() {
             mkdir -p /usr/local/share/wayland-sessions /usr/share/wayland-sessions
             exe install -Dm644 "$desktop_file" /usr/local/share/wayland-sessions/niri.desktop
             exe install -Dm644 "$desktop_file" /usr/share/wayland-sessions/niri.desktop
+            # 顺手补上 niri-session 启动器（niri.desktop 的 Exec=niri-session 依赖它）：
+            # 缺失会直接黑屏。
+            for _sess in "$work"/*/resources/niri-session "$work"/*/resources/niri-session.sh; do
+                [ -f "$_sess" ] || continue
+                exe install -Dm755 "$_sess" /usr/local/bin/niri-session 2>/dev/null || true
+                break
+            done
             # 顺手补上 systemd user units（GDM 登录循环的根因：缺 niri.service）
             mkdir -p /usr/lib/systemd/user
             local _unit
@@ -1700,6 +1707,27 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
     [ ${#PC_STILL_MISSING[@]} -eq 0 ]
 }
 
+# /usr/local/bin is commonly NOT on PATH in GDM Wayland sessions and systemd user
+# sessions on RHEL/Debian, so bare Exec=niri-session / ExecStart=niri resolve to
+# nothing → the greeter handoff ends in a black screen. Bake /usr/local/bin into
+# /etc/environment (used by GDM and systemd user managers) idempotently.
+ensure_localbin_on_path() {
+    [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
+    [ -f /etc/environment ] || touch /etc/environment
+    local probe
+    probe=$(grep -E '^PATH=' /etc/environment 2>/dev/null | head -1)
+    if [ -n "$probe" ]; then
+        if ! echo "$probe" | grep -qE '/usr/local/bin'; then
+            sed -i 's|^PATH=.*|&:/usr/local/bin|' /etc/environment
+            log "$(_t "Added /usr/local/bin to PATH in /etc/environment" "Added /usr/local/bin to PATH in /etc/environment")"
+        fi
+    else
+        printf 'PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin\n' >> /etc/environment
+        log "$(_t "Set PATH (incl. /usr/local/bin) in /etc/environment" "Set PATH (incl. /usr/local/bin) in /etc/environment")"
+    fi
+    # systemd will pick the new PATH on the next session start.
+}
+
 # niri 已装但 systemd user units 缺失时（旧版脚本装的 niri / 手动装的）补装：
 # niri-session 启动需要 systemctl --user start niri.service，缺 unit 会 GDM 登录循环。
 # 下载源码 tarball，从 resources/ 提取 *.service / *.target 到 /usr/lib/systemd/user/。
@@ -1744,10 +1772,12 @@ install_niri_binary() {
     if command -v niri >/dev/null 2>&1; then
         if [ -f /usr/share/wayland-sessions/niri.desktop ] || [ -f /usr/local/share/wayland-sessions/niri.desktop ]; then
             SKIPPED_PKGS+=("niri (already installed)")
+            ensure_localbin_on_path
             _ensure_niri_units   # 旧版脚本/手动装的 niri 可能缺 systemd units → GDM 登录循环
             return 0
         fi
         log "$(_t "niri binary found but niri.desktop missing; repairing session file..." "niri binary found but niri.desktop missing; repairing session file...")"
+        ensure_localbin_on_path
         _repair_niri_session
         return $?
     fi
@@ -2039,7 +2069,12 @@ install_niri_from_build() { # $1 = srcdir, $2 = logfile
     local srcdir="$1" logfile="$2"
     if [ -x "$srcdir/target/release/niri" ]; then
         exe install -Dm755 "$srcdir/target/release/niri" /usr/local/bin/niri
+        # niri.desktop's Exec=niri-session and niri.service's ExecStart=niri are bare
+        # names resolved via PATH. Install niri-session and make /usr/local/bin visible
+        # to GDM + the user systemd session on RHEL/Debian (where /usr/local/bin is
+        # commonly NOT on the default PATH) — without it login goes straight to black.
         exe install -Dm755 "$srcdir/resources/niri-session" /usr/local/bin/niri-session 2>/dev/null || true
+        ensure_localbin_on_path
         exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/local/share/wayland-sessions/niri.desktop 2>/dev/null || true
         exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/share/wayland-sessions/niri.desktop 2>/dev/null || true
         exe install -Dm644 "$srcdir/resources/niri-portals.conf" /usr/local/share/xdg-desktop-portal/niri-portals.conf 2>/dev/null || true
