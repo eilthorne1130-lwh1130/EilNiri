@@ -1154,14 +1154,31 @@ install_rhel() {
             DRY_PKGS+=("$name")
         else
             if [ "$p" = "niri" ]; then
-                warn "$(_t "No niri package in dnf (common outside Fedora), falling back to official prebuilt/source install..." "No niri package in dnf (common outside Fedora), falling back to official prebuilt/source install...")"
-                install_niri_binary
+                # non-Fedora RHEL (Rocky/Alma/CentOS Stream): dnf has no niri package.
+                # Try the author's COPR (yalter/niri, built for epel-10) first so we get
+                # a packaged binary; only fall back to a 10-20 min source build when that
+                # is not possible (EL9 / no copr plugin / enable fails).
+                local _nrc=0
+                install_niri_copr || _nrc=$?
+                if [ "$_nrc" -eq 0 ]; then
+                    INSTALLED_PKGS+=("niri")
+                elif [ "$_nrc" -ne "$DRY_RUN_RC" ]; then
+                    warn "$(_t "No niri package in dnf and COPR unavailable — falling back to source build..." "No niri package in dnf and COPR unavailable — falling back to source build...")"
+                    install_niri_binary
+                fi
             elif [ "$p" = "xwayland-satellite" ]; then
                 warn "$(_t "No xwayland-satellite package in dnf, falling back to cargo install..." "No xwayland-satellite package in dnf, falling back to cargo install...")"
                 install_xwayland_satellite
             elif [ -n "${SOURCE_PKGS[$p]:-}" ]; then
                 warn "$(_t "No dnf package for " "No dnf package for ") $p, building from source..."
                 install_hypr_source "$p" "${SOURCE_PKGS[$p]}"
+            elif [ "$p" = "ttf-jetbrains-mono-nerd" ]; then
+                # Nerd Font: jetbrains-mono-nerd-fonts is only in the Fedora repo.
+                # On Rocky/Alma/CentOS dnf has no such package — install_nerd_font,
+                # called right after install_rhel, covers it via the official release
+                # download. Don't record a hard failure here; the download warns if it
+                # also fails (font is optional).
+                log "$(_t "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead." "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead.")"
             elif [ -n "${RHEL_FAIL_HINT[$p]:-}" ]; then
                 MANUAL_ITEMS+=("$name — not available in repo. ${RHEL_FAIL_HINT[$p]}")
             else
@@ -1171,8 +1188,69 @@ install_rhel() {
     done
 }
 
+# Install niri from the author's COPR on EL10 (Rocky/Alma/CentOS Stream 10).
+# yalter/niri only builds the epel-10 chroot (plus Fedora), so this path is taken
+# only when the running RHEL-family system is EL10 and `dnf copr` is usable.
+# Returns 0 on success, 1 on failure, DRY_RUN_RC in dry-run (caller handles it).
+install_niri_copr() {
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("niri (COPR)"); return "$DRY_RUN_RC"; }
+    # EL10 only — the COPR has no EL9 build (avoids a doomed enable+install on EL9).
+    local _maj
+    _maj=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
+    if [ "$_maj" != "10" ]; then
+        log "$(_t "yalter/niri COPR builds only for EL10 (this is EL$_maj) — skipping COPR path." "yalter/niri COPR builds only for EL10 (this is EL$_maj) — skipping COPR path.")"
+        return 1
+    fi
+    # `dnf copr` lives in dnf-plugins-core (dnf5 also ships it); install if missing.
+    if ! dnf copr --help >/dev/null 2>&1; then
+        pm_install dnf-plugins-core 2>/dev/null || true
+    fi
+    if ! dnf copr --help >/dev/null 2>&1; then
+        log "$(_t "dnf copr not available — skipping COPR path." "dnf copr not available — skipping COPR path.")"
+        return 1
+    fi
+    # COPR-built niri on epel-10 may depend on EPEL packages; enable it first (best effort).
+    if ! rpm -q epel-release >/dev/null 2>&1 && [ ! -f /etc/yum.repos.d/epel.repo ]; then
+        pm_install epel-release 2>/dev/null || true
+    fi
+    if ! exe dnf -y copr enable yalter/niri; then
+        log "$(_t "COPR enable failed — skipping COPR path." "COPR enable failed — skipping COPR path.")"
+        return 1
+    fi
+    local _erc=0
+    exe dnf install -y niri || _erc=$?
+    return "$_erc"
+}
+
 # --- GitHub download (official direct; resume + retries + timeouts) ---
 CURL_DL_FLAGS=(-fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 1800 -C -)
+
+# Reliable GitHub-release mirror proxies for CN, ordered by measured availability
+# (206 range-supported). mirror.ghproxy.com and github.moeyy.xyz were found
+# unreachable and are omitted. Override the whole list via EILNIRI_GH_PROXY.
+GH_MIRRORS="https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/ https://gh.llkk.cc/"
+
+# Bounded best-effort GitHub-release download for large release assets (e.g. the
+# ~50MB Nerd Font zip). Tries direct then each mirror, hard-capped at $3 seconds
+# per attempt so a slow/stalled origin can never hang the whole install. Returns
+# 0 only when a full, non-empty file was written (curl -o truncates, so a partial
+# direct download never leaks into a later mirror attempt).
+_dl_gh_bounded() { # $1=github asset url, $2=outfile, $3=seconds cap (default 90)
+    local url="$1" out="$2" cap="${3:-90}" prox full
+    [ -n "$url" ] && [ -n "$out" ] || return 1
+    rm -f "$out"
+    if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$url" 2>/dev/null && [ -s "$out" ]; then
+        return 0
+    fi
+    for prox in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
+        full="${prox%/}/$url"
+        rm -f "$out"
+        if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$full" 2>/dev/null && [ -s "$out" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 # one download attempt with resume support; rc 33 = server rejects range requests -> restart
 try_dl() { # $1 = URL, $2 = output file; returns 0 on success
@@ -1196,7 +1274,7 @@ download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the cur
     # direct download failed — try mirror proxies (CN-friendly; configurable via EILNIRI_GH_PROXY)
     log "$(_t "Direct download failed (curl " "Direct download failed (curl ") $rc), trying mirror proxies..."
     local proxy prefix
-    for proxy in ${EILNIRI_GH_PROXY:-https://ghfast.top/ https://mirror.ghproxy.com/}; do
+    for proxy in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
         prefix="${proxy%/}"
         if try_dl "${prefix}/${url}" "$out"; then
             return 0
@@ -2609,27 +2687,36 @@ install_nerd_font() {
     local _font_dir="$HOME_DIR/.local/share/fonts"
     # 幂等：已在系统里装过带有 JetBrainsMono Nerd 字形的字体，或目标目录已有 Nerd Font
     # 的 .ttf，则直接跳过（绝不在每次 restore 都重新下载几十~上百 MB）。
-    if fc-list 2>/dev/null | grep -qi 'jetbrainsmono.*nerd'; then
+    # 正则兼容两种 family 命名：包管理器装的 "JetBrains Mono Nerd" 与 release 下载的
+    # "JetBrainsMono Nerd"（Fedora 的 jetbrains-mono-nerd-fonts 包即据此被识别而跳过下载）。
+    if fc-list 2>/dev/null | grep -qiE 'jetbrains[[:space:]-]?mono.*nerd|nerd.*jetbrains[[:space:]-]?mono'; then
         log "$(_t "Nerd Font already installed, skipping." "Nerd Font already installed, skipping.")"
         return 0
     fi
-    if [ -d "$_font_dir" ] && find "$_font_dir" \( -iname '*.ttf' -o -iname '*.otf' \) 2>/dev/null | head -100 | grep -qiE 'jetbrainsmono.*nerd|nerd.*jetbrains'; then
+    if [ -d "$_font_dir" ] && find "$_font_dir" \( -iname '*.ttf' -o -iname '*.otf' \) 2>/dev/null | head -100 | grep -qiE 'jetbrains[[:space:]-]?mono.*nerd|nerd.*jetbrains[[:space:]-]?mono'; then
         log "$(_t "Nerd Font present in ~/.local/share/fonts, skipping." "Nerd Font present in ~/.local/share/fonts, skipping.")"
         return 0
     fi
     mkdir -p "$_font_dir"
-    # 可选依赖：失败绝不阻塞主流程（很多地区大文件下载慢会卡住 install）。
+    # 可选依赖：这是个 ~50MB 的大文件，且部分地区直连 GitHub 很慢/被墙。
+    # 不能走 download_gh —— 它全局用 --max-time 1800（30 分钟/次）+ 多代理轮询，
+    # 一旦源站慢或不通，整次 install 会被这个可选项拖死（表现为"一直卡住"）。
+    # 这里走统一的 _dl_gh_bounded：直连 + 实测可用的 CN 镜像各试一轮，每次硬性
+    # 90 秒封顶、连接超时 8s、最多 1 次重试；失败立刻降级为"未装上"提示。
     log "$(_t "Downloading JetBrainsMono Nerd Font (icons, optional)..." "Downloading JetBrainsMono Nerd Font (icons, optional)...")"
-    local _zip _ok=0
+    local _zip _url _ok=0
     _zip=$(mktemp); register_temp_path "$_zip"
-    if download_gh "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/JetBrainsMono.zip" "$_zip"; then
+    _url="https://github.com/ryanoasis/nerd-fonts/releases/latest/download/JetBrainsMono.zip"
+    if _dl_gh_bounded "$_url" "$_zip" 90; then
+        _ok=1
+    fi
+    if [ "$_ok" -eq 1 ]; then
         if command -v unzip >/dev/null 2>&1; then
             exe unzip -o "$_zip" -d "$_font_dir" >/dev/null 2>&1 || true
         else
             exe python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$_zip" "$_font_dir" 2>/dev/null || true
         fi
         exe fc-cache -f "$_font_dir" >/dev/null 2>&1 || true
-        _ok=1
         INSTALLED_PKGS+=("JetBrainsMono Nerd Font")
         success "$(_t "Nerd Font installed (waybar icons)" "Nerd Font installed (waybar icons)")"
     fi
@@ -4151,7 +4238,7 @@ Options:
 Environment:
   EILNIRI_KEEP_DM=1    keep existing display manager unchanged
   EILNIRI_KEEP_SYS=1   skip disabling other-DE components during restore
-  EILNIRI_GH_PROXY     space-separated GitHub proxy URLs (default: ghfast.top mirror.ghproxy.com)
+  EILNIRI_GH_PROXY     space-separated GitHub proxy URLs (default: ghfast.top gh-proxy.com ghproxy.net gh.llkk.cc)
 
 Workflow:
   1. On your reference machine:  ./install.sh collect-config
