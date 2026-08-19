@@ -66,7 +66,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.19"
+SCRIPT_VERSION="1.9.20"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -615,7 +615,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v34"
+PROGRESS_VERSION="v35"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -2606,12 +2606,21 @@ install_nerd_font() {
         DRY_PKGS+=("JetBrainsMono Nerd Font (download)")
         return "$DRY_RUN_RC"
     fi
-    fc-list 2>/dev/null | grep -qi 'JetBrainsMono.*Nerd' && { log "$(_t "Nerd Font already installed, skipping." "Nerd Font already installed, skipping.")"; return 0; }
-    command -v fc-cache >/dev/null 2>&1 || pm_install fontconfig 2>/dev/null || true
     local _font_dir="$HOME_DIR/.local/share/fonts"
+    # 幂等：已在系统里装过带有 JetBrainsMono Nerd 字形的字体，或目标目录已有 Nerd Font
+    # 的 .ttf，则直接跳过（绝不在每次 restore 都重新下载几十~上百 MB）。
+    if fc-list 2>/dev/null | grep -qi 'jetbrainsmono.*nerd'; then
+        log "$(_t "Nerd Font already installed, skipping." "Nerd Font already installed, skipping.")"
+        return 0
+    fi
+    if [ -d "$_font_dir" ] && find "$_font_dir" \( -iname '*.ttf' -o -iname '*.otf' \) 2>/dev/null | head -100 | grep -qiE 'jetbrainsmono.*nerd|nerd.*jetbrains'; then
+        log "$(_t "Nerd Font present in ~/.local/share/fonts, skipping." "Nerd Font present in ~/.local/share/fonts, skipping.")"
+        return 0
+    fi
     mkdir -p "$_font_dir"
-    log "$(_t "Downloading JetBrainsMono Nerd Font (icons)..." "Downloading JetBrainsMono Nerd Font (icons)...")"
-    local _zip
+    # 可选依赖：失败绝不阻塞主流程（很多地区大文件下载慢会卡住 install）。
+    log "$(_t "Downloading JetBrainsMono Nerd Font (icons, optional)..." "Downloading JetBrainsMono Nerd Font (icons, optional)...")"
+    local _zip _ok=0
     _zip=$(mktemp); register_temp_path "$_zip"
     if download_gh "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/JetBrainsMono.zip" "$_zip"; then
         if command -v unzip >/dev/null 2>&1; then
@@ -2620,10 +2629,13 @@ install_nerd_font() {
             exe python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$_zip" "$_font_dir" 2>/dev/null || true
         fi
         exe fc-cache -f "$_font_dir" >/dev/null 2>&1 || true
+        _ok=1
         INSTALLED_PKGS+=("JetBrainsMono Nerd Font")
         success "$(_t "Nerd Font installed (waybar icons)" "Nerd Font installed (waybar icons)")"
-    else
-        MANUAL_ITEMS+=("JetBrainsMono Nerd Font — 下载失败; 手动: 从 github.com/ryanoasis/nerd-fonts/releases 下载 JetBrainsMono.zip 解压到 ~/.local/share/fonts 并运行 fc-cache -f")
+    fi
+    # 下载失败或解压后仍无 nerd 字体 → 记录一条提示但不中止后续安装
+    if [ "$_ok" -eq 0 ] || ! fc-list 2>/dev/null | grep -qi 'jetbrainsmono.*nerd'; then
+        warn "$(_t "Nerd Font 未装上（可选）— waybar 部分图标可能显示为方框; 可稍后手动安装" "Nerd Font not installed (optional) — some waybar icons may render as boxes; install manually later")"
     fi
 }
 
