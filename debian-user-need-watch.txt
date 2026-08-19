@@ -1,0 +1,2 @@
+For Debian users, it is not recommended to use this on a virtual machine, as ghosting issues may occur. Additionally, some .desktop files may not generate correctly. This will be addressed later. This is currently for testing purposes only. If you have any dd<F1
+对于debian用户，不建议在虚拟机上使用，可能会出现拖影问题。另外可能部分.desktop不能正常生成。后期会更改。目前仅为测试，如有疑惑或建议可以反馈或发送电子邮件至eilthorne1130@gmail.com。再次感谢您的尝试
