@@ -312,15 +312,21 @@ declare -A SOURCE_PKGS=(
 )
 
 # hyprlock / hypridle system build dependencies (Debian/Ubuntu names).
-# libhyprutils-dev & libhyprlang-dev exist on Ubuntu 25.10+ / Debian 13+ universe only;
-# apt_install_tolerant handles their absence on older releases (cargo then reports the real error).
-HYPR_BUILD_DEPS_DEB=(build-essential cmake pkg-config git libwayland-dev wayland-protocols
+# NOTE: upstream migrated hyprlock/hypridle from Rust to C++/CMake (repos no longer
+# contain a Cargo.toml), so the list covers BOTH the old Rust build and the new CMake
+# build. Missing entries are tolerated (apt_install_tolerant / dnf_install_tolerant),
+# so a package absent on an older release never aborts the whole build-deps step.
+HYPR_BUILD_DEPS_DEB=(build-essential cmake ninja-build pkg-config git libwayland-dev wayland-protocols
     libpango1.0-dev libgbm-dev libdrm-dev libxkbcommon-dev libxcb1-dev
-    libhyprutils-dev libhyprlang-dev)
+    libcairo2-dev libpam0g-dev
+    libhyprutils-dev libhyprlang-dev libhyprgraphics-dev libhyprcursor-dev
+    libsdbus-c++-dev hyprwayland-scanner)
 # hyprlock / hypridle system build dependencies (RHEL family names)
-HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config git wayland-devel wayland-protocols-devel
-    pango-devel mesa-libgbm-devel libdrm-devel libxkbcommon-devel libxcb-devel
-    hyprutils-devel hyprlang-devel)
+HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git wayland-devel wayland-protocols-devel
+    pango-devel mesa-libgbm-devel mesa-libEGL-devel libdrm-devel libxkbcommon-devel libxcb-devel
+    cairo-gobject-devel libpam-devel
+    hyprutils-devel hyprlang-devel hyprgraphics-devel hyprcursor-devel
+    sdbus-c++-devel hyprwayland-scanner)
 
 # System components (from other desktop environments) to disable when restoring
 # on a multi-DE target machine.  Only masked / hidden, NEVER uninstalled — the user
@@ -603,6 +609,25 @@ apt_install_tolerant() {
     for p in "$@"; do
         erc=0
         exe apt-get install -y "$p" 2>>"$LOG_DIR/apt-errors.log" || erc=$?
+        [ "$erc" -ne 0 ] && BDEPS_MISSING+=("$p")
+    done
+    [ ${#BDEPS_MISSING[@]} -eq 0 ]
+}
+
+# dnf twin of apt_install_tolerant: install as many of a batch as possible.
+# `dnf install -y a b c` aborts the WHOLE transaction when one name is absent
+# (e.g. hyprutils-devel not in Rocky/Alma base repos), so a failed batch is retried
+# one-by-one; genuinely absent names land in BDEPS_MISSING (shared array).
+dnf_install_tolerant() {
+    BDEPS_MISSING=()
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$@"); return "$DRY_RUN_RC"; }
+    if exe dnf install -y "$@" 2>>"$LOG_DIR/dnf-errors.log"; then
+        return 0   # whole batch installed
+    fi
+    local p erc
+    for p in "$@"; do
+        erc=0
+        exe dnf install -y "$p" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
         [ "$erc" -ne 0 ] && BDEPS_MISSING+=("$p")
     done
     [ ${#BDEPS_MISSING[@]} -eq 0 ]
@@ -1246,6 +1271,27 @@ _dl_gh_bounded() { # $1=github asset url, $2=outfile, $3=seconds cap (default 90
         full="${prox%/}/$url"
         rm -f "$out"
         if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$full" 2>/dev/null && [ -s "$out" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Clone a GitHub repo, falling back to the CN mirror proxies when direct git fails
+# (git smart-HTTP works through ghfast.top and friends; verified with git ls-remote).
+# Bounded so a blocked GitHub never hangs the install (git has no default timeout).
+git_clone_gh() { # $1 = github repo URL, $2 = dest dir; returns 0 on success
+    local repo="$1" dest="$2" prox full
+    [ -n "$repo" ] && [ -n "$dest" ] || return 1
+    if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+        clone --depth 1 "$repo" "$dest" >/dev/null 2>&1; then
+        return 0
+    fi
+    for prox in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
+        full="${prox%/}/$repo"
+        rm -rf "$dest"
+        if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+            clone --depth 1 "$full" "$dest" >/dev/null 2>&1; then
             return 0
         fi
     done
@@ -2042,8 +2088,19 @@ install_awww() {
             return 1
         fi
     else
-        exe dnf install -y git wayland-devel wayland-protocols-devel lz4-devel || bdeps_rc=$?
+        # RHEL: awww's common crate links xkbcommon + lz4 + dav1d (all need -devel .pc);
+        # tolerant so a missing name (e.g. dav1d-devel on older EL) never aborts the batch.
+        dnf_install_tolerant git wayland-devel wayland-protocols-devel lz4-devel \
+            xkbcommon-devel dav1d-devel || bdeps_rc=$?
+        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+            warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+        fi
         exe dnf install -y dav1d lz4 2>/dev/null || true
+        # pkg-config 预检（RHEL 只校验不自愈）：wayland-client / xkbcommon / liblz4 / dav1d
+        if ! ensure_pc_deps wayland-client xkbcommon liblz4 dav1d; then
+            MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -devel 包后重跑: $AWWW_REPO")
+            return 1
+        fi
     fi
     if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
         MANUAL_ITEMS+=("awww — build dependencies install failed, build manually: $AWWW_REPO")
@@ -2461,20 +2518,40 @@ install_xwayland_satellite() {
             return 1
         fi
     else
-        exe dnf install -y git clang libxcb-cursor-devel || bdeps_rc=$?
+        # RHEL: also need the wayland/xkbcommon/xcb-util dev headers for the .pc the
+        # build links against; tolerant so a missing name never aborts the batch.
+        dnf_install_tolerant git clang libxcb-cursor-devel \
+            wayland-devel wayland-protocols-devel libxkbcommon-devel xcb-util-devel || bdeps_rc=$?
+        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+            warn "$(_t "Some xwayland-satellite build deps unavailable (continuing):" "Some xwayland-satellite build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+        fi
+        # pkg-config 预检（RHEL 只校验不自愈）
+        if ! ensure_pc_deps wayland-client xkbcommon xcb-cursor; then
+            MANUAL_ITEMS+=("xwayland-satellite — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -devel 包后重跑: $XWS_REPO")
+            return 1
+        fi
     fi
     if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
-        MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (git/clang/libxcb-cursor-dev); install manually: $XWS_REPO")
+        MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (git/clang/libxcb-cursor-devel); install manually: $XWS_REPO")
         return 1
     fi
     if ! ensure_rust; then
         MANUAL_ITEMS+=("xwayland-satellite — Rust toolchain install failed; install manually: $XWS_REPO")
         return 1
     fi
-    # tee cargo output to a log so failures stay diagnosable
-    local logf="$LOG_DIR/xwayland-satellite-build.log"
-    log "$(_t "Building xwayland-satellite from GitHub via cargo (about 3 min)..." "Building xwayland-satellite from GitHub via cargo (about 3 min)...")"
-    cargo install --git "$XWS_REPO" --locked --root /usr/local xwayland-satellite 2>&1 | tee "$logf"
+    # NOT on crates.io (verified 404) — clone via CN mirrors (direct GitHub git fetch is
+    # often blocked) and install from the local checkout instead of `cargo install --git`.
+    local work logf
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    log "$(_t "Cloning xwayland-satellite (GitHub, via CN mirror if needed)..." "Cloning xwayland-satellite (GitHub, via CN mirror if needed)...")"
+    if ! git_clone_gh "$XWS_REPO" "$work/xws"; then
+        MANUAL_ITEMS+=("xwayland-satellite — git clone failed (direct + CN mirrors); install manually: $XWS_REPO (or Fedora repo)")
+        return 1
+    fi
+    logf="$LOG_DIR/xwayland-satellite-build.log"
+    log "$(_t "Building xwayland-satellite via cargo (about 3 min)..." "Building xwayland-satellite via cargo (about 3 min)...")"
+    ( cd "$work/xws" && cargo install --path . --locked --root /usr/local xwayland-satellite ) 2>&1 | tee "$logf"
     local crc=${PIPESTATUS[0]}
     if [ "$crc" -eq 0 ]; then
         INSTALLED_PKGS+=("xwayland-satellite (cargo build)")
@@ -2488,10 +2565,13 @@ install_xwayland_satellite() {
 }
 
 # --- hyprlock / hypridle source build (fallback when no apt/dnf package) ---
-# Used for any package listed in SOURCE_PKGS. Clones the upstream repo, installs the
-# hyprwm C build deps, runs a foreground cargo build (~3 min), installs the binary to
-# /usr/local/bin. For hyprlock it also writes /etc/pam.d/hyprlock (the apt package
-# ships one, but a source build does not — without it hyprlock cannot authenticate).
+# Used for any package listed in SOURCE_PKGS. Clones the upstream repo (CN-mirror
+# aware), installs the hyprwm build deps tolerantly, then builds — auto-detecting
+# the build system: older versions are Rust (cargo build), current ones are
+# C++/CMake (cmake -B build; the repos no longer ship a Cargo.toml). Installs the
+# binary to /usr/local/bin. For hyprlock it also writes /etc/pam.d/hyprlock (the
+# apt package ships one, but a source build does not — without it hyprlock cannot
+# authenticate).
 install_hypr_source() { # $1 = pkg name, $2 = repo URL
     local pkg="$1" repo="$2"
     if command -v "$pkg" >/dev/null 2>&1; then
@@ -2499,11 +2579,11 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        DRY_PKGS+=("$pkg (cargo source build)")
+        DRY_PKGS+=("$pkg (source build)")
         return "$DRY_RUN_RC"
     fi
 
-    # build deps (tolerant: libhyprutils-dev/libhyprlang-dev are absent on older releases)
+    # build deps (tolerant: many hypr deps are absent on older releases / Rocky/Alma)
     local _brc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
         apt_install_tolerant "${HYPR_BUILD_DEPS_DEB[@]}" || _brc=$?
@@ -2511,7 +2591,10 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
             warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
     else
-        exe dnf install -y "${HYPR_BUILD_DEPS_RHEL[@]}" || _brc=$?
+        dnf_install_tolerant "${HYPR_BUILD_DEPS_RHEL[@]}" || _brc=$?
+        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+            warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+        fi
     fi
     if ! ensure_rust; then
         MANUAL_ITEMS+=("$pkg — Rust toolchain install failed, build manually: $repo")
@@ -2522,31 +2605,32 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     work=$(mktemp -d)
     register_temp_path "$work"
     log "$(_t "Cloning " "Cloning ") $pkg ($repo)..."
-    
-    local _hypr_attempts=3 _hypr_delay=10 _hyprrc=0
-    for (( _hattempt=1; _hattempt<=$_hypr_attempts; _hattempt++ )); do
-        if exe git clone --depth 1 "$repo" "$work/$pkg" 2>/dev/null; then
-            _hyprrc=0
-            break
-        fi
-        _hyprrc=$?
-        if [ "$_hattempt" -lt "$_hypr_attempts" ]; then
-            log "$(_t "Clone attempt $_hattempt/$_hypr_attempts failed, retrying in ${_hypr_delay}s..." "Clone attempt $_hattempt/$_hypr_attempts failed, retrying in ${_hypr_delay}s...")"
-            sleep "$_hypr_delay"
-            rm -rf "$work/$pkg"
-        fi
-    done
-    
-    if [ "$_hyprrc" -ne 0 ]; then
-        MANUAL_ITEMS+=("$pkg — git clone failed after $_hypr_attempts attempts, build manually: $repo")
+    if ! git_clone_gh "$repo" "$work/$pkg"; then
+        MANUAL_ITEMS+=("$pkg — git clone failed (direct + CN mirrors), build manually: $repo")
         return 1
     fi
 
-    local logf="$LOG_DIR/$pkg-build.log"
-    log "$(_t "Building " "Building ") $pkg from source (~3 min, log: $logf)..."
-    ( cd "$work/$pkg" && cargo build --release ) > "$logf" 2>&1
-    local crc=$?
-    if [ "$crc" -ne 0 ] || [ ! -x "$work/$pkg/target/release/$pkg" ]; then
+    # hyprlock/hypridle migrated from Rust to C++/CMake: the repos no longer contain
+    # a Cargo.toml (only CMakeLists.txt). Detect the build system instead of blindly
+    # running `cargo build` (which used to die with "could not find Cargo.toml").
+    local logf="$LOG_DIR/$pkg-build.log" _bin=""
+    if [ -f "$work/$pkg/Cargo.toml" ]; then
+        log "$(_t "Building " "Building ") $pkg (cargo) from source (~3 min, log: $logf)..."
+        ( cd "$work/$pkg" && cargo build --release ) > "$logf" 2>&1
+        _bin="$work/$pkg/target/release/$pkg"
+    elif [ -f "$work/$pkg/CMakeLists.txt" ]; then
+        # CMake build needs hyprwayland-scanner + hyprlang/hyprgraphics/hyprcursor/
+        # sdbus-c++ -devel; absent ones were reported above as BDEPS_MISSING and the
+        # build will fail here — a clear manual hint follows instead of a cargo error.
+        log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
+        ( cd "$work/$pkg" && cmake -B build -DCMAKE_BUILD_TYPE=Release . \
+            && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
+        _bin="$work/$pkg/build/$pkg"
+    else
+        MANUAL_ITEMS+=("$pkg — cloned source has neither Cargo.toml nor CMakeLists.txt; build manually: $repo")
+        return 1
+    fi
+    if [ ! -x "$_bin" ]; then
         local tailmsg
         tailmsg=$(tail -n 6 "$logf" 2>/dev/null | tr '\n' ' ')
         MANUAL_ITEMS+=("$pkg — build failed ($tailmsg); build manually: $repo")
@@ -2554,8 +2638,8 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         return 1
     fi
 
-    exe install -Dm755 "$work/$pkg/target/release/$pkg" "/usr/local/bin/$pkg"
-    INSTALLED_PKGS+=("$pkg (cargo source build)")
+    exe install -Dm755 "$_bin" "/usr/local/bin/$pkg"
+    INSTALLED_PKGS+=("$pkg (source build)")
     success "$(_t "$pkg built from source" "$pkg built from source")"
 
     # hyprlock needs a PAM config to authenticate; the apt package ships one, a source build does not.
@@ -3190,15 +3274,23 @@ install_zsh_extras() {
     fi
 
     # 4) eza (aliased in .zshrc): repo package first, cargo --root /usr/local as fallback
-    #    (Debian 12 / Ubuntu 24.04 have no eza package yet)
+    #    (Debian 12 / Ubuntu 24.04 have no eza package yet; on RHEL eza lives in EPEL)
     if ! command -v eza >/dev/null 2>&1; then
         log "$(_t "Installing eza..." "Installing eza...")"
         pm_install eza 2>/dev/null || true
         if ! command -v eza >/dev/null 2>&1; then
-            if ensure_rust && exe cargo install --locked --root /usr/local eza 2>/dev/null; then
-                INSTALLED_PKGS+=("eza (cargo build)")
-            else
-                MANUAL_ITEMS+=("eza — no repo package and cargo build failed; install manually (apt/dnf/cargo)")
+            # RHEL family: eza is in EPEL, not the base repos (Fedora has it in base)
+            if [ "$DISTRO_FAMILY" = rhel ] && ! rpm -q epel-release >/dev/null 2>&1; then
+                log "$(_t "eza not in base RHEL repos — enabling EPEL and retrying..." "eza not in base RHEL repos — enabling EPEL and retrying...")"
+                pm_install epel-release 2>/dev/null || true
+                pm_install eza 2>/dev/null || true
+            fi
+            if ! command -v eza >/dev/null 2>&1; then
+                if ensure_rust && exe cargo install --locked --root /usr/local eza 2>/dev/null; then
+                    INSTALLED_PKGS+=("eza (cargo build)")
+                else
+                    MANUAL_ITEMS+=("eza — no repo package and cargo build failed; install manually (dnf --enablerepo=epel install eza / apt install eza / cargo install eza)")
+                fi
             fi
         fi
     fi
