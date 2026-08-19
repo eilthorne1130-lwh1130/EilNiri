@@ -382,6 +382,13 @@ DISABLE_SYS=(
     # --- KDE power management (replaced by power-profiles-daemon) ---
     "userunit|org.kde.powerdevil.service|KDE power manager"
     "autostart|org.kde.powerdevil.desktop|KDE power manager (replaced by power-profiles-daemon)"
+
+    # --- tuned vs power-profiles-daemon (RHEL 8/9) ---
+    # tuned is the RHEL default power-management service and conflicts with
+    # power-profiles-daemon.service (both ride the same power framework), so with
+    # tuned running power-profiles-daemon fails to start. Masked on RHEL (existence-
+    # checked — absent on Arch/Debian, harmless there); user can enable tuned again.
+    "systemunit|tuned.service|tuned (RHEL default power mgmt, conflicts with power-profiles-daemon)"
     
     # --- XFCE screen saver (replaced by hyprlock + hypridle) ---
     "userunit|xfce4-screensaver.service|XFCE screensaver (replaced by hyprlock)"
@@ -3057,6 +3064,15 @@ stage_services() {
             log "$(_t "Installing service provider: " "Installing service provider: ")$provider"
             erc=0
             pm_install "$provider" || erc=$?
+            # RHEL family: some providers (power-profiles-daemon, ...) are only in EPEL,
+            # not the base repos — enable EPEL once and retry before declaring failure.
+            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ "$DISTRO_FAMILY" = rhel ] \
+                && ! rpm -q epel-release >/dev/null 2>&1 && [ ! -f /etc/yum.repos.d/epel.repo ]; then
+                log "$(_t "Provider not in base RHEL repos — enabling EPEL and retrying..." "Provider not in base RHEL repos — enabling EPEL and retrying...")"
+                pm_install epel-release 2>/dev/null || true
+                erc=0
+                pm_install "$provider" || erc=$?
+            fi
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
                 FAILED_PKGS+=("svc-provider:$provider")
                 any_failed=1
@@ -3072,6 +3088,15 @@ stage_services() {
         elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
             DRY_SVCS+=("$unit")
         else
+            # diagnostics: distinguish a *missing/masked unit* from a *start failure*
+            # so the failure is actionable on the rerun instead of repeating silently.
+            local _desc
+            _desc=$(systemctl show "$unit" --property=Description 2>/dev/null | sed 's/^Description=//')
+            if [ -z "$_desc" ]; then
+                warn "$(_t "Service unit not found: " "Service unit not found: ")$unit (package may not ship this unit on this distro)"
+            fi
+            systemctl --no-pager --lines=5 status "$unit" >"$LOG_DIR/service-$unit.log" 2>&1 || true
+            log "$(_t "Enable failed for " "Enable failed for ")$unit — details: $LOG_DIR/service-$unit.log"
             FAILED_PKGS+=("service:$unit")
             any_failed=1
         fi
@@ -3975,11 +4000,14 @@ do_restore() {
     if stage_apps_select; then
         stage_apps_install
     fi
+    # Disable other-DE components (mask tuned / GNOME / PulseAudio / ...) BEFORE
+    # enabling our services — e.g. power-profiles-daemon.service fails to start if
+    # tuned is still running (RHEL default), a conflict resolved by masking tuned here.
+    stage_disable_system
     stage_services
     stage_dm
     stage_backup
     stage_configs
-    stage_disable_system
     stage_wait_builds
     stage_hardware_adapt
     stage_verify
