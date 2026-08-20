@@ -3727,6 +3727,16 @@ stage_hardware_adapt() {
 
     if [ -z "$detected_out" ]; then
         warn "$(_t "No connected display found, skipping adapt." "No connected display found, skipping adapt.")"
+        # On QEMU/KVM this usually means the virtual GPU/render backend isn't
+        # producing an active output — the classic cause of niri's
+        # "display output is not active" / black screen at the greeter.
+        local _virt=""
+        command -v systemd-detect-virt >/dev/null 2>&1 && _virt=$(systemd-detect-virt 2>/dev/null || true)
+        case "$_virt" in
+            qemu|kvm)
+                warn "$(_t "检测到 QEMU/KVM 且无可用显示输出 — niri 进桌面可能黑屏 / 提示 display output is not active。请在虚拟机上：① 显卡设为 virtio-gpu 并开 3D（gl=on）；② 显示协议用 SPICE；③ 确保安装了对应的图形驱动（mesa/virtio_gpu）；④ libvirt 里 <video> 的 model 为 virtio 并开启渲染。改完重启即可。" "QEMU/KVM detected with no active display output — niri may black-screen / show 'display output is not active'. On the VM: 1) set the video card to virtio-gpu with 3D (gl=on); 2) use the SPICE display protocol; 3) ensure the graphics driver (mesa/virtio_gpu) is installed; 4) set libvirt <video> model=virtio with rendering enabled. Reboot after changing.")"
+                ;;
+        esac
         stage_mark hwadapt
         return
     fi
