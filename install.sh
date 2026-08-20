@@ -257,6 +257,10 @@ declare -A RHEL_MAP=(
     [wqy-zenhei]=wqy-zenhei-fonts
     [pipewire-pulse]=pipewire-pulseaudio
 )
+# Runtime graphics packages required by niri on EL systems.  These are separate
+# from the compiler dependencies below: a minimal Rocky/Alma install can build
+# niri successfully while still lacking Mesa/DRM support for a virtio GPU.
+RHEL_GRAPHICS_RUNTIME=(mesa-dri-drivers mesa-libGL mesa-libEGL mesa-libgbm libdrm mesa-vulkan-drivers)
 # Packages with no official RPM -> go to the "manual install" report (value = reason/advice)
 # (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
 declare -A RHEL_MANUAL=(
@@ -774,6 +778,22 @@ ensure_rhel_repos() {
     fi
 }
 
+ensure_rhel_graphics_runtime() {
+    [ "$DISTRO_FAMILY" = rhel ] || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("${RHEL_GRAPHICS_RUNTIME[@]}")
+        return "$DRY_RUN_RC"
+    fi
+    local _pkg _missing=()
+    for _pkg in "${RHEL_GRAPHICS_RUNTIME[@]}"; do
+        pkg_installed "$_pkg" || _missing+=("$_pkg")
+    done
+    [ ${#_missing[@]} -eq 0 ] && return 0
+    log "$(_t "Installing RHEL graphics runtime for niri..." "Installing RHEL graphics runtime for niri...")"
+    pm_install "${_missing[@]}" || warn "$(_t "Some Mesa/DRM runtime packages could not be installed; niri may not start on a virtual GPU." "Some Mesa/DRM runtime packages could not be installed; niri may not start on a virtual GPU.")"
+    return 0
+}
+
 stage_preflight() {
     section "$(_t "Pre-Flight" "Pre-Flight")" "$(_t "System Update" "System Update")"
     if stage_done preflight; then
@@ -804,6 +824,7 @@ stage_preflight() {
             ;;
         rhel)
             ensure_rhel_repos   # enable EPEL + CRB so -devel build packages are available
+            ensure_rhel_graphics_runtime
             if [ "$DRY_RUN" -eq 1 ]; then
                 log "$(_t "[DRY-RUN] Skipping system upgrade." "[DRY-RUN] Skipping system upgrade.")"
             elif ! exe dnf -y upgrade --refresh; then
@@ -3737,6 +3758,8 @@ stage_hardware_adapt() {
                 warn "$(_t "检测到 QEMU/KVM 且无可用显示输出 — niri 进桌面可能黑屏 / 提示 display output is not active。请在虚拟机上：① 显卡设为 virtio-gpu 并开 3D（gl=on）；② 显示协议用 SPICE；③ 确保安装了对应的图形驱动（mesa/virtio_gpu）；④ libvirt 里 <video> 的 model 为 virtio 并开启渲染。改完重启即可。" "QEMU/KVM detected with no active display output — niri may black-screen / show 'display output is not active'. On the VM: 1) set the video card to virtio-gpu with 3D (gl=on); 2) use the SPICE display protocol; 3) ensure the graphics driver (mesa/virtio_gpu) is installed; 4) set libvirt <video> model=virtio with rendering enabled. Reboot after changing.")"
                 ;;
         esac
+        # Do not rewrite output settings when the installer cannot observe a
+        # connected DRM output. The GDM session may expose it later.
         stage_mark hwadapt
         return
     fi
