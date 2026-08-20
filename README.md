@@ -5,18 +5,16 @@
 ## 快速开始
 
 ```bash
-# 1. 准备配置文件：把桌面配置放进本仓库的 configs/.config/（niri、waybar、mako、kitty 等目录）
+# 1. 把整个 EilNiri 目录拷贝到新机器（git 克隆）
 
-# 2. 把整个 EilNiri 目录拷贝到新机器（U盘 / rsync / scp / 局域网共享）
-
-# 3. 在新机器安装（需要 root；一个脚本搞定所有：包、niri/awww/satty、输入法词库、登录管理器、服务、配置）
+# 2. 在新机器安装（需要 root；一个脚本搞定所有：包、niri/awww/satty、输入法词库、登录管理器、服务、配置）
 sudo ./install.sh restore
 #    完成后重启，直接进入登录界面 → niri 桌面
 
-# 4. 回滚配置
+# 3. 回滚配置
 sudo ./install.sh rollback
 
-# 5. 若想重新启用 restore 时被禁用的其他桌面组件（多桌面环境场景）
+# 4. 若想重新启用 restore 时被禁用的其他桌面组件（多桌面环境场景）
 sudo ./install.sh restore-system
 ```
 
