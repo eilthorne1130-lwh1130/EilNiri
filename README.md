@@ -1,14 +1,15 @@
 # EilNiri
 
-在新装的 **Arch 系** / **RHEL 系** / **Debian 系**（Debian/Ubuntu）系统上**只运行一个脚本**即可还原完整的 Niri 桌面环境：包安装（内置列表）、niri/awww/satty 预编译或源码构建、waypaper pip 安装、rime-ice 词库部署、**登录管理器（自动替换现有 DM）**、系统服务（内置列表 fzf 勾选）、显示器适配、配置部署（仓库内 `configs/`）全部自动完成，无需快照/export 流程。**niri/awww 的 cargo 编译自动放到后台并行执行**，期间继续装包、部署配置，最后统一等待收尾，大幅压缩总等待时间。Arch 系与 Fedora 全量预编译安装、零 AUR 构建；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上，niri 自动走官方预编译二进制或官方 vendored 源码离线编译。自动适配显示器、输入法中文组件可选、服务自启、字体渲染。
+在新装的 **Arch 系** / **RHEL 系** / **Debian 系**（Debian/Ubuntu）系统上**只运行一个脚本**即可还原完整的 Niri 桌面环境：包安装（内置列表）、niri/awww/satty 预编译或源码构建、waypaper pip 安装、rime-ice 词库部署、**登录管理器（自动替换现有 DM）**、系统服务（内置列表 fzf 勾选）、显示器适配全部自动完成，**无需任何前置配置准备**；若仓库 `configs/` 里有你自己的 dotfiles，restore 会一并部署（不准备也照常安装）。**niri/awww 的 cargo 编译自动放到后台并行执行**，期间继续装包、部署配置，最后统一等待收尾，大幅压缩总等待时间。Arch 系与 Fedora 全量预编译安装、零 AUR 构建；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上，niri 自动走官方预编译二进制或官方 vendored 源码离线编译。自动适配显示器、输入法中文组件可选、服务自启、字体渲染。
 
 ## 快速开始
 
 ```bash
-# 1. 把整个 EilNiri 目录拷贝到新机器（git 克隆）
+# 1. 把整个 EilNiri 目录拷到新机器 / 或直接在新机器上解压（U盘 / rsync / scp / 局域网共享）
 
-# 2. 在新机器安装（需要 root；一个脚本搞定所有：包、niri/awww/satty、输入法词库、登录管理器、服务、配置）
+# 2. 在新机器安装（需要 root；无需任何前置准备，一个脚本搞定所有：包、niri/awww/satty、输入法词库、登录管理器、服务、配置）
 sudo ./install.sh restore
+#    若你把自己的 dotfiles 放进 configs/.config/，restore 会一并部署；不放进也有默认可用
 #    完成后重启，直接进入登录界面 → niri 桌面
 
 # 3. 回滚配置
@@ -55,9 +56,9 @@ sudo ./install.sh restore-system
 | 显示管理器 | ✅ 自动 | 自动安装并**替换现有 DM**：Arch→ly；Debian/RHEL→gdm（gdm3 兜底，装不上自动尝试 sddm） |
 | 系统服务 | 可选 | bluetooth / libvirtd / power-profiles-daemon |
 
-### 配置目录 `configs/`
+### 配置目录 `configs/`（可选）
 
-restore 会部署 `configs/` 里的配置：`configs/.config/` 下的每个目录对应 `~/.config/<name>`（niri、waybar、mako、kitty、hypr、copyq、satty、waypaper、fcitx5、fcitx、environment.d、xdg-desktop-portal、gtk-3.0、gtk-4.0、fontconfig、systemd 等）；`configs/.local/share/` 下的内容会部署到 `~/.local/share/`。请把目标桌面所需配置直接放进这些位置。
+`configs/` **不是必须的**——不放也能直接 `restore`（niri 用默认配置）。若想部署自己的 dotfiles，restore 会部署 `configs/` 里的配置：`configs/.config/` 下的每个目录对应 `~/.config/<name>`（niri、waybar、mako、kitty、hypr、copyq、satty、waypaper、fcitx5、fcitx、environment.d、xdg-desktop-portal、gtk-3.0、gtk-4.0、fontconfig、systemd 等）；`configs/.local/share/` 下的内容会部署到 `~/.local/share/`。把目标桌面所需配置直接放进这些位置即可。
 
 - `configs/.config/systemd/user/` 内的用户单元（如 waypaper 服务）会在 restore 时启用
 - 敏感数据（~/.ssh、keyring、token）不应放进 `configs/`

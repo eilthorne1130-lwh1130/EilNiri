@@ -3,11 +3,10 @@
 # eilNiri - install.sh
 #
 #   One-click niri desktop setup for a fresh Arch / RHEL / Debian family system.
-#   Desktop config is read from the repo's configs/ directory (place your desktop
-#   configs under configs/.config/), packages come from a built-in list, and the
-#   script installs everything: niri/awww/satty builds,
-#   rime-ice dictionary, display manager (replacing any existing one), services
-#   and config deploy.
+#   Packages come from a built-in list and the script installs everything:
+#   niri/awww/satty builds, rime-ice dictionary, display manager (replacing any
+#   existing one), services and config deploy. Desktop config is optional and read
+#   from the repo's configs/.config/ if you choose to ship any.
 #
 #   Usage:
 #     ./install.sh restore [--dry-run]     restore on new system (root)
@@ -3153,7 +3152,7 @@ stage_backup() {
     section "$(_t "Config Snapshot" "Config Snapshot")" "$(_t "Create rollback point before deploy" "Create rollback point before deploy")"
     local snap_cfg="$BASE_DIR/configs"
     if [ ! -d "$snap_cfg/.config" ]; then
-        warn "$(_t "configs/ mirror not found, skipping backup." "configs/ mirror not found, skipping backup.")"
+        log "$(_t "configs/ not present — skipping rollback backup." "configs/ not present — skipping rollback backup.")"
         stage_mark backup
         return
     fi
@@ -3317,7 +3316,7 @@ stage_configs() {
     fi
     local snap="$BASE_DIR/configs"
     if [ ! -d "$snap" ]; then
-        warn "$(_t "configs/ mirror not found, skipping deploy." "configs/ mirror not found, skipping deploy.")"
+        log "$(_t "configs/ not present — skipping config deploy." "configs/ not present — skipping config deploy.")"
         return
     fi
 
@@ -3895,16 +3894,12 @@ do_restore() {
     [ "$DRY_RUN" -eq 1 ] && warn "$(_t "DRY-RUN mode: printing plan only, no changes." "DRY-RUN mode: printing plan only, no changes.")"
     show_logo
 
-    # Config mirror check: configs/ must exist (place your desktop configs there,
-    # e.g. configs/.config/*). Without it restore deploys no desktop config.
-    local _snap_missing=0
-    [ -d "$BASE_DIR/configs" ] || _snap_missing=1
-    if [ "$_snap_missing" -eq 1 ]; then
-        warn "$(_t "configs/ not found in " "configs/ not found in ") $BASE_DIR$(_t " — no desktop config will be deployed (niri will run with default/empty config). Put your desktop configs under configs/.config/ (e.g. niri, waybar, ...) before restoring." " — no desktop config will be deployed (niri will run with default/empty config). Put your desktop configs under configs/.config/ (e.g. niri, waybar, ...) before restoring.")"
-        if [ "$DRY_RUN" -eq 0 ] && ! confirm "$(_t "configs/ missing — continue without deploying config? [Y/n] (default Y):" "configs/ missing — continue without deploying config? [Y/n] (default Y):")" "Y" 30; then
-            error "$(_t "Aborted: add a configs/ directory with your desktop configs, then rerun." "Aborted: add a configs/ directory with your desktop configs, then rerun.")"
-            exit 1
-        fi
+    # configs/ is optional: if present it's deployed as the desktop config; if absent
+    # the script still installs and configures everything else and niri runs with
+    # default config. Never block or prompt the user about it — a plain `./install.sh
+    # restore` must just work with no prep.
+    if [ ! -d "$BASE_DIR/configs" ]; then
+        log "$(_t "configs/ not present — desktop config deploy skipped (niri will run with default config). To ship your own dotfiles, put them under configs/.config/" "configs/ not present — desktop config deploy skipped (niri will run with default config). To ship your own dotfiles, put them under configs/.config/")"
     fi
 
     # update the system first (a fresh machine has a stale package db, so installing fzf directly may fail)
@@ -4346,13 +4341,13 @@ Environment:
   EILNIRI_GH_PROXY     space-separated GitHub proxy URLs (default: ghfast.top gh-proxy.com ghproxy.net gh.llkk.cc)
 
 Workflow:
-  1. Provide a configs/ directory (place your desktop configs under configs/.config/)
-  2. Copy this eilNiri directory to the new machine (USB / network)
-  3. On new machine (Arch/RHEL/Debian): sudo ./install.sh restore
+  1. Copy this eilNiri directory to the target machine (USB / network)
+  2. On the machine (Arch/RHEL/Debian): sudo ./install.sh restore   — no prep required;
+     optionally drop your own dotfiles into configs/.config/ and they get deployed
      - niri/awww compile in background:  ./install.sh status   (live progress)
      - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
-  4. Rollback config:            sudo ./install.sh rollback
-  5. Re-enable other-DE comps:   sudo ./install.sh restore-system
+  3. Rollback config:            sudo ./install.sh rollback
+  4. Re-enable other-DE comps:   sudo ./install.sh restore-system
 EOF
 }
 
