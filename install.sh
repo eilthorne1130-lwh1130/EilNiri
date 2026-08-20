@@ -261,6 +261,9 @@ declare -A RHEL_MAP=(
 # from the compiler dependencies below: a minimal Rocky/Alma install can build
 # niri successfully while still lacking Mesa/DRM support for a virtio GPU.
 RHEL_GRAPHICS_RUNTIME=(mesa-dri-drivers mesa-libGL mesa-libEGL mesa-libgbm libdrm mesa-vulkan-drivers)
+# Build/runtime packages used by optional RHEL components. Keep these names
+# separate from RHEL_MAP because they are dependency groups, not app aliases.
+RHEL_OPTIONAL_DEPS=(fcitx5-rime)
 # Packages with no official RPM -> go to the "manual install" report (value = reason/advice)
 # (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
 declare -A RHEL_MANUAL=(
@@ -859,6 +862,11 @@ stage_preflight() {
         rhel)
             ensure_rhel_repos   # enable EPEL + CRB so -devel build packages are available
             ensure_rhel_graphics_runtime
+            # Install the Rime engine before the optional dictionary stage. The
+            # dictionary is useless without it and must not hide the real dnf error.
+            if printf '%s\n' "${REPO_SEL[@]+${REPO_SEL[@]}}" | grep -qx 'rime-ice-pinyin-git'; then
+                dnf_install_tolerant "${RHEL_OPTIONAL_DEPS[@]}" || true
+            fi
             if [ "$DRY_RUN" -eq 1 ]; then
                 log "$(_t "[DRY-RUN] Skipping system upgrade." "[DRY-RUN] Skipping system upgrade.")"
             elif ! exe dnf -y upgrade --refresh; then
@@ -2088,7 +2096,7 @@ install_awww() {
         # optional runtime codec, so only lz4/xkbcommon are hard pre-checks. Tolerant
         # so a missing name (e.g. dav1d-devel on older EL) never aborts the batch.
         dnf_install_tolerant git wayland-devel wayland-protocols-devel lz4-devel \
-            xkbcommon-devel dav1d-devel || bdeps_rc=$?
+            libxkbcommon-devel dav1d-devel libdrm-devel mesa-libgbm-devel || bdeps_rc=$?
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
             warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
@@ -2100,7 +2108,7 @@ install_awww() {
             return 1
         fi
     fi
-    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
+    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ] && [ ${#BDEPS_MISSING[@]} -gt 0 ] && [ ${#PC_STILL_MISSING[@]} -gt 0 ]; then
         MANUAL_ITEMS+=("awww — build dependencies install failed, build manually: $AWWW_REPO")
         return 1
     fi
@@ -2429,10 +2437,10 @@ install_rime_ice() {
     # was deferred (rime-ice-pinyin-git is only usable with the rime engine present).
     if ! pkg_installed fcitx5-rime; then
         log "$(_t "fcitx5-rime not installed — installing it before deploying rime-ice..." "fcitx5-rime not installed — installing it before deploying rime-ice...")"
-        pm_install fcitx5-rime 2>>"$LOG_DIR/pkg-errors.log"
+        pm_install fcitx5-rime 2>>"$LOG_DIR/pkg-errors.log" || true
     fi
     if ! pkg_installed fcitx5-rime; then
-        MANUAL_ITEMS+=("rime-ice — fcitx5-rime not installed (and could not be installed), skip deploy")
+        MANUAL_ITEMS+=("rime-ice — fcitx5-rime not installed; skipped dictionary deploy. Enable EPEL/CRB and install fcitx5-rime before retrying")
         return 1
     fi
     if ! command -v unzip &>/dev/null; then
@@ -2524,8 +2532,9 @@ install_xwayland_satellite() {
     else
         # RHEL: also need the wayland/xkbcommon/xcb-util dev headers for the .pc the
         # build links against; tolerant so a missing name never aborts the batch.
-        dnf_install_tolerant git clang libxcb-cursor-devel \
-            wayland-devel wayland-protocols-devel libxkbcommon-devel xcb-util-devel || bdeps_rc=$?
+        dnf_install_tolerant git clang libclang-devel libxcb-cursor-devel \
+            wayland-devel wayland-protocols-devel libxkbcommon-devel xcb-util-devel \
+            xcb-util-wm-devel libxcb-devel libdrm-devel mesa-libgbm-devel || bdeps_rc=$?
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
             warn "$(_t "Some xwayland-satellite build deps unavailable (continuing):" "Some xwayland-satellite build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
@@ -2535,7 +2544,7 @@ install_xwayland_satellite() {
             return 1
         fi
     fi
-    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
+    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ] && [ ${#PC_STILL_MISSING[@]} -gt 0 ]; then
         MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (git/clang/libxcb-cursor-devel); install manually: $XWS_REPO")
         return 1
     fi
