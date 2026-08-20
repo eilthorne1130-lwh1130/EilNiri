@@ -745,6 +745,35 @@ set_debian_mirror() { # $1 = 可选：直接指定镜像 (tuna|aliyun|ustc)，�
 }
 
 # --- 4.1 Pre-flight ---
+# Enable EPEL + CRB on RHEL family so the -devel build packages (xcb-cursor,
+# dav1d, pixman, librsvg, fcitx5-rime, sdbus-c++, ...) are actually available.
+# CRB is CodeReady Builder on RHEL / "CRB" on Rocky/Alma; dnf5 (EL10+/Fedora 41+)
+# uses `config-manager setopt`, dnf4 uses `config-manager --set-enabled`.
+ensure_rhel_repos() {
+    [ "$DISTRO_FAMILY" = rhel ] || return 0
+    [ "$DRY_RUN" -eq 1 ] && { log "$(_t "[DRY-RUN] would enable EPEL + CRB repos." "[DRY-RUN] would enable EPEL + CRB repos.")"; return 0; }
+    if [ ! -f /etc/yum.repos.d/epel.repo ] && ! rpm -q epel-release >/dev/null 2>&1; then
+        log "$(_t "Enabling EPEL..." "Enabling EPEL...")"
+        pm_install epel-release 2>/dev/null || warn "$(_t "EPEL enable failed; some -devel packages may be unavailable." "EPEL enable failed; some -devel packages may be unavailable.")"
+    fi
+    # CRB / CodeReady Builder — try dnf5 (setopt) then dnf4 (--set-enabled), then the
+    # RHEL RHUI variant, then install dnf-plugins-core and retry the dnf4 form.
+    if ! dnf repolist 2>/dev/null | grep -qiE '^\s*(crb|codeready-builder)'; then
+        log "$(_t "Enabling CRB (CodeReady Builder) repo..." "Enabling CRB (CodeReady Builder) repo...")"
+        if dnf config-manager setopt crb.enabled=1 2>/dev/null; then
+            :
+        elif dnf config-manager --set-enabled crb 2>/dev/null \
+            || dnf config-manager --set-enabled codeready-builder-for-rhel-9-rhui-rpms 2>/dev/null; then
+            :
+        else
+            # dnf4 needs dnf-plugins-core for config-manager
+            pm_install dnf-plugins-core 2>/dev/null || true
+            dnf config-manager --set-enabled crb 2>/dev/null \
+                || warn "$(_t "CRB enable failed; some -devel packages may be unavailable." "CRB enable failed; some -devel packages may be unavailable.")"
+        fi
+    fi
+}
+
 stage_preflight() {
     section "$(_t "Pre-Flight" "Pre-Flight")" "$(_t "System Update" "System Update")"
     if stage_done preflight; then
@@ -774,6 +803,7 @@ stage_preflight() {
             fi
             ;;
         rhel)
+            ensure_rhel_repos   # enable EPEL + CRB so -devel build packages are available
             if [ "$DRY_RUN" -eq 1 ]; then
                 log "$(_t "[DRY-RUN] Skipping system upgrade." "[DRY-RUN] Skipping system upgrade.")"
             elif ! exe dnf -y upgrade --refresh; then
@@ -1559,14 +1589,15 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
         fi
         break
     done
-    # 失败原因说明：有 apt 报错就带尾部；无报错说明候选包不在 apt 列表（universe 未启用等）
-    local _perr
+    # 失败原因说明（按发行版系生成，避免在 RHEL/Arch 上误报 Debian 专属的 universe/apt 提示）
+    local _perr _hint
     _perr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
-    if [ -n "$_perr" ]; then
-        PC_FAIL_HINT="apt error: $_perr"
-    else
-        PC_FAIL_HINT="apt 无报错 — 候选 -dev 包不在 apt 列表中（大概率 universe 未启用或源列表缺失）"
-    fi
+    case "$DISTRO_FAMILY" in
+        rhel)   _hint="dnf 里没有提供该 .pc 的 -devel 包（可能需启用 EPEL / CRB 仓库）；可运行 'dnf install <对应-devel包>' 或 'dnf --enablerepo=crb,epel install <对应-devel包>' 后重跑" ;;
+        arch)   _hint="pacman 里没有提供该 .pc 的开发包（可尝试 'pacman -S <对应包名>' 或 AUR）后重跑" ;;
+        *)      if [ -n "$_perr" ]; then _hint="apt error: $_perr"; else _hint="apt 无报错 — 候选 -dev 包不在 apt 列表中（大概率 universe 未启用或源列表缺失）"; fi ;;
+    esac
+    PC_FAIL_HINT="$_hint"
     [ ${#PC_STILL_MISSING[@]} -eq 0 ]
 }
 

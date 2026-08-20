@@ -1,6 +1,6 @@
 # EilNiri
 
-在新装的 **Arch 系** / **RHEL 系** / **Debian 系**（Debian/Ubuntu）系统上**只运行一个脚本**即可还原完整的 Niri 桌面环境：包安装（内置列表）、niri/awww/satty 预编译或源码构建、waypaper pip 安装、rime-ice 词库部署、**登录管理器（自动替换现有 DM）**、系统服务（内置列表 fzf 勾选）、显示器适配全部自动完成，**无需任何前置配置准备**；若仓库 `configs/` 里有你自己的 dotfiles，restore 会一并部署（不准备也照常安装）。**niri/awww 的 cargo 编译自动放到后台并行执行**，期间继续装包、部署配置，最后统一等待收尾，大幅压缩总等待时间。Arch 系与 Fedora 全量预编译安装、零 AUR 构建；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上，niri 自动走官方预编译二进制或官方 vendored 源码离线编译。自动适配显示器、输入法中文组件可选、服务自启、字体渲染。
+在新装的 **Arch 系** / **RHEL 系** / **Debian 系**（Debian/Ubuntu）系统上**只运行一个脚本**即可还原完整的 Niri 桌面环境：包安装（内置列表）、niri/awww/satty 预编译或源码构建、waypaper pip 安装、rime-ice 词库部署、**登录管理器（自动替换现有 DM）**、系统服务（内置列表 fzf 勾选）、显示器适配全部自动完成，**无需任何前置配置准备**；若仓库 `configs/` 里有你自己的 dotfiles，restore 会一并部署（不准备也照常安装）。**RHEL 系（Rocky/Alma/CentOS Stream）会自动启用 EPEL + CRB 仓库**，保证构建依赖可装。**niri/awww 的 cargo 编译自动放到后台并行执行**，期间继续装包、部署配置，最后统一等待收尾，大幅压缩总等待时间。Arch 系与 Fedora 全量预编译安装、零 AUR 构建；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上，niri 自动走官方预编译二进制或官方 vendored 源码离线编译。自动适配显示器、输入法中文组件可选、服务自启、字体渲染。
 
 ## 快速开始
 
@@ -84,7 +84,7 @@ sudo ./install.sh restore-system
 - 无 RPM 对应包自动走替代安装（awww 源码构建 / satty 预编译 / rime-ice 词库部署 / gdm 登录管理器），只有全部失败才列入手动安装报告
 - waypaper 走 pip3 兜底
 - **Fedora**：niri / hyprlock / hypridle / xwayland-satellite 官方仓库都有，`dnf` 直接装
-- **Rocky / Alma / CentOS Stream**：这些包默认仓库没有——niri 自动回退官方预编译/源码编译安装；hyprlock/hypridle/xwayland-satellite 给出 EPEL / Copr / 手动指引
+- **Rocky / Alma / CentOS Stream**：这些包默认仓库没有——restore 开头**自动启用 EPEL + CRB**（含 dnf-plugins-core），让 xcb-cursor / dav1d / pixman / fcitx5-rime / sdbus-c++ 等 `-devel` 构建依赖可装；niri 自动回退官方预编译/源码编译安装；hyprlock/hypridle/xwayland-satellite 若仓库仍缺则给 EPEL / Copr / 手动指引
 - **awww / satty**（全部 RHEL 系）：awww 自动从 Codeberg 源码构建（约 5 分钟）；satty 自动下载官方预编译二进制，不可用时回退 cargo 构建
 - **登录管理器**：自动装并启用 `gdm`（Fedora 仓库有 / gdm3 兜底；装不上会提示并给出 tty 方案）
 
