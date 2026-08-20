@@ -5,14 +5,11 @@
 ## 快速开始
 
 ```bash
-# 1. 在参考机（任意发行版，普通用户）收集桌面配置到仓库 configs/（自动修正笔误与 niri-session，完成后自检并提示 git 提交）
-./install.sh collect-config
+# 1. 准备配置文件：把桌面配置放进本仓库的 configs/.config/（niri、waybar、mako、kitty 等目录）
 
-# 2. 用 git 云同步时，configs/ 必须提交（git clone 只传被跟踪的文件）：
-git add configs && git commit -m "configs update" && git push
-#    （或直接用 U盘/rsync 拷贝整个 EilNiri 目录）
+# 2. 把整个 EilNiri 目录拷贝到新机器（U盘 / rsync / scp / 局域网共享）
 
-# 3. 在新机器克隆/拷贝后安装（需要 root；一个脚本搞定所有：包、niri/awww/satty、输入法词库、登录管理器、服务、配置）
+# 3. 在新机器安装（需要 root；一个脚本搞定所有：包、niri/awww/satty、输入法词库、登录管理器、服务、配置）
 sudo ./install.sh restore
 #    完成后重启，直接进入登录界面 → niri 桌面
 
@@ -27,7 +24,6 @@ sudo ./install.sh restore-system
 
 | 命令 | 权限 | 说明 |
 |---|---|---|
-| `./install.sh collect-config` | 普通用户 | 收集本机桌面配置到仓库 `configs/`（任意发行版） |
 | `sudo ./install.sh restore` | root | 显示 Logo → 安装桌面环境（fzf 交互） |
 | `sudo ./install.sh restore --dry-run` | root | 预览模式，只打印不执行 |
 | `./install.sh status` | 任意 | **查看后台编译进度**（restore 运行时在另一终端执行，支持 `watch -n 5 ./install.sh status`） |
@@ -61,13 +57,13 @@ sudo ./install.sh restore-system
 | 显示管理器 | ✅ 自动 | 自动安装并**替换现有 DM**：Arch→ly；Debian/RHEL→gdm（gdm3 兜底，装不上自动尝试 sddm） |
 | 系统服务 | 可选 | bluetooth / libvirtd / power-profiles-daemon |
 
-### 配置采集（`collect-config` 复制进仓库 `configs/`）
+### 配置目录 `configs/`
 
-`~/.config/` 下：niri waybar mako（排 __pycache__）kitty hypr copyq satty waypaper fcitx5 fcitx environment.d xdg-desktop-portal gtk-3.0 gtk-4.0 fontconfig systemd，以及家目录 `.pam_environment`、`.zshrc`。
+restore 会部署 `configs/` 里的配置：`configs/.config/` 下的每个目录对应 `~/.config/<name>`（niri、waybar、mako、kitty、hypr、copyq、satty、waypaper、fcitx5、fcitx、environment.d、xdg-desktop-portal、gtk-3.0、gtk-4.0、fontconfig、systemd 等）；`configs/.local/share/` 下的内容会部署到 `~/.local/share/`。请把目标桌面所需配置直接放进这些位置。
 
-额外捕获并修复 `/usr/bin/niri-session`（systemd 弃用警告）→ 存入 `configs/.local/bin/`；`systemd` 目录内的用户单元（如 waypaper 服务）也会被采集并在 restore 时启用。
-
-敏感数据（~/.ssh、keyring、token）不进入 `configs/`。
+- `configs/.config/systemd/user/` 内的用户单元（如 waypaper 服务）会在 restore 时启用
+- 敏感数据（~/.ssh、keyring、token）不应放进 `configs/`
+- 配置里的参考机绝对路径建议写成 `$HOME` 字面量（restore 时会展开成目标机主目录）
 
 ## restore 流程（共 11 步）
 
@@ -127,12 +123,12 @@ sudo ./install.sh restore-system
 - **apt 镜像源自动换源（404 / 无法下载自愈）**：当 `apt-get update` 失败、或安装时 apt 报 `404`/`无法下载`/`Failed to fetch`（典型：`cn.archive.ubuntu.com` 等镜像同步滞后——索引里已有新版但 pool 里的 .deb 尚未同步，如 Ubuntu 26.04 的 `libudev-dev_259.5-0ubuntu3.3`、`libinput10 1.31.1-1`）时，脚本按 **tuna → 阿里云 → 中科大** 顺序询问并自动换源：备份原源文件（`*.mirror-bak-时间戳`）→ 改写 `.list`/`.sources` 里的 host → `apt-get update` → **用 curl 探测之前 404 的 .deb 是否真被新镜像同步**（只有显式 404 才换下一个候选）→ 换源成功后自动重试关键依赖一轮（带 `--fix-missing`）。fzf 可用时用 fzf 菜单选择，未装时退化为编号提示。手动报告只追加一次。
 - **系统时钟偏差自动检测**：apt 报 `Release 文件已经过期 / expired / Valid-Until` 时（尤其是 `security.ubuntu.com` 这类官方源也报过期）通常不是镜像问题，而是**本地时钟偏快**（VM 常见）。脚本在 `apt-get update` 失败和关键依赖失败时会对比官方源 Last-Modified 与本地时间，偏差 ≥ 3 天即给出校准命令（`sudo timedatectl set-ntp true`），避免"换镜像也没用"的误导。
 - **pkg-config 预检自愈**：启动 niri 后台编译前一次性验证全部 23 个 `.pc` 文件；缺失时（Debian 系）**自动安装对应的 -dev 包**（新旧命名都试，如 `libxcb-icccm4-dev` ↔ `libxcb-icccm-dev`，`apt-cache` 探测哪个存在装哪个），装完重新校验；仍缺则报出**具体缺失清单**，不再等到 15 分钟编译后报 "libdisplay-info.pc not found"。另有 `.pc` **命名分歧自动兼容**（Ubuntu 26.04 的 `libxcb-render-util0-dev` 装的是上游原名 `xcb-renderutil.pc`，与 Debian 系传统命名 `xcb-render-util.pc` 不同——脚本自动补双向符号链接），以及"包已装但 pkg-config 找不到"时自动把 `.pc` 所在目录加入 `PKG_CONFIG_PATH`。
-- **systemd user units 与 ExecStart 路径修复**：niri-session 通过 `systemctl --user start niri.service` 启动会话，源码构建后**必须把 niri 源码 `resources/` 里的 `niri.service` / `niri-shutdown.target` 装到 `/usr/lib/systemd/user/`**（漏装会导致 GDM 登录循环："Unit niri.service not found"）；配置部署时还会**自动修正收集来的 user unit 里 `ExecStart` 的二进制绝对路径**（参考机 Arch 的 `/usr/bin/xxx` ↔ Debian/RHEL 的 `/usr/local/bin` 或 `~/.local/bin`，如 waypaper/hypridle），避免 "Failed at step EXEC spawning ... No such file"。
+- **systemd user units 与 ExecStart 路径修复**：niri-session 通过 `systemctl --user start niri.service` 启动会话，源码构建后**必须把 niri 源码 `resources/` 里的 `niri.service` / `niri-shutdown.target` 装到 `/usr/lib/systemd/user/`**（漏装会导致 GDM 登录循环："Unit niri.service not found"）；配置部署时还会**自动修正 `configs/` 里 user unit 的 `ExecStart` 二进制绝对路径**（参考机 Arch 的 `/usr/bin/xxx` ↔ Debian/RHEL 的 `/usr/local/bin` 或 `~/.local/bin`，如 waypaper/hypridle），避免 "Failed at step EXEC spawning ... No such file"。
 - **Rust 工具链版本守卫**：`rustup` 工具链/默认版本缺失时防止静默使用发行版自带的过老 cargo（Debian 12 的 rustc 1.63、Ubuntu 22.04 的 1.75 编译 niri 会报 "edition 2024" 错误）。`ensure_rust` 校验 cargo ≥ 1.85，不足时自动 `rustup update stable` 重试一次，仍不满足则明确报错中止，不再用老工具链硬编译。
 
 ## zsh / oh-my-zsh（桌面终端体验）
 
-- **自动安装 oh-my-zsh**：Debian/RHEL 的官方仓库都没有 oh-my-zsh 包（[Arch 参考机靠 AUR 才有](https://github.com/ohmyzsh/ohmyzsh)），参考机收集的 `configs/.zshrc` 也因此只在 Arch 上生效。restore 在 zsh 选中时自动以目标用户身份 `git clone --depth=1` 官方仓库到 `~/.oh-my-zsh`，跨 Arch/RHEL/Debian 三家一致生效。
+- **自动安装 oh-my-zsh**：Debian/RHEL 的官方仓库都没有 oh-my-zsh 包（[Arch 参考机靠 AUR 才有](https://github.com/ohmyzsh/ohmyzsh)），`configs/.zshrc` 也因此只在 Arch 上生效。restore 在 zsh 选中时自动以目标用户身份 `git clone --depth=1` 官方仓库到 `~/.oh-my-zsh`，跨 Arch/RHEL/Debian 三家一致生效。
 - **OMZ 插件放到 `custom/plugins/`**：`zsh-autosuggestions` / `zsh-syntax-highlighting` 不再走 apt/dnf 包（它们装到 `/usr/share` 或 `/etc/zsh/zshrc.d`，OMZ 的 `plugins=()` 用不上），而是克隆到 `~/.oh-my-zsh/custom/plugins/` 供 .zshrc 插件表识别。
 - **配套运行时自动装**：starship（`configs/.zshrc` 里 `init zsh` 依赖，官方脚本装到 `/usr/local/bin`）、eza（repo 优先，无包则 `cargo install --root /usr/local`）、bat（Debian/Ubuntu 上自动建 `bat`→`batcat` 符号链接）。
 - **`.zshrc` 全防护**：`source $ZSH/oh-my-zsh.sh`、`starship init zsh`、eza/bat/rg 别名均改为"命令存在才加载"，参考机写死的 `/home/eilthorne` 绝对路径改为主目录相对（`$HOME`）；即使某个组件没装上，shell 也不会报错。
@@ -159,7 +155,7 @@ sudo ./install.sh restore-system
 ```
 EilNiri/
 ├── install.sh
-├── configs/          (桌面配置镜像 + .local/bin/niri-session，collect-config 生成，随 git 走)
+├── configs/          (桌面配置：configs/.config/ + configs/.local/share/，随目录拷贝走)
 ├── backups/          (回滚点 tar.gz)
 ├── .replicate_progress
 ├── .system_disabled  (restore 时禁用的其他桌面组件清单，restore-system 据此恢复)
@@ -178,13 +174,13 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore/collect-config 开头都会显示 `v版本号`（当前 v1.9.11）——目标机器上先看版本号确认同步的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore 开头都会显示 `v版本号`（当前 v1.9.11）——目标机器上先看版本号确认拷到的是最新脚本（旧进度文件自动作废）
 - **多桌面环境**：restore 会自动禁用（不卸载）其他 DE 的冲突组件（通知/设置守护等），清单存 `.system_disabled`；切回其他 DE 前用 `sudo ./install.sh restore-system` 重新启用，或 `EILNIRI_KEEP_SYS=1` 跳过禁用
 - **诊断**：restore 结尾打印 `NIRI STATUS`（niri 二进制/desktop/gdm Session 三态）+ `Boot Environment Check`（gdm 是否真能启动 niri）+ 生成 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包（各 build 日志 + AccountsService + custom.conf + 包清单），排查时直接分享该包
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
 - 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
 - **Debian/Ubuntu 虚拟机适配**：若 Niri 配置由 `spawn-at-startup "waybar"` 启动 Waybar，restore 会停止并屏蔽 systemd 侧的 `waybar.service`，避免登录后出现两个 Waybar；检测到 QEMU/KVM 时还会自动启用软件光标回退，减少鼠标拖影。若仍有拖影，请将虚拟显卡设为 `virtio-gpu` 并开启 3D 加速（`gl=on`），或使用 SPICE 显示协议。
-- collect-config 默认修正 niri config 两处笔误（swww-daemon→awww-daemon、authenntication→authentication），live 配置不受影响
+- restore 会自动修正 niri config 两处笔误（swww-daemon→awww-daemon、authenntication→authentication），live 配置不受影响
 - 壁纸图片不在 `configs/` 内
 - 中断恢复：重跑自动跳过已完成阶段，删除 `.replicate_progress` 可强制全量重跑；**进度文件带脚本版本标记，旧版本脚本写的进度自动作废**（失败阶段不再标记完成，重跑自动重试，无需手动删文件）
 - dry-run：不对系统做任何改动（唯一例外：fzf 是交互前提，dry-run 下也会实际安装）

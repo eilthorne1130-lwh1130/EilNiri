@@ -3,14 +3,13 @@
 # eilNiri - install.sh
 #
 #   One-click niri desktop setup for a fresh Arch / RHEL / Debian family system.
-#   Desktop config lives in the repo's configs/ directory (collect it from your
-#   reference machine with `./install.sh collect-config`), packages come from a
-#   built-in list, and the script installs everything: niri/awww/satty builds,
+#   Desktop config is read from the repo's configs/ directory (place your desktop
+#   configs under configs/.config/), packages come from a built-in list, and the
+#   script installs everything: niri/awww/satty builds,
 #   rime-ice dictionary, display manager (replacing any existing one), services
 #   and config deploy.
 #
 #   Usage:
-#     ./install.sh collect-config          collect this machine's config into configs/ (normal user)
 #     ./install.sh restore [--dry-run]     restore on new system (root)
 #     ./install.sh status                  show background build progress
 #     ./install.sh rollback                rollback config from backup (root)
@@ -238,10 +237,6 @@ for _g in "${GROUP_ORDER[@]}"; do
 done
 unset _g _p
 
-# Config capture whitelist (~/.config dirs) + home dotfiles
-CONFIG_DIRS=(niri waybar mako kitty hypr copyq satty waypaper fcitx5 fcitx5 environment.d xdg-desktop-portal gtk-3.0 gtk-4.0 fontconfig systemd)
-CONFIG_FILES=(.pam_environment .zshrc)
-
 # service -> provider package mapping (filtered by is-enabled during export and written to services.txt)
 SVC_ORDER=(bluetooth.service libvirtd.service power-profiles-daemon.service)
 declare -A SVC_PROVIDER=(
@@ -405,137 +400,6 @@ DISABLE_SYS=(
 INSTALLED_PKGS=() SKIPPED_PKGS=() FAILED_PKGS=() MANUAL_ITEMS=() ENABLED_SVCS=()
 DRY_PKGS=() DRY_SVCS=()  # items "that would be executed" in dry-run mode; kept separate to avoid inflated counts
 
-# ==============================================================================
-# 3. collect-config mode — collect this machine's desktop config into configs/ (normal user).
-# Works on any distro (pure file copying; no package manager involved).
-
-collect_config() {
-    init_logger
-    if [ "$EUID" -eq 0 ]; then
-        error "$(_t "collect-config must run as normal user (needs ~/.config), do not use sudo." "collect-config must run as normal user (needs ~/.config), do not use sudo.")"
-        exit 1
-    fi
-
-    local CFG_DIR="$BASE_DIR/configs"
-
-    # configs/ must be a DIRECTORY; a same-named regular file would break collection
-    if [ -e "$CFG_DIR" ] && [ ! -d "$CFG_DIR" ]; then
-        warn "$(_t "A regular file exists at " "A regular file exists at ") $CFG_DIR$(_t " — the config mirror must be a directory. Move or delete the file first, then rerun." " — the config mirror must be a directory. Move or delete the file first, then rerun.")"
-        return 1
-    fi
-
-    section "$(_t "Collect Config" "Collect Config")" "v$SCRIPT_VERSION — $(_t "desktop config -> configs/" "desktop config -> configs/")"
-    info_kv "$(_t "Repo Dir" "Repo Dir")" "$BASE_DIR"
-
-    # --- 3.1 config mirror (whitelist) ---
-    log "$(_t "Copying desktop config (whitelist) to configs/ ..." "Copying desktop config (whitelist) to configs/ ...")"
-    rm -rf "$CFG_DIR"
-    mkdir -p "$CFG_DIR/.config"
-
-    local d f
-    for d in "${CONFIG_DIRS[@]}"; do
-        if [ -d "$HOME/.config/$d" ]; then
-            cp -r "$HOME/.config/$d" "$CFG_DIR/.config/$d"
-            log "  $(_t "[config]" "[config]") ~/.config/$d"
-        else
-            warn "  $(_t "[skip]" "[skip]") ~/.config/$d does not exist"
-        fi
-    done
-    for f in "${CONFIG_FILES[@]}"; do
-        if [ -f "$HOME/$f" ]; then
-            cp "$HOME/$f" "$CFG_DIR/$f"
-            log "  $(_t "[config]" "[config]") ~/$f"
-        fi
-    done
-
-    # Remove useless cache directories
-    rm -rf "$CFG_DIR/.config/mako/__pycache__" 2>/dev/null
-
-    # --- 3.1b privacy scrub: 本脚本面向大众分发，收集的配置绝不允许携带参考机的 ---
-    # 个人信息。删除 copyQ 剪贴板历史/锁/加密 key（*.dat 可能含密码、token、聊天记录），
-    # 并把所有文件里的参考机主目录绝对路径替换为 $HOME 字面量（防用户名/路径泄露）。
-    rm -f "$CFG_DIR"/.config/copyq/*.dat \
-          "$CFG_DIR"/.config/copyq/*.lock \
-          "$CFG_DIR"/.config/copyq/.copyq_s \
-          "$CFG_DIR"/.config/copyq/copyq.pub 2>/dev/null
-    # 输入法只保留基础功能（profile 启用 fcitx5+rime），去掉候选框皮肤等美化配置
-    # 与无意义缓存（classicui.conf / cached_layouts）。
-    rm -f "$CFG_DIR"/.config/fcitx5/conf/classicui.conf \
-          "$CFG_DIR"/.config/fcitx5/conf/cached_layouts \
-          "$CFG_DIR"/.config/fcitx5/fcitx5/conf/classicui.conf \
-          "$CFG_DIR"/.config/fcitx5/fcitx5/conf/cached_layouts 2>/dev/null
-    if [ -n "$HOME" ]; then
-        local _prf
-        while IFS= read -r _prf; do
-            [ -f "$_prf" ] || continue
-            sed -i "s#$HOME#\$HOME#g" "$_prf" 2>/dev/null || true
-            log "  [privacy] scrubbed path in $_prf"
-        done < <(grep -rlI -- "$HOME" "$CFG_DIR" 2>/dev/null | head -50)
-    fi
-
-    # --- 3.2 fix known typos in the collected copy (never touch live config) ---
-    local NIRI_KDL="$CFG_DIR/.config/niri/config.kdl"
-    if [ -f "$NIRI_KDL" ]; then
-        local fixed=()
-        if grep -q "swww-daemon" "$NIRI_KDL"; then
-            sed -i 's/swww-daemon/awww-daemon/g' "$NIRI_KDL"
-            fixed+=("swww-daemon -> awww-daemon")
-        fi
-        if grep -q "authenntication" "$NIRI_KDL"; then
-            sed -i 's/authenntication/authentication/g' "$NIRI_KDL"
-            fixed+=("polkit-gnome-authenntication -> polkit-gnome-authentication")
-        fi
-        if [ ${#fixed[@]} -gt 0 ]; then
-            warn "$(_t "Fixed typos in the collected copy (live config unchanged):" "Fixed typos in the collected copy (live config unchanged):")"
-            for fx in "${fixed[@]}"; do echo -e "     ${H_YELLOW}· $fx${NC}"; done
-            write_log "FIX" "${fixed[*]}"
-        fi
-    fi
-
-    # --- 3.3 capture & fix niri-session (systemd import-environment deprecation warning) ---
-    local NIRI_SESSION="$CFG_DIR/.local/bin/niri-session"
-    local NIRI_DESKTOP="$CFG_DIR/.local/share/applications/niri.desktop"
-    if [ -x /usr/bin/niri-session ]; then
-        mkdir -p "$(dirname "$NIRI_SESSION")" "$(dirname "$NIRI_DESKTOP")"
-        cp /usr/bin/niri-session "$NIRI_SESSION"
-        chmod +x "$NIRI_SESSION"
-        if grep -q 'systemctl --user import-environment$' "$NIRI_SESSION"; then
-            sed -i 's/systemctl --user import-environment$/systemctl --user import-environment WAYLAND_DISPLAY XDG_SESSION_TYPE DISPLAY XDG_CURRENT_DESKTOP/' "$NIRI_SESSION"
-            log "  [fix] niri-session: import-environment now has an explicit variable list"
-        fi
-        cat > "$NIRI_DESKTOP" <<'DESKTOP_EOF'
-[Desktop Entry]
-Name=Niri (fixed)
-Comment=Scrollable-tiling Wayland compositor
-Exec=niri-session
-Type=Application
-DesktopNames=niri
-DESKTOP_EOF
-        chmod +x "$NIRI_DESKTOP"
-        log "  [config] fixed niri-session + desktop entry"
-    fi
-
-    section "$(_t "Collect Done" "Collect Done")" "$(_t "Config Collected" "Config Collected")"
-    info_kv "$(_t "Config Mirror" "Config Mirror")" "$CFG_DIR/"
-
-    # --- 3.4 self-check: configs/ must be non-empty before it is pushed/cloned anywhere ---
-    if [ ! -d "$CFG_DIR/.config" ] || [ -z "$(find "$CFG_DIR/.config" -type f 2>/dev/null | head -n 1)" ]; then
-        error "$(_t "Self-check FAILED: configs/.config is empty — nothing was collected. Fix and rerun." "Self-check FAILED: configs/.config is empty — nothing was collected. Fix and rerun.")"
-        return 1
-    fi
-    success "$(_t "Self-check passed." "Self-check passed.")"
-
-    # If this repo is synced via git (cloud clone), remind to commit the config —
-    # git only transfers tracked files, and a missing configs/ silently breaks restore.
-    if [ -d "$BASE_DIR/.git" ] || git -C "$BASE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-        echo ""
-        info_kv "$(_t "Git sync" "Git sync")" "$(_t "configs must be committed" "configs must be committed")" ""
-        echo -e "   ${H_CYAN}git add configs && git commit -m \"configs update\" && git push${NC}"
-        echo -e "   ${DIM}$(_t "(git clone only transfers tracked files — without this, restore on the target machine deploys no config)" "(git clone only transfers tracked files — without this, restore on the target machine deploys no config)")${NC}"
-    else
-        log "Next: copy the eilNiri directory to the new machine and run ${BOLD}sudo ./install.sh restore${NC}"
-    fi
-}
 
 # 4. restore mode — reproduce desktop on new system (run as root)
 # ==============================================================================
@@ -2292,7 +2156,7 @@ PYEOF
                 log "$(_t "waypaper config.ini points to missing path " "waypaper config.ini points to missing path ") $_oldwp$(_t " -> " " -> ") $_img"
                 sed -i "s#^wallpaper\s*=.*#wallpaper = $_img#" "$_wpconf" 2>/dev/null || true
             fi
-            # stylesheet 键：参考机绝对路径已由 collect-config 擦除为 $HOME，这里展开成绝对路径
+            # stylesheet 键：配置里的参考机绝对路径通常是 $HOME 字面量，这里展开成绝对路径
             local _oldss
             _oldss=$(grep -E '^stylesheet\s*=' "$_wpconf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \r')
             if [ -n "$_oldss" ] && [ ! -f "$_oldss" ]; then
@@ -4031,13 +3895,14 @@ do_restore() {
     [ "$DRY_RUN" -eq 1 ] && warn "$(_t "DRY-RUN mode: printing plan only, no changes." "DRY-RUN mode: printing plan only, no changes.")"
     show_logo
 
-    # Config mirror check: configs/ must exist in the repo (collect with ./install.sh collect-config)
+    # Config mirror check: configs/ must exist (place your desktop configs there,
+    # e.g. configs/.config/*). Without it restore deploys no desktop config.
     local _snap_missing=0
     [ -d "$BASE_DIR/configs" ] || _snap_missing=1
     if [ "$_snap_missing" -eq 1 ]; then
-        warn "$(_t "configs/ not found in " "configs/ not found in ") $BASE_DIR$(_t " — no desktop config will be deployed (niri will run with default/empty config). Collect it on your reference machine with './install.sh collect-config' and push the repo." " — no desktop config will be deployed (niri will run with default/empty config). Collect it on your reference machine with './install.sh collect-config' and push the repo.")"
+        warn "$(_t "configs/ not found in " "configs/ not found in ") $BASE_DIR$(_t " — no desktop config will be deployed (niri will run with default/empty config). Put your desktop configs under configs/.config/ (e.g. niri, waybar, ...) before restoring." " — no desktop config will be deployed (niri will run with default/empty config). Put your desktop configs under configs/.config/ (e.g. niri, waybar, ...) before restoring.")"
         if [ "$DRY_RUN" -eq 0 ] && ! confirm "$(_t "configs/ missing — continue without deploying config? [Y/n] (default Y):" "configs/ missing — continue without deploying config? [Y/n] (default Y):")" "Y" 30; then
-            error "$(_t "Aborted: run ./install.sh collect-config on the reference machine, commit configs/, push, then rerun." "Aborted: run ./install.sh collect-config on the reference machine, commit configs/, push, then rerun.")"
+            error "$(_t "Aborted: add a configs/ directory with your desktop configs, then rerun." "Aborted: add a configs/ directory with your desktop configs, then rerun.")"
             exit 1
         fi
     fi
@@ -4466,7 +4331,6 @@ usage() {
 eilNiri install.sh v$SCRIPT_VERSION — niri desktop environment replication tool
 
 Usage:
-  ./install.sh collect-config          collect this machine's config into configs/ (normal user)
   ./install.sh restore [--dry-run]      restore desktop on new system (root)
   ./install.sh status                   show background build progress (run from another terminal)
   ./install.sh rollback                 rollback config from backup (root)
@@ -4482,8 +4346,8 @@ Environment:
   EILNIRI_GH_PROXY     space-separated GitHub proxy URLs (default: ghfast.top gh-proxy.com ghproxy.net gh.llkk.cc)
 
 Workflow:
-  1. On your reference machine:  ./install.sh collect-config
-  2. Sync the repo (git push / USB): git add configs && git commit && git push
+  1. Provide a configs/ directory (place your desktop configs under configs/.config/)
+  2. Copy this eilNiri directory to the new machine (USB / network)
   3. On new machine (Arch/RHEL/Debian): sudo ./install.sh restore
      - niri/awww compile in background:  ./install.sh status   (live progress)
      - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
@@ -4496,7 +4360,7 @@ main() {
     local arg
     for arg in "$@"; do
         case "$arg" in
-            collect-config|restore|rollback|status|restore-system) MODE="$arg" ;;
+            restore|rollback|status|restore-system) MODE="$arg" ;;
             --dry-run)      DRY_RUN=1 ;;
             -h|--help)      usage; exit 0 ;;
             *) error "$(_t "Unknown argument: " "Unknown argument: ") $arg"; usage; exit 1 ;;
@@ -4504,7 +4368,6 @@ main() {
     done
 
     case "$MODE" in
-        collect-config)  collect_config ;;
         restore)         do_restore ;;
         status)          do_status ;;
         rollback)        do_rollback ;;
