@@ -616,8 +616,42 @@ ensure_fzf() {
     log "$(_t "Installing interactive menu dependency: fzf ..." "Installing interactive menu dependency: fzf ...")"
     local _saved_dry="$DRY_RUN"
     DRY_RUN=0  # fzf is required for interaction, so install it even in --dry-run
-    pm_install fzf || { error "$(_t "fzf install failed, cannot continue." "fzf install failed, cannot continue.")"; exit 1; }
+    if pm_install fzf; then
+        DRY_RUN="$_saved_dry"
+        return 0
+    fi
+    # Minimal RHEL images may not have fzf in the enabled repositories. Use the
+    # official release asset as a fallback instead of aborting the whole restore.
+    if [ "$DISTRO_FAMILY" = rhel ] && command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+        local _arch _asset _tmp _work _url _fzf_bin
+        case "$(uname -m)" in
+            x86_64)  _arch=linux_amd64 ;;
+            aarch64) _arch=linux_arm64 ;;
+            *)       _arch="" ;;
+        esac
+        if [ -n "$_arch" ]; then
+            _asset="fzf-${_arch}.tar.gz"
+            _tmp=$(mktemp)
+            _work=$(mktemp -d)
+            register_temp_path "$_tmp"
+            register_temp_path "$_work"
+            _url="https://github.com/junegunn/fzf/releases/latest/download/${_asset}"
+            if download_gh "$_url" "$_tmp" && tar xzf "$_tmp" -C "$_work" 2>/dev/null; then
+                _fzf_bin="$_work/fzf"
+                if [ -x "$_fzf_bin" ]; then
+                    exe install -Dm755 "$_fzf_bin" /usr/local/bin/fzf
+                    if command -v fzf >/dev/null 2>&1; then
+                        DRY_RUN="$_saved_dry"
+                        log "$(_t "Installed fzf from the official release archive." "Installed fzf from the official release archive.")"
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+    fi
     DRY_RUN="$_saved_dry"
+    error "$(_t "fzf install failed, cannot continue." "fzf install failed, cannot continue.")"
+    exit 1
 }
 
 # fzf multi-select (see 99-apps.sh: select all by default / TAB toggle / Ctrl-A select all / Ctrl-D deselect all)
