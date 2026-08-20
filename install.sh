@@ -676,6 +676,49 @@ fzf_single() {
         --header="$1"
 }
 
+# Resolve the DRM connector at session startup, after GDM has handed the device
+# to the user session. Installation-time detection can see a different connector
+# (or no connector at all) on virtual machines.
+install_niri_output_wrapper() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _wrapper=/usr/local/bin/eilniri-niri-session
+    cat > "$_wrapper" <<'WRAPEOF'
+#!/usr/bin/env bash
+set -u
+
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl"
+tmp="${cfg}.eilniri-output.$$"
+out=""; mode=""
+for status in /sys/class/drm/card*-*/status; do
+    [ -f "$status" ] || continue
+    [ "$(<"$status")" = connected ] || continue
+    dir=${status%/status}
+    candidate=${dir##*/}
+    candidate=${candidate#card[0-9]-}
+    candidate_mode=$(sed -n '1p' "$dir/modes" 2>/dev/null || true)
+    [ -n "$candidate" ] && [ -n "$candidate_mode" ] || continue
+    out="$candidate"; mode="$candidate_mode"; break
+done
+
+if [ -n "$out" ] && [ -n "$mode" ] && [ -f "$cfg" ]; then
+    w=${mode%x*}; h=${mode#*x}; mode_line="mode \"${w}x${h}@60\""
+    awk -v output="$out" -v mode_line="$mode_line" '
+        BEGIN { replaced=0; inside=0 }
+        !replaced && $0 ~ /^[[:space:]]*output[[:space:]]+"/ {
+            print "output \"" output "\" {"; print "    " mode_line
+            replaced=1; inside=1; next
+        }
+        inside && $0 ~ /^[[:space:]]*}/ { print "}"; inside=0; next }
+        inside { next }
+        { print }
+    ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+fi
+
+exec /usr/local/bin/niri-session.real "$@"
+WRAPEOF
+    chmod 755 "$_wrapper"
+}
+
 # --- Debian/Ubuntu apt mirror switch (offered when apt-get update or install fails ---
 # with 404 / 无法下载 / connection errors).  Rewrites the apt host in the source
 # files (both deb-format .list and deb822 .sources) to a selected mirror, backs up
@@ -1451,7 +1494,8 @@ _repair_niri_session() {
             # 缺失会直接黑屏。
             for _sess in "$work"/*/resources/niri-session "$work"/*/resources/niri-session.sh; do
                 [ -f "$_sess" ] || continue
-                exe install -Dm755 "$_sess" /usr/local/bin/niri-session 2>/dev/null || true
+                exe install -Dm755 "$_sess" /usr/local/bin/niri-session.real 2>/dev/null || true
+                install_niri_output_wrapper
                 break
             done
             # 顺手补上 systemd user units（GDM 登录循环的根因：缺 niri.service）
@@ -2030,7 +2074,8 @@ install_niri_from_build() { # $1 = srcdir, $2 = logfile
         # names resolved via PATH. Install niri-session and make /usr/local/bin visible
         # to GDM + the user systemd session on RHEL/Debian (where /usr/local/bin is
         # commonly NOT on the default PATH) — without it login goes straight to black.
-        exe install -Dm755 "$srcdir/resources/niri-session" /usr/local/bin/niri-session 2>/dev/null || true
+        exe install -Dm755 "$srcdir/resources/niri-session" /usr/local/bin/niri-session.real 2>/dev/null || true
+        install_niri_output_wrapper
         ensure_localbin_on_path
         exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/local/share/wayland-sessions/niri.desktop 2>/dev/null || true
         exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/share/wayland-sessions/niri.desktop 2>/dev/null || true
