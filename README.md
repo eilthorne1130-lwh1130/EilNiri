@@ -183,6 +183,7 @@ EilNiri/
 - **诊断**：restore 结尾打印 `NIRI STATUS`（niri 二进制/desktop/gdm Session 三态）+ `Boot Environment Check`（gdm 是否真能启动 niri）+ 生成 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包（各 build 日志 + AccountsService + custom.conf + 包清单），排查时直接分享该包
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
 - 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
+- **Debian/Ubuntu 虚拟机适配**：若 Niri 配置由 `spawn-at-startup "waybar"` 启动 Waybar，restore 会停止并屏蔽 systemd 侧的 `waybar.service`，避免登录后出现两个 Waybar；检测到 QEMU/KVM 时还会自动启用软件光标回退，减少鼠标拖影。若仍有拖影，请将虚拟显卡设为 `virtio-gpu` 并开启 3D 加速（`gl=on`），或使用 SPICE 显示协议。
 - collect-config 默认修正 niri config 两处笔误（swww-daemon→awww-daemon、authenntication→authentication），live 配置不受影响
 - 壁纸图片不在 `configs/` 内
 - 中断恢复：重跑自动跳过已完成阶段，删除 `.replicate_progress` 可强制全量重跑；**进度文件带脚本版本标记，旧版本脚本写的进度自动作废**（失败阶段不再标记完成，重跑自动重试，无需手动删文件）

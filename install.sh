@@ -3533,33 +3533,48 @@ stage_configs() {
         done
 
         # waybar 去重：niri config 用 spawn-at-startup "waybar" 时，只保留 niri 这一个启动
-        # 来源，彻底清除 systemd 侧的 waybar.service（无论文件在用户/系统 user 目录、有无
-        # enable 链接），并杀掉运行中残留的 waybar 进程——否则开机 niri spawn 一个 +
-        # 残留 systemd/手动实例 = 两个 waybar。
+        # 来源。Debian/GDM 可能同时加载用户 unit、系统 user unit 或 graphical-session
+        # target；仅删除 enable 链接不够，必须停止并屏蔽 waybar.service。
         if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
             && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
-            log "$(_t "niri spawns waybar at startup — removing duplicate waybar (systemd + running)" "niri spawns waybar at startup — removing duplicate waybar (systemd + running)")"
+            log "$(_t "niri spawns waybar at startup — keeping only the niri instance" "niri spawns waybar at startup — keeping only the niri instance")"
             as_user systemctl --user disable --now waybar.service 2>/dev/null || true
+            as_user systemctl --user mask waybar.service 2>/dev/null || true
             rm -f "$HOME_DIR/.config/systemd/user/default.target.wants/waybar.service" \
                   "$HOME_DIR/.config/systemd/user/graphical-session.target.wants/waybar.service" \
                   "$HOME_DIR/.config/systemd/user/waybar.service" \
                   /etc/systemd/user/default.target.wants/waybar.service \
-                  /etc/systemd/user/waybar.service 2>/dev/null || true
+                  /etc/systemd/user/graphical-session.target.wants/waybar.service \
+                  /etc/systemd/user/waybar.service \
+                  /usr/lib/systemd/user/default.target.wants/waybar.service \
+                  /usr/lib/systemd/user/graphical-session.target.wants/waybar.service \
+                  /usr/lib/systemd/user/waybar.service 2>/dev/null || true
+            mkdir -p "$HOME_DIR/.config/systemd/user"
+            ln -sfn /dev/null "$HOME_DIR/.config/systemd/user/waybar.service"
             as_user systemctl --user daemon-reload 2>/dev/null || true
-            # 杀掉运行中的 waybar（无论来源）；重启后 niri 会重新 spawn 唯一的一个。
+            # 杀掉运行中的 Waybar；重启后 Niri 会重新 spawn 唯一实例。
             # root 下直接对目标用户进程 pkill，避免残留实例与新实例并存。
             pkill -u "$TARGET_USER" -x waybar 2>/dev/null || true
             sleep 1
-            log "$(_t "Killed running waybar instances (niri will spawn one on next login)" "Killed running waybar instances (niri will spawn one on next login)")"
+            log "$(_t "Stopped and masked systemd waybar; niri will spawn the only instance on next login" "Stopped and masked systemd waybar; niri will spawn the only instance on next login")"
         fi
 
-        # 光标拖影：QEMU/KVM 虚拟机在合成器下常见（无硬件 cursor plane / 软件渲染）。
-        # guest 侧无法根本解决——提示用户调整 VM 显示配置（virtio-gpu + 3D 加速）。
-        # 注意：绝不在此处向 config.kdl 追加内容（曾因追加破坏 KDL 语法导致快捷键/壁纸全失效）。
+        # 光标拖影：QEMU/KVM 虚拟机常因虚拟硬件 cursor plane 与 Niri 不兼容。
+        # WLR_NO_HARDWARE_CURSORS=1 让 wlroots 使用软件光标；写入 environment.d，
+        # 不向 config.kdl 追加内容，避免破坏 Niri KDL 语法。
         if command -v systemd-detect-virt >/dev/null 2>&1; then
-            case "$(systemd-detect-virt 2>/dev/null)" in
+            local _virt
+            _virt=$(systemd-detect-virt 2>/dev/null || true)
+            case "$_virt" in
                 qemu|kvm)
-                    warn "$(_t "检测到 QEMU/KVM 虚拟机：若鼠标光标仍有拖影，请在 VM 配置把显卡设为 virtio-gpu 并开启 3D 加速（gl=on），或改用 spice 显示协议（spice-vdagent 已安装）。" "QEMU/KVM VM detected: if the mouse cursor still has ghosting/trailing, set the VM display to virtio-gpu with 3D acceleration (gl=on), or use the SPICE display protocol (spice-vdagent is installed).")"
+                    local _cursor_env="$HOME_DIR/.config/environment.d/90-eilniri-cursor.conf"
+                    mkdir -p "$(dirname "$_cursor_env")"
+                    if [ ! -f "$_cursor_env" ] || ! grep -q '^WLR_NO_HARDWARE_CURSORS=1$' "$_cursor_env" 2>/dev/null; then
+                        printf '%s\n' 'WLR_NO_HARDWARE_CURSORS=1' > "$_cursor_env"
+                        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cursor_env" 2>/dev/null || true
+                        log "$(_t "Enabled software cursor fallback for QEMU/KVM to prevent ghosting" "Enabled software cursor fallback for QEMU/KVM to prevent ghosting")"
+                    fi
+                    warn "$(_t "检测到 QEMU/KVM：已启用软件光标回退。若仍有拖影，请将虚拟显卡设为 virtio-gpu 并开启 3D 加速（gl=on），或改用 SPICE 显示协议。" "QEMU/KVM detected: software cursor fallback is enabled. If ghosting remains, use virtio-gpu with 3D acceleration (gl=on), or use the SPICE display protocol.")"
                     ;;
             esac
         fi
