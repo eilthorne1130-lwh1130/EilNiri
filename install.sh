@@ -64,7 +64,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.24"
+SCRIPT_VERSION="1.9.25"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -272,7 +272,13 @@ declare -A RHEL_COPR_PKG=(
     [niri]=yalter/niri
     [hyprlock]=solopasha/hyprland
     [hypridle]=solopasha/hyprland
+    [copyq]=alebastr/sway-extras
+    [playerctl]=alebastr/sway-extras
+    [brightnessctl]=alebastr/sway-extras
 )
+# Packages expected from EPEL on EL10 (Fedora has them in the base repo).
+# After a failed dnf, retry with --enablerepo=epel* before COPR/source.
+RHEL_EPEL_PKGS=(copyq playerctl brightnessctl fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime power-profiles-daemon waybar mako fuzzel grim slurp)
 # Runtime graphics packages required by niri on EL systems.  These are separate
 # from the compiler dependencies below: a minimal Rocky/Alma install can build
 # niri successfully while still lacking Mesa/DRM support for a virtio GPU.
@@ -345,7 +351,7 @@ HYPR_BUILD_DEPS_DEB=(build-essential cmake ninja-build pkg-config git libwayland
 # hyprlock / hypridle system build dependencies (RHEL family names)
 HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git wayland-devel wayland-protocols-devel
     pango-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel libdrm-devel libxkbcommon-devel libxcb-devel
-    cairo-gobject-devel cairo-devel libpam-devel pixman-devel libjpeg-turbo-devel libwebp-devel
+    cairo-gobject-devel cairo-devel pam-devel libpam-devel pixman-devel libjpeg-turbo-devel libwebp-devel
     librsvg2-devel file-devel libpng-devel pugixml-devel sdbus-cpp-devel)
 
 # System components (from other desktop environments) to disable when restoring
@@ -539,7 +545,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v38"
+PROGRESS_VERSION="v39"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -857,7 +863,7 @@ set_debian_mirror() { # $1 = 可选：直接指定镜像 (tuna|aliyun|ustc)，�
 _rhel_refresh_enablerepo() {
     RHEL_DNF_ENABLEREPO=()
     local _ids _id
-    _ids=$(dnf repolist --all 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /^(epel|crb|powertools|codeready|copr:)/ {print $1}')
+    _ids=$(dnf repolist --all 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /(^epel|crb|powertools|codeready|copr)/ {print $1}')
     for _id in $_ids; do
         RHEL_DNF_ENABLEREPO+=("--enablerepo=$_id")
     done
@@ -1266,6 +1272,17 @@ install_rhel() {
         fi
         erc=0
         pm_install "$name" || erc=$?
+        if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
+            local _is_epel=0 _e
+            for _e in "${RHEL_EPEL_PKGS[@]}"; do
+                [ "$_e" = "$p" ] || [ "$_e" = "$name" ] && _is_epel=1
+            done
+            if [ "$_is_epel" -eq 1 ]; then
+                log "$(_t "Retrying " "Retrying ") $name$(_t " with EPEL explicitly enabled..." " with EPEL explicitly enabled...")"
+                erc=0
+                exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$name" || erc=$?
+            fi
+        fi
         if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ -n "${RHEL_COPR_PKG[$p]:-}" ]; then
             local _crc=0
             install_rhel_copr_pkg "$name" "${RHEL_COPR_PKG[$p]}" || _crc=$?
@@ -1316,12 +1333,15 @@ install_rhel_copr_pkg() { # $1=pkg $2=copr (owner/name)
     if ! dnf copr --help >/dev/null 2>&1; then
         return 1
     fi
-    if ! exe dnf -y copr enable "$_copr"; then
+    if ! exe dnf -y copr enable "$_copr" && ! exe dnf copr enable -y "$_copr"; then
         return 1
     fi
     _rhel_refresh_enablerepo
     local _erc=0
     exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$_pkg" || _erc=$?
+    if [ "$_erc" -ne 0 ]; then
+        exe dnf install -y --enablerepo='*copr*' --enablerepo='epel*' "$_pkg" || _erc=$?
+    fi
     return "$_erc"
 }
 
@@ -2836,6 +2856,13 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
             warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
+        # EL names pam-devel (not libpam-devel). Force it so hyprlock's
+        # find_library(PAM) / pkg_check_modules(PAM) succeeds.
+        dnf_install_tolerant pam-devel || true
+        if [ ! -f /usr/include/security/pam_appl.h ] && [ ! -f /usr/include/pam/pam_appl.h ]; then
+            MANUAL_ITEMS+=("$pkg — pam-devel missing (libpam not found); install: dnf install pam-devel, then rerun")
+            return 1
+        fi
     fi
     if ! ensure_rust; then
         MANUAL_ITEMS+=("$pkg — Rust toolchain install failed, build manually: $repo")
@@ -3238,6 +3265,11 @@ stage_services() {
                 pm_install epel-release 2>/dev/null || true
                 erc=0
                 pm_install "$provider" || erc=$?
+            fi
+            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ "$DISTRO_FAMILY" = rhel ]; then
+                log "$(_t "Retrying service provider with EPEL: " "Retrying service provider with EPEL: ")$provider"
+                erc=0
+                exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$provider" || erc=$?
             fi
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
                 FAILED_PKGS+=("svc-provider:$provider")
