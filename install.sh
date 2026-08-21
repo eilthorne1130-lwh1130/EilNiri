@@ -3557,31 +3557,44 @@ stage_configs() {
             done < <(sed -n 's/^ExecStart=//p' "$_sf" 2>/dev/null)
         done
 
-        # waybar 去重：niri config 用 spawn-at-startup "waybar" 时，只保留 niri 这一个启动
-        # 来源。Debian/GDM 可能同时加载用户 unit、系统 user unit 或 graphical-session
-        # target；仅删除 enable 链接不够，必须停止并屏蔽 waybar.service。
+        # waybar 去重：只保留 niri 的 spawn-at-startup 作为启动来源。
+        # 清理 systemd user unit、target 链接和 XDG autostart，避免 GDM
+        # session 与 niri 同时启动两个 Waybar 实例。
         if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
             && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
             log "$(_t "niri spawns waybar at startup — keeping only the niri instance" "niri spawns waybar at startup — keeping only the niri instance")"
             as_user systemctl --user disable --now waybar.service 2>/dev/null || true
-            as_user systemctl --user mask waybar.service 2>/dev/null || true
+            as_user systemctl --user disable --now waybar-session.service 2>/dev/null || true
+            as_user systemctl --user mask waybar.service waybar-session.service 2>/dev/null || true
             rm -f "$HOME_DIR/.config/systemd/user/default.target.wants/waybar.service" \
                   "$HOME_DIR/.config/systemd/user/graphical-session.target.wants/waybar.service" \
+                  "$HOME_DIR/.config/systemd/user/default.target.wants/waybar-session.service" \
+                  "$HOME_DIR/.config/systemd/user/graphical-session.target.wants/waybar-session.service" \
                   "$HOME_DIR/.config/systemd/user/waybar.service" \
+                  "$HOME_DIR/.config/systemd/user/waybar-session.service" \
                   /etc/systemd/user/default.target.wants/waybar.service \
                   /etc/systemd/user/graphical-session.target.wants/waybar.service \
+                  /etc/systemd/user/default.target.wants/waybar-session.service \
+                  /etc/systemd/user/graphical-session.target.wants/waybar-session.service \
                   /etc/systemd/user/waybar.service \
+                  /etc/systemd/user/waybar-session.service \
                   /usr/lib/systemd/user/default.target.wants/waybar.service \
                   /usr/lib/systemd/user/graphical-session.target.wants/waybar.service \
-                  /usr/lib/systemd/user/waybar.service 2>/dev/null || true
+                  /usr/lib/systemd/user/default.target.wants/waybar-session.service \
+                  /usr/lib/systemd/user/graphical-session.target.wants/waybar-session.service \
+                  /usr/lib/systemd/user/waybar.service \
+                  /usr/lib/systemd/user/waybar-session.service \
+                  /etc/xdg/autostart/waybar.desktop \
+                  "$HOME_DIR/.config/autostart/waybar.desktop" 2>/dev/null || true
             mkdir -p "$HOME_DIR/.config/systemd/user"
             ln -sfn /dev/null "$HOME_DIR/.config/systemd/user/waybar.service"
+            ln -sfn /dev/null "$HOME_DIR/.config/systemd/user/waybar-session.service"
             as_user systemctl --user daemon-reload 2>/dev/null || true
             # 杀掉运行中的 Waybar；重启后 Niri 会重新 spawn 唯一实例。
             # root 下直接对目标用户进程 pkill，避免残留实例与新实例并存。
             pkill -u "$TARGET_USER" -x waybar 2>/dev/null || true
             sleep 1
-            log "$(_t "Stopped and masked systemd waybar; niri will spawn the only instance on next login" "Stopped and masked systemd waybar; niri will spawn the only instance on next login")"
+            log "$(_t "Removed competing Waybar launchers; niri will spawn the only instance on next login" "Removed competing Waybar launchers; niri will spawn the only instance on next login")"
         fi
 
         # 光标拖影：QEMU/KVM 虚拟机常因虚拟硬件 cursor plane 与 Niri 不兼容。
