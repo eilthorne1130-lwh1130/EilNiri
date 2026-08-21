@@ -688,6 +688,8 @@ set -u
 
 cfg="${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl"
 tmp="${cfg}.eilniri-output.$$"
+export WLR_NO_HARDWARE_CURSORS=1
+export WLR_RENDERER_ALLOW_SOFTWARE=1
 out=""; mode=""
 for status in /sys/class/drm/card*-*/status; do
     [ -f "$status" ] || continue
@@ -3557,49 +3559,20 @@ stage_configs() {
             done < <(sed -n 's/^ExecStart=//p' "$_sf" 2>/dev/null)
         done
 
-        # waybar 去重：只保留 niri 的 spawn-at-startup 作为启动来源。
-        # 清理 systemd user unit、target 链接和 XDG autostart，避免 GDM
-        # session 与 niri 同时启动两个 Waybar 实例。
+        # waybar 由 GDM/systemd session 启动；niri 中的 spawn-at-startup 会
+        # 产生第二个实例，因此将该启动项注释掉。
         if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
             && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
-            log "$(_t "niri spawns waybar at startup — keeping only the niri instance" "niri spawns waybar at startup — keeping only the niri instance")"
-            as_user systemctl --user disable --now waybar.service 2>/dev/null || true
-            as_user systemctl --user disable --now waybar-session.service 2>/dev/null || true
-            as_user systemctl --user mask waybar.service waybar-session.service 2>/dev/null || true
-            rm -f "$HOME_DIR/.config/systemd/user/default.target.wants/waybar.service" \
-                  "$HOME_DIR/.config/systemd/user/graphical-session.target.wants/waybar.service" \
-                  "$HOME_DIR/.config/systemd/user/default.target.wants/waybar-session.service" \
-                  "$HOME_DIR/.config/systemd/user/graphical-session.target.wants/waybar-session.service" \
-                  "$HOME_DIR/.config/systemd/user/waybar.service" \
-                  "$HOME_DIR/.config/systemd/user/waybar-session.service" \
-                  /etc/systemd/user/default.target.wants/waybar.service \
-                  /etc/systemd/user/graphical-session.target.wants/waybar.service \
-                  /etc/systemd/user/default.target.wants/waybar-session.service \
-                  /etc/systemd/user/graphical-session.target.wants/waybar-session.service \
-                  /etc/systemd/user/waybar.service \
-                  /etc/systemd/user/waybar-session.service \
-                  /usr/lib/systemd/user/default.target.wants/waybar.service \
-                  /usr/lib/systemd/user/graphical-session.target.wants/waybar.service \
-                  /usr/lib/systemd/user/default.target.wants/waybar-session.service \
-                  /usr/lib/systemd/user/graphical-session.target.wants/waybar-session.service \
-                  /usr/lib/systemd/user/waybar.service \
-                  /usr/lib/systemd/user/waybar-session.service \
-                  /etc/xdg/autostart/waybar.desktop \
-                  "$HOME_DIR/.config/autostart/waybar.desktop" 2>/dev/null || true
-            mkdir -p "$HOME_DIR/.config/systemd/user"
-            ln -sfn /dev/null "$HOME_DIR/.config/systemd/user/waybar.service"
-            ln -sfn /dev/null "$HOME_DIR/.config/systemd/user/waybar-session.service"
-            as_user systemctl --user daemon-reload 2>/dev/null || true
-            # 杀掉运行中的 Waybar；重启后 Niri 会重新 spawn 唯一实例。
-            # root 下直接对目标用户进程 pkill，避免残留实例与新实例并存。
+            sed -i -E 's/^([[:space:]]*)spawn-at-startup[[:space:]]+"waybar"/\1# spawn-at-startup "waybar" (started by GDM\/systemd)/' "$HOME_DIR/.config/niri/config.kdl"
+            chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
             pkill -u "$TARGET_USER" -x waybar 2>/dev/null || true
             sleep 1
-            log "$(_t "Removed competing Waybar launchers; niri will spawn the only instance on next login" "Removed competing Waybar launchers; niri will spawn the only instance on next login")"
+            log "$(_t "Disabled niri Waybar startup; GDM/systemd will provide the only instance" "Disabled niri Waybar startup; GDM/systemd will provide the only instance")"
         fi
 
         # 光标拖影：QEMU/KVM 虚拟机常因虚拟硬件 cursor plane 与 Niri 不兼容。
-        # WLR_NO_HARDWARE_CURSORS=1 让 wlroots 使用软件光标；写入 environment.d，
-        # 不向 config.kdl 追加内容，避免破坏 Niri KDL 语法。
+        # Keep the environment file for user services, and export the same
+        # variables from the niri-session wrapper so GDM definitely inherits them.
         if command -v systemd-detect-virt >/dev/null 2>&1; then
             local _virt
             _virt=$(systemd-detect-virt 2>/dev/null || true)
@@ -3608,7 +3581,7 @@ stage_configs() {
                     local _cursor_env="$HOME_DIR/.config/environment.d/90-eilniri-cursor.conf"
                     mkdir -p "$(dirname "$_cursor_env")"
                     if [ ! -f "$_cursor_env" ] || ! grep -q '^WLR_NO_HARDWARE_CURSORS=1$' "$_cursor_env" 2>/dev/null; then
-                        printf '%s\n' 'WLR_NO_HARDWARE_CURSORS=1' > "$_cursor_env"
+                        printf '%s\n' 'WLR_NO_HARDWARE_CURSORS=1' 'WLR_RENDERER_ALLOW_SOFTWARE=1' > "$_cursor_env"
                         chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cursor_env" 2>/dev/null || true
                         log "$(_t "Enabled software cursor fallback for QEMU/KVM to prevent ghosting" "Enabled software cursor fallback for QEMU/KVM to prevent ghosting")"
                     fi
