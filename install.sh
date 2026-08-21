@@ -64,7 +64,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.22"
+SCRIPT_VERSION="1.9.23"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -466,10 +466,13 @@ pkg_installed() { # $1 = package name
     esac
 }
 
+# Extra dnf --enablerepo flags filled by ensure_rhel_repos (epel/crb/powertools).
+RHEL_DNF_ENABLEREPO=()
+
 pm_install() { # $@ = package names
     case "$DISTRO_FAMILY" in
         arch)   exe pacman -S --noconfirm --needed "$@" ;;
-        rhel)   exe dnf install -y "$@" ;;
+        rhel)   exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$@" ;;
         debian) exe apt-get install -y "$@" ;;
     esac
 }
@@ -503,13 +506,13 @@ apt_install_tolerant() {
 dnf_install_tolerant() {
     BDEPS_MISSING=()
     [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$@"); return "$DRY_RUN_RC"; }
-    if exe dnf install -y "$@" 2>>"$LOG_DIR/dnf-errors.log"; then
+    if exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$@" 2>>"$LOG_DIR/dnf-errors.log"; then
         return 0   # whole batch installed
     fi
     local p erc
     for p in "$@"; do
         erc=0
-        exe dnf install -y "$p" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
+        exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$p" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
         [ "$erc" -ne 0 ] && BDEPS_MISSING+=("$p")
     done
     [ ${#BDEPS_MISSING[@]} -eq 0 ]
@@ -835,28 +838,54 @@ set_debian_mirror() { # $1 = 可选：直接指定镜像 (tuna|aliyun|ustc)，�
 # dav1d, pixman, librsvg, fcitx5-rime, sdbus-c++, ...) are actually available.
 # CRB is CodeReady Builder on RHEL / "CRB" on Rocky/Alma; dnf5 (EL10+/Fedora 41+)
 # uses `config-manager setopt`, dnf4 uses `config-manager --set-enabled`.
+# Collect --enablerepo=ID for every extra repo we care about that dnf knows
+# (enabled or disabled). Unknown IDs must never be passed — dnf treats them as errors.
+_rhel_refresh_enablerepo() {
+    RHEL_DNF_ENABLEREPO=()
+    local _ids _id
+    _ids=$(dnf repolist --all 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /^(epel|crb|powertools|codeready)/ {print $1}')
+    for _id in $_ids; do
+        RHEL_DNF_ENABLEREPO+=("--enablerepo=$_id")
+    done
+}
+
+# Enable EPEL + CRB/PowerTools on RHEL family so -devel packages (and EPEL apps)
+# are available. Rocky/Alma 8 use "powertools"; 9/10 and CentOS Stream use "crb";
+# RHEL itself uses CodeReady Builder / RHUI IDs. Fedora already has most packages
+# in the official repos — extra enables are best-effort and ignored if absent.
 ensure_rhel_repos() {
     [ "$DISTRO_FAMILY" = rhel ] || return 0
-    [ "$DRY_RUN" -eq 1 ] && { log "$(_t "[DRY-RUN] would enable EPEL + CRB repos." "[DRY-RUN] would enable EPEL + CRB repos.")"; return 0; }
+    [ "$DRY_RUN" -eq 1 ] && { log "$(_t "[DRY-RUN] would enable EPEL + CRB/PowerTools repos." "[DRY-RUN] would enable EPEL + CRB/PowerTools repos.")"; return 0; }
     if [ ! -f /etc/yum.repos.d/epel.repo ] && ! rpm -q epel-release >/dev/null 2>&1; then
         log "$(_t "Enabling EPEL..." "Enabling EPEL...")"
-        pm_install epel-release 2>/dev/null || warn "$(_t "EPEL enable failed; some -devel packages may be unavailable." "EPEL enable failed; some -devel packages may be unavailable.")"
+        dnf install -y epel-release 2>/dev/null \
+            || warn "$(_t "EPEL enable failed; some -devel packages may be unavailable." "EPEL enable failed; some -devel packages may be unavailable.")"
     fi
-    # CRB / CodeReady Builder — try dnf5 (setopt) then dnf4 (--set-enabled), then the
-    # RHEL RHUI variant, then install dnf-plugins-core and retry the dnf4 form.
-    if ! dnf repolist 2>/dev/null | grep -qiE '^\s*(crb|codeready-builder)'; then
-        log "$(_t "Enabling CRB (CodeReady Builder) repo..." "Enabling CRB (CodeReady Builder) repo...")"
-        if dnf config-manager setopt crb.enabled=1 2>/dev/null; then
-            :
-        elif dnf config-manager --set-enabled crb 2>/dev/null \
-            || dnf config-manager --set-enabled codeready-builder-for-rhel-9-rhui-rpms 2>/dev/null; then
-            :
-        else
-            # dnf4 needs dnf-plugins-core for config-manager
-            pm_install dnf-plugins-core 2>/dev/null || true
-            dnf config-manager --set-enabled crb 2>/dev/null \
-                || warn "$(_t "CRB enable failed; some -devel packages may be unavailable." "CRB enable failed; some -devel packages may be unavailable.")"
-        fi
+    if ! command -v dnf >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! dnf config-manager --help >/dev/null 2>&1; then
+        dnf install -y dnf-plugins-core 2>/dev/null || true
+    fi
+    log "$(_t "Enabling CRB / PowerTools (CodeReady Builder)..." "Enabling CRB / PowerTools (CodeReady Builder)...")"
+    # Rocky ships a `crb enable` helper; try it first.
+    command -v crb >/dev/null 2>&1 && crb enable >/dev/null 2>&1 || true
+    # dnf5
+    dnf config-manager setopt crb.enabled=1 2>/dev/null || true
+    dnf config-manager setopt powertools.enabled=1 2>/dev/null || true
+    # dnf4 — try every historical ID; unknown IDs fail quietly
+    local _rid
+    for _rid in crb CRB powertools PowerTools \
+        codeready-builder-for-rhel-8-rhui-rpms \
+        codeready-builder-for-rhel-9-rhui-rpms \
+        codeready-builder-for-rhel-10-rhui-rpms; do
+        dnf config-manager --set-enabled "$_rid" 2>/dev/null || true
+    done
+    _rhel_refresh_enablerepo
+    if dnf repolist 2>/dev/null | grep -qiE 'epel|crb|powertools|codeready'; then
+        log "$(_t "Extra repos active:" "Extra repos active:") $(dnf repolist 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /(epel|crb|powertools|codeready)/ {printf "%s ", $1}')"
+    else
+        warn "$(_t "CRB/PowerTools/EPEL still not visible; -devel packages may be missing. Try: dnf install epel-release && dnf config-manager --set-enabled crb" "CRB/PowerTools/EPEL still not visible; -devel packages may be missing. Try: dnf install epel-release && dnf config-manager --set-enabled crb")"
     fi
 }
 
@@ -1216,8 +1245,16 @@ install_rhel() {
                 warn "$(_t "No xwayland-satellite package in dnf, falling back to cargo install..." "No xwayland-satellite package in dnf, falling back to cargo install...")"
                 install_xwayland_satellite
             elif [ -n "${SOURCE_PKGS[$p]:-}" ]; then
-                warn "$(_t "No dnf package for " "No dnf package for ") $p, building from source..."
-                install_hypr_source "$p" "${SOURCE_PKGS[$p]}"
+                local _crc=0
+                install_rhel_copr_pkg "$name" "solopasha/hyprland" || _crc=$?
+                if [ "$_crc" -eq 0 ]; then
+                    INSTALLED_PKGS+=("$name (COPR)")
+                elif [ "$_crc" -eq "$DRY_RUN_RC" ]; then
+                    DRY_PKGS+=("$name (COPR)")
+                else
+                    warn "$(_t "No dnf/COPR package for " "No dnf/COPR package for ") $p, building from source..."
+                    install_hypr_source "$p" "${SOURCE_PKGS[$p]}"
+                fi
             elif [ "$p" = "ttf-jetbrains-mono-nerd" ]; then
                 # Nerd Font: jetbrains-mono-nerd-fonts is only in the Fedora repo.
                 # On Rocky/Alma/CentOS dnf has no such package — install_nerd_font,
@@ -1234,38 +1271,38 @@ install_rhel() {
     done
 }
 
+# Enable a COPR and install one package. Best-effort: missing copr plugin or
+# missing chroot for this EL version returns 1 quickly (caller falls back).
+install_rhel_copr_pkg() { # $1=pkg $2=copr (owner/name)
+    local _pkg="$1" _copr="$2"
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$_pkg (COPR $_copr)"); return "$DRY_RUN_RC"; }
+    if ! dnf copr --help >/dev/null 2>&1; then
+        dnf install -y dnf-plugins-core 2>/dev/null || true
+    fi
+    if ! dnf copr --help >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! exe dnf -y copr enable "$_copr"; then
+        return 1
+    fi
+    _rhel_refresh_enablerepo
+    local _erc=0
+    exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$_pkg" || _erc=$?
+    return "$_erc"
+}
+
 # Install niri from the author's COPR on EL10 (Rocky/Alma/CentOS Stream 10).
 # yalter/niri only builds the epel-10 chroot (plus Fedora), so this path is taken
 # only when the running RHEL-family system is EL10 and `dnf copr` is usable.
 # Returns 0 on success, 1 on failure, DRY_RUN_RC in dry-run (caller handles it).
 install_niri_copr() {
-    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("niri (COPR)"); return "$DRY_RUN_RC"; }
-    # EL10 only — the COPR has no EL9 build (avoids a doomed enable+install on EL9).
     local _maj
     _maj=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
     if [ "$_maj" != "10" ]; then
         log "$(_t "yalter/niri COPR builds only for EL10 (this is EL$_maj) — skipping COPR path." "yalter/niri COPR builds only for EL10 (this is EL$_maj) — skipping COPR path.")"
         return 1
     fi
-    # `dnf copr` lives in dnf-plugins-core (dnf5 also ships it); install if missing.
-    if ! dnf copr --help >/dev/null 2>&1; then
-        pm_install dnf-plugins-core 2>/dev/null || true
-    fi
-    if ! dnf copr --help >/dev/null 2>&1; then
-        log "$(_t "dnf copr not available — skipping COPR path." "dnf copr not available — skipping COPR path.")"
-        return 1
-    fi
-    # COPR-built niri on epel-10 may depend on EPEL packages; enable it first (best effort).
-    if ! rpm -q epel-release >/dev/null 2>&1 && [ ! -f /etc/yum.repos.d/epel.repo ]; then
-        pm_install epel-release 2>/dev/null || true
-    fi
-    if ! exe dnf -y copr enable yalter/niri; then
-        log "$(_t "COPR enable failed — skipping COPR path." "COPR enable failed — skipping COPR path.")"
-        return 1
-    fi
-    local _erc=0
-    exe dnf install -y niri || _erc=$?
-    return "$_erc"
+    install_rhel_copr_pkg niri yalter/niri
 }
 
 # --- GitHub download (official direct; resume + retries + timeouts) ---
@@ -2033,7 +2070,7 @@ EOF
             return 1
         fi
     else
-        exe dnf install -y "${NIRI_BUILD_DEPS_RHEL[@]}" || bdeps_rc=$?
+        dnf_install_tolerant "${NIRI_BUILD_DEPS_RHEL[@]}" || bdeps_rc=$?
     fi
     
     if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
@@ -2155,7 +2192,7 @@ install_awww() {
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
             warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
-        exe dnf install -y dav1d lz4 2>/dev/null || true
+        exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} dav1d lz4 2>/dev/null || true
         # pkg-config 预检（RHEL 只校验不自愈）：wayland-client / xkbcommon / liblz4
         # 必装；dav1d 可选，缺了不阻塞（awww 仍能编译/运行）。
         if ! ensure_pc_deps wayland-client xkbcommon liblz4; then
@@ -2386,7 +2423,7 @@ install_satty() {
     if [ "$DISTRO_FAMILY" = debian ]; then
         exe apt-get install -y libgtk-4-1 libadwaita-1-0 librsvg2-2 || warn "$(_t "satty runtime libraries failed to install; the binary may not start." "satty runtime libraries failed to install; the binary may not start.")"
     else
-        exe dnf install -y gtk4 libadwaita librsvg2 || warn "$(_t "satty runtime libraries failed to install; the binary may not start." "satty runtime libraries failed to install; the binary may not start.")"
+        exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} gtk4 libadwaita librsvg2 || warn "$(_t "satty runtime libraries failed to install; the binary may not start." "satty runtime libraries failed to install; the binary may not start.")"
     fi
 
     # --- Strategy 1: official prebuilt binary ---
@@ -2446,7 +2483,7 @@ install_satty() {
             warn "$(_t "Some satty build deps unavailable (continuing):" "Some satty build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
     else
-        exe dnf install -y gcc pkgconf-pkg-config gtk4-devel libadwaita-devel librsvg2-devel || bdeps_rc=$?
+        dnf_install_tolerant gcc pkgconf-pkg-config gtk4-devel libadwaita-devel librsvg2-devel || bdeps_rc=$?
     fi
     if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
         MANUAL_ITEMS+=("satty — build dependencies install failed, install manually: $SATTY_GH")

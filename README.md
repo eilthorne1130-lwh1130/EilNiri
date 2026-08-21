@@ -84,7 +84,7 @@ sudo ./install.sh restore-system
 - 无 RPM 对应包自动走替代安装（awww 源码构建 / satty 预编译 / rime-ice 词库部署 / gdm 登录管理器），只有全部失败才列入手动安装报告
 - waypaper 走 pip3 兜底
 - **Fedora**：niri / hyprlock / hypridle / xwayland-satellite 官方仓库都有，`dnf` 直接装
-- **Rocky / Alma / CentOS Stream**：这些包默认仓库没有——restore 开头**自动启用 EPEL + CRB**（含 dnf-plugins-core），让 xcb-cursor / dav1d / pixman / fcitx5-rime / sdbus-c++ 等 `-devel` 构建依赖可装；niri 自动回退官方预编译/源码编译安装；hyprlock/hypridle/xwayland-satellite 若仓库仍缺则给 EPEL / Copr / 手动指引
+- **Rocky / Alma / CentOS Stream**：这些包默认仓库没有——restore 开头**自动启用 EPEL + CRB/PowerTools**（EL8 为 PowerTools，EL9/10 为 crb；含 dnf-plugins-core），后续所有 `dnf install` 会带上 `--enablerepo`；niri 优先 COPR（yalter/niri，EL10）；hyprlock/hypridle 优先 COPR（solopasha/hyprland），再才源码编译
 - **awww / satty**（全部 RHEL 系）：awww 自动从 Codeberg 源码构建（约 5 分钟）；satty 自动下载官方预编译二进制，不可用时回退 cargo 构建
 - **登录管理器**：自动装并启用 `gdm`（Fedora 仓库有 / gdm3 兜底；装不上会提示并给出 tty 方案）
 
@@ -173,7 +173,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore 开头都会显示 `v版本号`（当前 v1.9.11）——目标机器上先看版本号确认拷到的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore 开头都会显示 `v版本号`（当前 v1.9.23）——目标机器上先看版本号确认拷到的是最新脚本（旧进度文件自动作废）
 - **多桌面环境**：restore 会自动禁用（不卸载）其他 DE 的冲突组件（通知/设置守护等），清单存 `.system_disabled`；切回其他 DE 前用 `sudo ./install.sh restore-system` 重新启用，或 `EILNIRI_KEEP_SYS=1` 跳过禁用
 - **诊断**：restore 结尾打印 `NIRI STATUS`（niri 二进制/desktop/gdm Session 三态）+ `Boot Environment Check`（gdm 是否真能启动 niri）+ 生成 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包（各 build 日志 + AccountsService + custom.conf + 包清单），排查时直接分享该包
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
