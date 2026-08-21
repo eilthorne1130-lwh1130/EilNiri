@@ -3439,11 +3439,24 @@ install_zsh_extras() {
     fi
 }
 
+prune_config_backups() { # $1 = directory, $2 = basename glob
+    local dir="$1" pattern="$2" backup
+    [ -d "$dir" ] || return 0
+    mapfile -t backups < <(
+        find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
+            | sort -rn | awk 'NR > 1 { sub(/^[^ ]+ /, ""); print }'
+    )
+    for backup in "${backups[@]}"; do
+        [ -n "$backup" ] && rm -f -- "$backup"
+    done
+}
+
 deploy_one() { # $1 = source path, $2 = destination path
     local src="$1" dst="$2" ts="$3"
     if [ -e "$dst" ] || [ -L "$dst" ]; then
         log "$(_t "Backup existing: " "Backup existing: ")$dst -> $dst.bak-$ts"
         exe mv "$dst" "$dst.bak-$ts"
+        prune_config_backups "$(dirname "$dst")" "$(basename "$dst").bak-*"
     fi
     exe cp -r "$src" "$dst"
     exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dst"
@@ -3871,6 +3884,7 @@ stage_hardware_adapt() {
         log "$(_t "Adapting niri output config..." "Adapting niri output config...")"
         # backup
         cp "$niri_cfg" "$niri_cfg.bak-hw-$(date +%Y%m%d-%H%M%S)"
+        prune_config_backups "$(dirname "$niri_cfg")" "$(basename "$niri_cfg").bak-hw-*"
 
         # find the first active output block and replace its name and mode
         local tmp
@@ -4382,6 +4396,7 @@ do_rollback() {
         target="$HOME_DIR/.config/$name"
         if [ -e "$target" ] || [ -L "$target" ]; then
             exe mv "$target" "$target.bak-$ts"
+            prune_config_backups "$(dirname "$target")" "$(basename "$target").bak-*"
         fi
         exe cp -r "$item" "$target"
         exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
@@ -4396,6 +4411,7 @@ do_rollback() {
         mkdir -p "$(dirname "$target")"
         if [ -e "$target" ] || [ -L "$target" ]; then
             exe mv "$target" "$target.bak-$ts"
+            prune_config_backups "$(dirname "$target")" "$(basename "$target").bak-*"
         fi
         exe cp -r "$item" "$target"
         exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
@@ -4406,6 +4422,7 @@ do_rollback() {
         mkdir -p "$(dirname "$target")"
         if [ -e "$target" ] || [ -L "$target" ]; then
             exe mv "$target" "$target.bak-$ts"
+            prune_config_backups "$(dirname "$target")" "$(basename "$target").bak-*"
         fi
         exe cp "$item" "$target"
         exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
@@ -4418,6 +4435,7 @@ do_rollback() {
         [ -f "$item" ] || continue
         if [ -e "$target" ] || [ -L "$target" ]; then
             exe mv "$target" "$target.bak-$ts"
+            prune_config_backups "$(dirname "$target")" "$(basename "$target").bak-*"
         fi
         exe cp "$item" "$target"
         exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
