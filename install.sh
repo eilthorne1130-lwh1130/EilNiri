@@ -997,6 +997,14 @@ load_app_universe() {
             REPO_UNIVERSE+=("$raw")
         done
     done
+    if [ "$DISTRO_FAMILY" != arch ]; then
+        local _filtered=() _pkg
+        for _pkg in "${REPO_UNIVERSE[@]}"; do
+            [ "$_pkg" = zsh ] && continue
+            _filtered+=("$_pkg")
+        done
+        REPO_UNIVERSE=("${_filtered[@]}")
+    fi
 }
 
 group_tag() { # $1 = pkg
@@ -3342,6 +3350,7 @@ stage_backup() {
 # when zsh was selected; every step is best-effort with a MANUAL_ITEMS note on
 # failure (the .zshrc itself is tolerant of missing pieces).
 install_zsh_extras() {
+    [ "$DISTRO_FAMILY" = arch ] || return 0
     local _has_zsh=0 _p
     for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
         [ "$_p" = "zsh" ] && _has_zsh=1
@@ -3645,13 +3654,16 @@ IMEEOF
             fi
         fi
     fi
-    # set zsh as the default shell (if zsh is installed and is not already the shell)
-    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
-        if [ "$_p" = "zsh" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != "/usr/bin/zsh" ]; then
-            exe chsh -s /usr/bin/zsh "$TARGET_USER" 2>/dev/null || warn "$(_t "Failed to set zsh as default shell" "Failed to set zsh as default shell")"
-            break
-        fi
-    done
+    # Keep zsh and its shell customization exclusive to Arch. Debian/RHEL use
+    # the system bash without installing or changing the user's login shell.
+    if [ "$DISTRO_FAMILY" = arch ]; then
+        for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+            if [ "$_p" = "zsh" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != "/usr/bin/zsh" ]; then
+                exe chsh -s /usr/bin/zsh "$TARGET_USER" 2>/dev/null || warn "$(_t "Failed to set zsh as default shell" "Failed to set zsh as default shell")"
+                break
+            fi
+        done
+    fi
 
     # oh-my-zsh + starship + eza + bat (the runtime configs/.zshrc needs)
     install_zsh_extras
