@@ -64,7 +64,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.23"
+SCRIPT_VERSION="1.9.24"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -256,6 +256,22 @@ declare -A RHEL_MAP=(
     [ttf-jetbrains-mono-nerd]=jetbrains-mono-nerd-fonts
     [wqy-zenhei]=wqy-zenhei-fonts
     [pipewire-pulse]=pipewire-pulseaudio
+    [fcitx5-configtool]=fcitx5-configtool
+    [fcitx5-gtk]=fcitx5-gtk
+    [fcitx5-qt]=fcitx5-qt
+)
+# Wayland extras that Fedora ships in official repos but Rocky/Alma/CentOS
+# Stream 10 only have via COPR. Fedora never hits this path (dnf succeeds first).
+declare -A RHEL_COPR_PKG=(
+    [waybar]=alebastr/sway-extras
+    [mako]=alebastr/sway-extras
+    [fuzzel]=alebastr/sway-extras
+    [grim]=alebastr/sway-extras
+    [slurp]=alebastr/sway-extras
+    [xwayland-satellite]=yalter/niri
+    [niri]=yalter/niri
+    [hyprlock]=solopasha/hyprland
+    [hypridle]=solopasha/hyprland
 )
 # Runtime graphics packages required by niri on EL systems.  These are separate
 # from the compiler dependencies below: a minimal Rocky/Alma install can build
@@ -327,12 +343,10 @@ HYPR_BUILD_DEPS_DEB=(build-essential cmake ninja-build pkg-config git libwayland
     libhyprutils-dev libhyprlang-dev libhyprgraphics-dev libhyprcursor-dev
     libsdbus-c++-dev hyprwayland-scanner)
 # hyprlock / hypridle system build dependencies (RHEL family names)
-HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git wayland-devel wayland-protocols-devel hyprland-protocols
+HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git wayland-devel wayland-protocols-devel
     pango-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel libdrm-devel libxkbcommon-devel libxcb-devel
     cairo-gobject-devel cairo-devel libpam-devel pixman-devel libjpeg-turbo-devel libwebp-devel
-    librsvg2-devel file-devel libpng-devel pugixml-devel
-    hyprutils-devel hyprlang-devel hyprgraphics-devel hyprcursor-devel
-    sdbus-c++-devel hyprwayland-scanner)
+    librsvg2-devel file-devel libpng-devel pugixml-devel sdbus-cpp-devel)
 
 # System components (from other desktop environments) to disable when restoring
 # on a multi-DE target machine.  Only masked / hidden, NEVER uninstalled — the user
@@ -525,7 +539,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v37"
+PROGRESS_VERSION="v38"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -843,7 +857,7 @@ set_debian_mirror() { # $1 = 可选：直接指定镜像 (tuna|aliyun|ustc)，�
 _rhel_refresh_enablerepo() {
     RHEL_DNF_ENABLEREPO=()
     local _ids _id
-    _ids=$(dnf repolist --all 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /^(epel|crb|powertools|codeready)/ {print $1}')
+    _ids=$(dnf repolist --all 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /^(epel|crb|powertools|codeready|copr:)/ {print $1}')
     for _id in $_ids; do
         RHEL_DNF_ENABLEREPO+=("--enablerepo=$_id")
     done
@@ -887,6 +901,35 @@ ensure_rhel_repos() {
     else
         warn "$(_t "CRB/PowerTools/EPEL still not visible; -devel packages may be missing. Try: dnf install epel-release && dnf config-manager --set-enabled crb" "CRB/PowerTools/EPEL still not visible; -devel packages may be missing. Try: dnf install epel-release && dnf config-manager --set-enabled crb")"
     fi
+    # Fedora already has niri/waybar/hypr* in official repos — skip COPR there.
+    # Rocky/Alma/CentOS Stream 10: enable COPRs once so later dnf installs succeed.
+    if [ "${DISTRO_ID:-}" != fedora ]; then
+        ensure_rhel_coprs
+    fi
+}
+
+# Enable the COPRs that carry Wayland extras on EL10. Idempotent: already-enabled
+# COPRs succeed quickly. Missing chroots (EL8/9) fail quietly; callers fall back.
+ensure_rhel_coprs() {
+    [ "$DISTRO_FAMILY" = rhel ] || return 0
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    if ! dnf copr --help >/dev/null 2>&1; then
+        dnf install -y dnf-plugins-core 2>/dev/null || true
+    fi
+    if ! dnf copr --help >/dev/null 2>&1; then
+        warn "$(_t "dnf copr not available — EL packages missing from base/EPEL will fall back to source builds." "dnf copr not available — EL packages missing from base/EPEL will fall back to source builds.")"
+        return 1
+    fi
+    local _copr
+    for _copr in alebastr/sway-extras yalter/niri solopasha/hyprland; do
+        log "$(_t "Enabling COPR " "Enabling COPR ") $_copr ..."
+        if exe dnf -y copr enable "$_copr" || exe dnf copr enable -y "$_copr"; then
+            log "$(_t "COPR enabled: " "COPR enabled: ") $_copr"
+        else
+            warn "$(_t "COPR enable failed (no chroot for this EL?): " "COPR enable failed (no chroot for this EL?): ") $_copr"
+        fi
+    done
+    _rhel_refresh_enablerepo
 }
 
 ensure_rhel_graphics_runtime() {
@@ -1223,45 +1266,36 @@ install_rhel() {
         fi
         erc=0
         pm_install "$name" || erc=$?
+        if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ -n "${RHEL_COPR_PKG[$p]:-}" ]; then
+            local _crc=0
+            install_rhel_copr_pkg "$name" "${RHEL_COPR_PKG[$p]}" || _crc=$?
+            if [ "$_crc" -eq 0 ]; then
+                INSTALLED_PKGS+=("$name (COPR)")
+                continue
+            elif [ "$_crc" -eq "$DRY_RUN_RC" ]; then
+                DRY_PKGS+=("$name (COPR)")
+                continue
+            fi
+            erc=$_crc
+        fi
         if [ "$erc" -eq 0 ]; then
             INSTALLED_PKGS+=("$name")
         elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
             DRY_PKGS+=("$name")
         else
             if [ "$p" = "niri" ]; then
-                # non-Fedora RHEL (Rocky/Alma/CentOS Stream): dnf has no niri package.
-                # Try the author's COPR (yalter/niri, built for epel-10) first so we get
-                # a packaged binary; only fall back to a 10-20 min source build when that
-                # is not possible (EL9 / no copr plugin / enable fails).
-                local _nrc=0
-                install_niri_copr || _nrc=$?
-                if [ "$_nrc" -eq 0 ]; then
-                    INSTALLED_PKGS+=("niri")
-                elif [ "$_nrc" -ne "$DRY_RUN_RC" ]; then
-                    warn "$(_t "No niri package in dnf and COPR unavailable — falling back to source build..." "No niri package in dnf and COPR unavailable — falling back to source build...")"
-                    install_niri_binary
-                fi
+                warn "$(_t "No niri package in dnf/COPR — falling back to source build..." "No niri package in dnf/COPR — falling back to source build...")"
+                install_niri_binary
             elif [ "$p" = "xwayland-satellite" ]; then
-                warn "$(_t "No xwayland-satellite package in dnf, falling back to cargo install..." "No xwayland-satellite package in dnf, falling back to cargo install...")"
+                warn "$(_t "No xwayland-satellite package in dnf/COPR, falling back to cargo install..." "No xwayland-satellite package in dnf/COPR, falling back to cargo install...")"
                 install_xwayland_satellite
             elif [ -n "${SOURCE_PKGS[$p]:-}" ]; then
-                local _crc=0
-                install_rhel_copr_pkg "$name" "solopasha/hyprland" || _crc=$?
-                if [ "$_crc" -eq 0 ]; then
-                    INSTALLED_PKGS+=("$name (COPR)")
-                elif [ "$_crc" -eq "$DRY_RUN_RC" ]; then
-                    DRY_PKGS+=("$name (COPR)")
-                else
-                    warn "$(_t "No dnf/COPR package for " "No dnf/COPR package for ") $p, building from source..."
-                    install_hypr_source "$p" "${SOURCE_PKGS[$p]}"
-                fi
+                warn "$(_t "No dnf/COPR package for " "No dnf/COPR package for ") $p, building from source..."
+                install_hypr_source "$p" "${SOURCE_PKGS[$p]}"
             elif [ "$p" = "ttf-jetbrains-mono-nerd" ]; then
-                # Nerd Font: jetbrains-mono-nerd-fonts is only in the Fedora repo.
-                # On Rocky/Alma/CentOS dnf has no such package — install_nerd_font,
-                # called right after install_rhel, covers it via the official release
-                # download. Don't record a hard failure here; the download warns if it
-                # also fails (font is optional).
                 log "$(_t "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead." "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead.")"
+            elif [ "$p" = "polkit-gnome" ]; then
+                log "$(_t "polkit-gnome not in dnf — niri config already uses /usr/libexec; skipping." "polkit-gnome not in dnf — niri config already uses /usr/libexec; skipping.")"
             elif [ -n "${RHEL_FAIL_HINT[$p]:-}" ]; then
                 MANUAL_ITEMS+=("$name — not available in repo. ${RHEL_FAIL_HINT[$p]}")
             else
@@ -1658,6 +1692,49 @@ _pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔）
         *)                 echo "" ;;
     esac
 }
+_pc_pkg_map_rhel() { # $1 = .pc 名; echo 候选 -devel 包名
+    case "$1" in
+        libdisplay-info)  echo "libdisplay-info-devel display-info-devel" ;;
+        xkbcommon)         echo "libxkbcommon-devel" ;;
+        xkbcommon-x11)     echo "libxkbcommon-x11-devel" ;;
+        wayland-client)    echo "wayland-devel libwayland-devel" ;;
+        wayland-server)    echo "wayland-devel libwayland-devel" ;;
+        libinput)          echo "libinput-devel" ;;
+        libseat)           echo "libseat-devel seatd-devel" ;;
+        libpipewire-0.3)   echo "pipewire-devel" ;;
+        dbus-1)            echo "dbus-devel" ;;
+        pango)             echo "pango-devel" ;;
+        gbm)               echo "mesa-libgbm-devel" ;;
+        egl)               echo "mesa-libEGL-devel" ;;
+        liblz4)            echo "lz4-devel" ;;
+        lz4)               echo "lz4-devel" ;;
+        dav1d)             echo "dav1d-devel" ;;
+        xcb-cursor)        echo "xcb-util-cursor-devel" ;;
+        xcb-composite)     echo "libxcb-devel" ;;
+        xcb-ewmh)          echo "xcb-util-wm-devel" ;;
+        xcb-icccm)         echo "xcb-util-wm-devel" ;;
+        xcb-randr)         echo "libxcb-devel" ;;
+        xcb-xfixes)        echo "libxcb-devel" ;;
+        xcb-present)       echo "libxcb-devel" ;;
+        xcb-render-util)   echo "xcb-util-renderutil-devel" ;;
+        xcb-res)           echo "libxcb-devel" ;;
+        xcb-shape)         echo "libxcb-devel" ;;
+        xcb-util)          echo "xcb-util-devel" ;;
+        xcb-xkb)           echo "libxcb-devel" ;;
+        xcb-xinerama)      echo "libxcb-devel" ;;
+        *)                 echo "" ;;
+    esac
+}
+_pc_auto_install_rhel() { # $1 = .pc 名
+    local _cand
+    for _cand in $(_pc_pkg_map_rhel "$1"); do
+        [ -z "$_cand" ] && continue
+        log "$(_t "Auto-installing missing build dep: " "Auto-installing missing build dep: ") $_cand"
+        dnf_install_tolerant "$_cand" || true
+        pkg-config --exists "$1" 2>/dev/null && return 0
+    done
+    return 1
+}
 _pc_auto_install() { # $1 = .pc 名（Debian 系专用）
     local _cand _found=0 _try
     for _try in 1 2; do
@@ -1714,8 +1791,12 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
         for _pc in "$@"; do
             if ! pkg-config --exists "$_pc" 2>/dev/null; then
                 warn "$(_t "build prerequisite missing: " "build prerequisite missing: ") $_pc.pc"
-                if [ "$DISTRO_FAMILY" = debian ] && [ "$DRY_RUN" -eq 0 ]; then
-                    _pc_auto_install "$_pc"
+                if [ "$DRY_RUN" -eq 0 ]; then
+                    if [ "$DISTRO_FAMILY" = debian ]; then
+                        _pc_auto_install "$_pc"
+                    elif [ "$DISTRO_FAMILY" = rhel ]; then
+                        _pc_auto_install_rhel "$_pc"
+                    fi
                 fi
             fi
         done
@@ -1747,7 +1828,7 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
     local _perr _hint
     _perr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
     case "$DISTRO_FAMILY" in
-        rhel)   _hint="dnf 里没有提供该 .pc 的 -devel 包（可能需启用 EPEL / CRB 仓库）；可运行 'dnf install <对应-devel包>' 或 'dnf --enablerepo=crb,epel install <对应-devel包>' 后重跑" ;;
+        rhel)   _hint="dnf 里没有提供该 .pc 的 -devel 包（xcb-cursor 对应 xcb-util-cursor-devel；需 EPEL/CRB）。可运行 'dnf install --enablerepo=epel,crb xcb-util-cursor-devel' 后重跑" ;;
         arch)   _hint="pacman 里没有提供该 .pc 的开发包（可尝试 'pacman -S <对应包名>' 或 AUR）后重跑" ;;
         *)      if [ -n "$_perr" ]; then _hint="apt error: $_perr"; else _hint="apt 无报错 — 候选 -dev 包不在 apt 列表中（大概率 universe 未启用或源列表缺失）"; fi ;;
     esac
@@ -2624,7 +2705,7 @@ install_xwayland_satellite() {
     else
         # RHEL: also need the wayland/xkbcommon/xcb-util dev headers for the .pc the
         # build links against; tolerant so a missing name never aborts the batch.
-        dnf_install_tolerant git clang libclang-devel libxcb-cursor-devel \
+        dnf_install_tolerant git clang libclang-devel xcb-util-cursor-devel \
             wayland-devel wayland-protocols-devel libxkbcommon-devel xcb-util-devel \
             xcb-util-wm-devel libxcb-devel libdrm-devel mesa-libgbm-devel || bdeps_rc=$?
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
@@ -2637,7 +2718,7 @@ install_xwayland_satellite() {
         fi
     fi
     if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ] && [ ${#PC_STILL_MISSING[@]} -gt 0 ]; then
-        MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (git/clang/libxcb-cursor-devel); install manually: $XWS_REPO")
+        MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (git/clang/xcb-util-cursor-devel); install manually: $XWS_REPO")
         return 1
     fi
     if ! ensure_rust; then

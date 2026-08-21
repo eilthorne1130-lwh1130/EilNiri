@@ -80,11 +80,19 @@ sudo ./install.sh restore-system
 
 ## RHEL 系支持
 
+**推荐发行版（优先顺序）**
+
+| 优先级 | 系统 | 说明 |
+|---|---|---|
+| ★ 首选 | **Fedora 41+**（含较新 Fedora） | niri / waybar / hyprlock / hypridle / xwayland-satellite / fcitx5 官方仓都有，几乎零源码构建 |
+| ★ 支持 | **Rocky Linux 10 / AlmaLinux 10 / CentOS Stream 10 / RHEL 10** | 自动启用 EPEL + CRB，并启用 COPR：`alebastr/sway-extras`（waybar/mako/fuzzel/grim/slurp）、`yalter/niri`、`solopasha/hyprland`（hyprlock/hypridle） |
+| △ 不推荐 | EL8 / EL9 / Rocky 8–9 | 多数 Wayland 套件无包，会大量源码编译，不作为目标平台 |
+
 - 包名自动翻译（如 `ttf-jetbrains-mono-nerd` → `jetbrains-mono-nerd-fonts`）
 - 无 RPM 对应包自动走替代安装（awww 源码构建 / satty 预编译 / rime-ice 词库部署 / gdm 登录管理器），只有全部失败才列入手动安装报告
 - waypaper 走 pip3 兜底
-- **Fedora**：niri / hyprlock / hypridle / xwayland-satellite 官方仓库都有，`dnf` 直接装
-- **Rocky / Alma / CentOS Stream**：这些包默认仓库没有——restore 开头**自动启用 EPEL + CRB/PowerTools**（EL8 为 PowerTools，EL9/10 为 crb；含 dnf-plugins-core），后续所有 `dnf install` 会带上 `--enablerepo`；niri 优先 COPR（yalter/niri，EL10）；hyprlock/hypridle 优先 COPR（solopasha/hyprland），再才源码编译
+- **Fedora**：官方仓库直接 `dnf` 装，**不会**启用 COPR
+- **Rocky / Alma / CentOS Stream / RHEL 10**：restore 开头启用 **EPEL + CRB**，后续 `dnf install` 带 `--enablerepo`（含已启用的 COPR）；仓库没有的包先试对应 COPR，再才源码
 - **awww / satty**（全部 RHEL 系）：awww 自动从 Codeberg 源码构建（约 5 分钟）；satty 自动下载官方预编译二进制，不可用时回退 cargo 构建
 - **登录管理器**：自动装并启用 `gdm`（Fedora 仓库有 / gdm3 兜底；装不上会提示并给出 tty 方案）
 
@@ -166,17 +174,17 @@ EilNiri/
 | | Arch 系 | RHEL 系 | Debian 系 |
 |---|---|---|---|
 | 包管理 | pacman | dnf | apt-get |
-| 推荐版本 | 任意 | Fedora / Rocky / Alma / CentOS Stream | **Ubuntu 24.04+** / Debian 13（22.04 会警告） |
+| 推荐版本 | 任意 | **Fedora 41+**（首选）；Rocky / Alma / CentOS Stream / **RHEL 10** | **Ubuntu 24.04+** / Debian 13（22.04 会警告） |
 | universe 源 | - | - | Ubuntu 自动开启 |
 | fzf | 自动安装 | 自动安装 | 自动安装 |
 | root | restore/rollback 需要 | restore/rollback 需要 | restore/rollback 需要 |
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore 开头都会显示 `v版本号`（当前 v1.9.23）——目标机器上先看版本号确认拷到的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore 开头都会显示 `v版本号`（当前 v1.9.24）——目标机器上先看版本号确认拷到的是最新脚本（旧进度文件自动作废）
 - **多桌面环境**：restore 会自动禁用（不卸载）其他 DE 的冲突组件（通知/设置守护等），清单存 `.system_disabled`；切回其他 DE 前用 `sudo ./install.sh restore-system` 重新启用，或 `EILNIRI_KEEP_SYS=1` 跳过禁用
 - **诊断**：restore 结尾打印 `NIRI STATUS`（niri 二进制/desktop/gdm Session 三态）+ `Boot Environment Check`（gdm 是否真能启动 niri）+ 生成 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包（各 build 日志 + AccountsService + custom.conf + 包清单），排查时直接分享该包
-- Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上 niri 离线源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**，satty 走官方预编译二进制（不可用时 cargo 构建）
+- Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 上 niri 源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**；Rocky/Alma/RHEL **10** 优先 COPR 二进制（niri/waybar/hyprlock），仅 COPR 不可用时才源码编译；satty 走官方预编译二进制（不可用时 cargo 构建）
 - 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
 - **Debian/Ubuntu 虚拟机适配**：若 Niri 配置由 `spawn-at-startup "waybar"` 启动 Waybar，restore 会停止并屏蔽 systemd 侧的 `waybar.service`，避免登录后出现两个 Waybar；检测到 QEMU/KVM 时还会自动启用软件光标回退，减少鼠标拖影。若仍有拖影，请将虚拟显卡设为 `virtio-gpu` 并开启 3D 加速（`gl=on`），或使用 SPICE 显示协议。
 - restore 会自动修正 niri config 两处笔误（swww-daemon→awww-daemon、authenntication→authentication），live 配置不受影响
