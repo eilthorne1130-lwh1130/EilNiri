@@ -92,7 +92,8 @@ sudo ./install.sh restore-system
 - 无 RPM 对应包自动走替代安装（awww 源码构建 / satty 预编译 / rime-ice 词库部署 / gdm 登录管理器），只有全部失败才列入手动安装报告
 - waypaper 走 pip3 兜底
 - **Fedora**：官方仓库直接 `dnf` 装，**不会**启用 COPR
-- **Rocky / Alma / CentOS Stream / RHEL 10**：restore 开头启用 **EPEL + CRB**；`dnf` 失败后对 fcitx5/copyq/waybar 等先 **`--enablerepo=epel*` 再装**，再试 COPR，最后才源码。hyprlock 源码构建使用 **`pam-devel`**（不是 libpam-devel）
+- **Rocky / Alma / CentOS Stream / RHEL 10**：restore 开头启用并刷新 **EPEL + CRB**，安装前验证真实包候选；EPEL 负责 copyq/playerctl/brightnessctl/fcitx5/fcitx5-rime/power-profiles-daemon，waybar/mako/fuzzel/grim/slurp 优先使用 `alebastr/sway-extras` COPR，niri 使用 `yalter/niri`，hyprlock/hypridle 使用 `solopasha/hyprland`，失败后再源码兜底。`fcitx5-configtool`、GTK/Qt 前端按可用候选包动态映射。hyprlock/hypridle 源码构建显式安装 **`pam-devel` + `sdbus-cpp-devel`**
+- **GDM 黑屏修复**：v1.9.26 每次 RHEL restore 都会解除旧版本可能遗留的 `gdm-wayland-session.service`、`gdm-x11-session.service`、`gdm-launch-environment.service` mask；这些 GDM Wayland 会话服务不会加入其他桌面组件禁用列表
 - **awww / satty**（全部 RHEL 系）：awww 自动从 Codeberg 源码构建（约 5 分钟）；satty 自动下载官方预编译二进制，不可用时回退 cargo 构建
 - **登录管理器**：自动装并启用 `gdm`（Fedora 仓库有 / gdm3 兜底；装不上会提示并给出 tty 方案）
 
@@ -124,7 +125,7 @@ sudo ./install.sh restore-system
 - **polkit agent**：Ubuntu 24.04+/Debian 13+ 的包名已从 polkit-gnome 改为 `policykit-1-gnome`（自动映射，旧版自动回退）；niri 配置里的 agent 启动路径自动按家族改写（Arch `/usr/lib` ↔ Debian/RHEL `/usr/libexec`）。
 - **PEP 668**：waypaper 的 pip 安装自动加 `--break-system-packages`（Debian/Ubuntu 默认阻止系统级 pip）。
 - **服务提供包**：`libvirtd.service` 的提供包按家族映射（Debian 为 `libvirt-daemon-system`）。
-- **rime-ice 雾凇拼音自动部署**：无 .deb，但官方发布 release zip（`full.zip`）——restore 自动从 GitHub 直连下载 → 解压复制到 `~/.local/share/fcitx5/rime`（fcitx5-rime 包提供引擎）。Arch 上仍走 archlinuxcn 包，不受影响。
+- **rime-ice 雾凇拼音自动部署**：无 .deb/RPM 时使用官方 release zip（`full.zip`）；restore 会先安装并验证 `fcitx5-rime`，RHEL 上失败后显式重试 EPEL，再下载解压到 `~/.local/share/fcitx5/rime`。Arch 上仍走 archlinuxcn 包，不受影响。
 - **登录管理器自动安装**：Debian/RHEL 自动装并启用 `gdm`（gdm3 兜底）；现有 DM 被自动禁用替换，`EILNIRI_KEEP_DM=1` 可保留。
 - **ly**：仅 Arch 有包（自动安装）；Debian/RHEL 上由脚本改用 gdm。
 - **apt 镜像源自动换源（404 / 无法下载自愈）**：当 `apt-get update` 失败、或安装时 apt 报 `404`/`无法下载`/`Failed to fetch`（典型：`cn.archive.ubuntu.com` 等镜像同步滞后——索引里已有新版但 pool 里的 .deb 尚未同步，如 Ubuntu 26.04 的 `libudev-dev_259.5-0ubuntu3.3`、`libinput10 1.31.1-1`）时，脚本按 **tuna → 阿里云 → 中科大** 顺序询问并自动换源：备份原源文件（`*.mirror-bak-时间戳`）→ 改写 `.list`/`.sources` 里的 host → `apt-get update` → **用 curl 探测之前 404 的 .deb 是否真被新镜像同步**（只有显式 404 才换下一个候选）→ 换源成功后自动重试关键依赖一轮（带 `--fix-missing`）。fzf 可用时用 fzf 菜单选择，未装时退化为编号提示。手动报告只追加一次。
@@ -181,7 +182,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore 开头都会显示 `v版本号`（当前 v1.9.25）——目标机器上先看版本号确认拷到的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore 开头都会显示 `v版本号`（当前 v1.9.26）——目标机器上先看版本号确认拷到的是最新脚本（旧进度文件自动作废）
 - **多桌面环境**：restore 会自动禁用（不卸载）其他 DE 的冲突组件（通知/设置守护等），清单存 `.system_disabled`；切回其他 DE 前用 `sudo ./install.sh restore-system` 重新启用，或 `EILNIRI_KEEP_SYS=1` 跳过禁用
 - **诊断**：restore 结尾打印 `NIRI STATUS`（niri 二进制/desktop/gdm Session 三态）+ `Boot Environment Check`（gdm 是否真能启动 niri）+ 生成 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包（各 build 日志 + AccountsService + custom.conf + 包清单），排查时直接分享该包
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 上 niri 源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**；Rocky/Alma/RHEL **10** 优先 COPR 二进制（niri/waybar/hyprlock），仅 COPR 不可用时才源码编译；satty 走官方预编译二进制（不可用时 cargo 构建）

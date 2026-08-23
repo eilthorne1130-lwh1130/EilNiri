@@ -64,7 +64,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.25"
+SCRIPT_VERSION="1.9.26"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -260,6 +260,13 @@ declare -A RHEL_MAP=(
     [fcitx5-gtk]=fcitx5-gtk
     [fcitx5-qt]=fcitx5-qt
 )
+# RHEL-family package names vary between EPEL, Fedora-derived COPRs, and EL10.
+# Resolve these candidates against the enabled repositories before installing.
+declare -A RHEL_CANDIDATES=(
+    [fcitx5-configtool]="fcitx5-configtool fcitx5-config-qt"
+    [fcitx5-gtk]="fcitx5-gtk fcitx5-frontend-gtk3 fcitx5-frontend-all"
+    [fcitx5-qt]="fcitx5-qt fcitx5-frontend-qt5 fcitx5-frontend-all"
+)
 # Wayland extras that Fedora ships in official repos but Rocky/Alma/CentOS
 # Stream 10 only have via COPR. Fedora never hits this path (dnf succeeds first).
 declare -A RHEL_COPR_PKG=(
@@ -278,7 +285,7 @@ declare -A RHEL_COPR_PKG=(
 )
 # Packages expected from EPEL on EL10 (Fedora has them in the base repo).
 # After a failed dnf, retry with --enablerepo=epel* before COPR/source.
-RHEL_EPEL_PKGS=(copyq playerctl brightnessctl fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime power-profiles-daemon waybar mako fuzzel grim slurp)
+RHEL_EPEL_PKGS=(copyq playerctl brightnessctl fcitx5 fcitx5-rime power-profiles-daemon)
 # Runtime graphics packages required by niri on EL systems.  These are separate
 # from the compiler dependencies below: a minimal Rocky/Alma install can build
 # niri successfully while still lacking Mesa/DRM support for a virtio GPU.
@@ -547,7 +554,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v39"
+PROGRESS_VERSION="v40"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -871,6 +878,19 @@ _rhel_refresh_enablerepo() {
     done
 }
 
+resolve_rhel_package() { # $1 = logical package name; prints an installable candidate
+    local logical="$1" candidate
+    for candidate in ${RHEL_CANDIDATES[$logical]:-$logical}; do
+        rpm -q "$candidate" >/dev/null 2>&1 && { printf '%s\n' "$candidate"; return 0; }
+        if dnf repoquery --available --qf '%{name}' "$candidate" 2>/dev/null \
+            | grep -Fxq "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Enable EPEL + CRB/PowerTools on RHEL family so -devel packages (and EPEL apps)
 # are available. Rocky/Alma 8 use "powertools"; 9/10 and CentOS Stream use "crb";
 # RHEL itself uses CodeReady Builder / RHUI IDs. Fedora already has most packages
@@ -903,6 +923,8 @@ ensure_rhel_repos() {
         codeready-builder-for-rhel-10-rhui-rpms; do
         dnf config-manager --set-enabled "$_rid" 2>/dev/null || true
     done
+    dnf clean all >/dev/null 2>&1 || true
+    dnf makecache --refresh >/dev/null 2>&1 || true
     _rhel_refresh_enablerepo
     if dnf repolist 2>/dev/null | grep -qiE 'epel|crb|powertools|codeready'; then
         log "$(_t "Extra repos active:" "Extra repos active:") $(dnf repolist 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /(epel|crb|powertools|codeready)/ {printf "%s ", $1}')"
@@ -937,6 +959,7 @@ ensure_rhel_coprs() {
             warn "$(_t "COPR enable failed (no chroot for this EL?): " "COPR enable failed (no chroot for this EL?): ") $_copr"
         fi
     done
+    dnf makecache --refresh >/dev/null 2>&1 || true
     _rhel_refresh_enablerepo
 }
 
@@ -1211,7 +1234,7 @@ install_arch() {
 }
 
 install_rhel() {
-    local p name erc
+    local p name erc resolved
     local all=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
 
     # pip fallback pre-check
@@ -1268,6 +1291,26 @@ install_rhel() {
             continue
         fi
         name="${RHEL_MAP[$p]:-$p}"
+        if [ -n "${RHEL_CANDIDATES[$p]:-}" ]; then
+            resolved=$(resolve_rhel_package "$p") || {
+                warn "$(_t "No RHEL package candidate for " "No RHEL package candidate for ") $p"
+                FAILED_PKGS+=("dnf:$p")
+                continue
+            }
+            name="$resolved"
+        fi
+        # EL10 Wayland extras are published by COPR rather than EPEL. Prefer
+        # the matching COPR before an EPEL retry, then retain the normal dnf
+        # path as a fallback for Fedora/RHEL variants that package them.
+        if [ "$erc" -eq 0 ] && [ -n "${RHEL_COPR_PKG[$p]:-}" ] \
+            && [[ "$p" =~ ^(waybar|mako|fuzzel|grim|slurp|niri|xwayland-satellite|hyprlock|hypridle)$ ]]; then
+            local _copr_first=0
+            install_rhel_copr_pkg "$name" "${RHEL_COPR_PKG[$p]}" || _copr_first=$?
+            if [ "$_copr_first" -eq 0 ]; then
+                INSTALLED_PKGS+=("$name (COPR)")
+                continue
+            fi
+        fi
         if pkg_installed "$name"; then
             SKIPPED_PKGS+=("$name (already installed)")
             continue
@@ -2633,6 +2676,10 @@ install_rime_ice() {
     if ! pkg_installed fcitx5-rime; then
         log "$(_t "fcitx5-rime not installed — installing it before deploying rime-ice..." "fcitx5-rime not installed — installing it before deploying rime-ice...")"
         pm_install fcitx5-rime 2>>"$LOG_DIR/pkg-errors.log" || true
+        if [ "$DISTRO_FAMILY" = rhel ] && ! pkg_installed fcitx5-rime; then
+            exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' fcitx5-rime \
+                2>>"$LOG_DIR/dnf-errors.log" || true
+        fi
     fi
     if ! pkg_installed fcitx5-rime; then
         MANUAL_ITEMS+=("rime-ice — fcitx5-rime not installed; skipped dictionary deploy. Enable EPEL/CRB and install fcitx5-rime before retrying")
@@ -2860,7 +2907,7 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         fi
         # EL names pam-devel (not libpam-devel). Force it so hyprlock's
         # find_library(PAM) / pkg_check_modules(PAM) succeeds.
-        dnf_install_tolerant pam-devel || true
+        dnf_install_tolerant pam-devel sdbus-cpp-devel || true
         if [ ! -f /usr/include/security/pam_appl.h ] && [ ! -f /usr/include/pam/pam_appl.h ]; then
             MANUAL_ITEMS+=("$pkg — pam-devel missing (libpam not found); install: dnf install pam-devel, then rerun")
             return 1
@@ -3815,6 +3862,21 @@ IMEEOF
 # (notifications, settings daemons, etc.) so the niri session runs cleanly.  Every action
 # is recorded in $BASE_DIR/.system_disabled and is reversible via `restore-system`.
 DISABLE_MANIFEST="$BASE_DIR/.system_disabled"
+
+# Older eilNiri versions masked these GDM helpers, which makes a valid niri
+# Wayland session handoff appear as an immediate black screen. Always remove
+# those stale masks on RHEL-family restores; they are never valid cleanup targets.
+unmask_gdm_wayland() {
+    [ "$DISTRO_FAMILY" = rhel ] || return 0
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local unit
+    for unit in gdm-wayland-session.service gdm-x11-session.service gdm-launch-environment.service; do
+        systemctl unmask "$unit" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$unit" 2>/dev/null || true
+    done
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 stage_disable_system() {
     if stage_done sysdisable; then return; fi
     if [ "${EILNIRI_KEEP_SYS:-0}" = "1" ]; then
@@ -4220,6 +4282,7 @@ do_restore() {
 
     # update the system first (a fresh machine has a stale package db, so installing fzf directly may fail)
     stage_preflight
+    unmask_gdm_wayland
     ensure_fzf
     detect_target_user
 
