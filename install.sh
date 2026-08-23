@@ -1291,6 +1291,7 @@ install_rhel() {
             continue
         fi
         name="${RHEL_MAP[$p]:-$p}"
+        erc=0
         if [ -n "${RHEL_CANDIDATES[$p]:-}" ]; then
             resolved=$(resolve_rhel_package "$p") || {
                 warn "$(_t "No RHEL package candidate for " "No RHEL package candidate for ") $p"
@@ -1302,7 +1303,7 @@ install_rhel() {
         # EL10 Wayland extras are published by COPR rather than EPEL. Prefer
         # the matching COPR before an EPEL retry, then retain the normal dnf
         # path as a fallback for Fedora/RHEL variants that package them.
-        if [ "$erc" -eq 0 ] && [ -n "${RHEL_COPR_PKG[$p]:-}" ] \
+        if [ -n "${RHEL_COPR_PKG[$p]:-}" ] \
             && [[ "$p" =~ ^(waybar|mako|fuzzel|grim|slurp|niri|xwayland-satellite|hyprlock|hypridle)$ ]]; then
             local _copr_first=0
             install_rhel_copr_pkg "$name" "${RHEL_COPR_PKG[$p]}" || _copr_first=$?
