@@ -337,6 +337,14 @@ declare -A PIP_PKGS=(
 # key = arch-style pkg name, value = upstream git URL. Add entries here to extend
 # the "apt/dnf failed -> build from source" fallback (install_debian / install_rhel).
 declare -A SOURCE_PKGS=(
+    [waybar]="https://github.com/Alexays/Waybar"
+    [mako]="https://github.com/emersion/mako"
+    [fuzzel]="https://codeberg.org/dnkl/fuzzel"
+    [copyq]="https://github.com/hluk/CopyQ"
+    [grim]="https://git.sr.ht/~emersion/grim"
+    [slurp]="https://github.com/emersion/slurp"
+    [playerctl]="https://github.com/altdesktop/playerctl"
+    [brightnessctl]="https://github.com/Hummer12007/brightnessctl"
     [hyprlock]="https://github.com/hyprwm/hyprlock"
     [hypridle]="https://github.com/hyprwm/hypridle"
 )
@@ -360,6 +368,15 @@ HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git wayla
     pango-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel libdrm-devel libxkbcommon-devel libxcb-devel
     cairo-gobject-devel cairo-devel pam-devel libpam-devel pixman-devel libjpeg-turbo-devel libwebp-devel
     librsvg2-devel file-devel libpng-devel pugixml-devel sdbus-cpp-devel)
+RHEL_SOURCE_BUILD_DEPS=(git gcc gcc-c++ make cmake ninja-build meson pkgconf-pkg-config
+    wayland-devel wayland-protocols-devel libxkbcommon-devel libinput-devel libdrm-devel
+    mesa-libgbm-devel mesa-libEGL-devel mesa-libGL-devel cairo-devel pango-devel
+    gtk3-devel gtk4-devel libadwaita-devel librsvg2-devel libnotify-devel libxcb-devel
+    xcb-util-devel xcb-util-wm-devel xcb-util-image-devel xcb-util-keysyms-devel
+    xcb-util-renderutil-devel xcb-util-cursor-devel libjpeg-turbo-devel libpng-devel
+    libwebp-devel pam-devel sdbus-cpp-devel)
+FCITX5_RIME_REPO="https://github.com/fcitx/fcitx5-rime"
+LIBRIME_REPO="https://github.com/rime/librime"
 
 # System components (from other desktop environments) to disable when restoring
 # on a multi-DE target machine.  Only masked / hidden, NEVER uninstalled — the user
@@ -950,13 +967,13 @@ ensure_rhel_coprs() {
         warn "$(_t "dnf copr not available — EL packages missing from base/EPEL will fall back to source builds." "dnf copr not available — EL packages missing from base/EPEL will fall back to source builds.")"
         return 1
     fi
-    local _copr
+    local _copr _copr_log="$LOG_DIR/copr.log"
     for _copr in alebastr/sway-extras yalter/niri solopasha/hyprland; do
         log "$(_t "Enabling COPR " "Enabling COPR ") $_copr ..."
-        if exe dnf -y copr enable "$_copr" || exe dnf copr enable -y "$_copr"; then
+        if dnf -y copr enable "$_copr" >>"$_copr_log" 2>&1 || dnf copr enable -y "$_copr" >>"$_copr_log" 2>&1; then
             log "$(_t "COPR enabled: " "COPR enabled: ") $_copr"
         else
-            warn "$(_t "COPR enable failed (no chroot for this EL?): " "COPR enable failed (no chroot for this EL?): ") $_copr"
+            warn "$(_t "COPR enable failed; source fallback will be used: " "COPR enable failed; source fallback will be used: ") $_copr"
         fi
     done
     dnf makecache --refresh >/dev/null 2>&1 || true
@@ -1354,7 +1371,7 @@ install_rhel() {
                 install_xwayland_satellite
             elif [ -n "${SOURCE_PKGS[$p]:-}" ]; then
                 warn "$(_t "No dnf/COPR package for " "No dnf/COPR package for ") $p, building from source..."
-                install_hypr_source "$p" "${SOURCE_PKGS[$p]}"
+                install_source_package "$p" "${SOURCE_PKGS[$p]}"
             elif [ "$p" = "ttf-jetbrains-mono-nerd" ]; then
                 log "$(_t "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead." "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead.")"
             elif [ "$p" = "polkit-gnome" ]; then
@@ -2656,6 +2673,43 @@ install_satty() {
 RIME_ICE_REPO="https://github.com/iDvel/rime-ice"
 RIME_ICE_ZIP_URL="https://github.com/iDvel/rime-ice/releases/latest/download/full.zip"
 
+install_fcitx5_rime_source() {
+    [ "$DISTRO_FAMILY" = rhel ] || return 1
+    [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
+    local work logf="$LOG_DIR/fcitx5-rime-build.log"
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    dnf_install_tolerant "${RHEL_SOURCE_BUILD_DEPS[@]}" fcitx5-devel librime-devel \
+        extra-cmake-modules boost-devel yaml-cpp-devel opencc-devel marisa-devel leveldb-devel \
+        || true
+    if ! rpm -q librime-devel >/dev/null 2>&1; then
+        if ! git_clone_gh "$LIBRIME_REPO" "$work/librime"; then
+            return 1
+        fi
+        if ! ( cd "$work/librime" && cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+            && cmake --build build -j"$(nproc)" && cmake --install build ) >"$logf" 2>&1; then
+            return 1
+        fi
+    fi
+    if ! pkg-config --exists fcitx5 2>/dev/null && ! find /usr/lib64/cmake /usr/lib/cmake /usr/local/lib64/cmake /usr/local/lib/cmake \
+        -iname '*Fcitx5*Config.cmake' -o -iname '*Fcitx5*config.cmake' 2>/dev/null | grep -q .; then
+        warn "$(_t "fcitx5-devel is unavailable on this AlmaLinux release; fcitx5-rime source build cannot continue." "fcitx5-devel is unavailable on this AlmaLinux release; fcitx5-rime source build cannot continue.")"
+        return 1
+    fi
+    if ! git_clone_gh "$FCITX5_RIME_REPO" "$work/fcitx5-rime"; then
+        return 1
+    fi
+    export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
+    if ! ( cd "$work/fcitx5-rime" && cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+        && cmake --build build -j"$(nproc)" && cmake --install build ) >>"$logf" 2>&1; then
+        return 1
+    fi
+    rpm -q fcitx5-rime >/dev/null 2>&1 || find /usr -name 'libFcitx5Rime.so' -print -quit 2>/dev/null | grep -q .
+}
+
 install_rime_ice() {
     local dest="$HOME_DIR/.local/share/fcitx5/rime"
     if [ -f "$dest/rime_ice.schema.yaml" ]; then
@@ -2683,8 +2737,12 @@ install_rime_ice() {
         fi
     fi
     if ! pkg_installed fcitx5-rime; then
-        MANUAL_ITEMS+=("rime-ice — fcitx5-rime not installed; skipped dictionary deploy. Enable EPEL/CRB and install fcitx5-rime before retrying")
-        return 1
+    if [ "$DISTRO_FAMILY" = rhel ] && install_fcitx5_rime_source; then
+            log "$(_t "fcitx5-rime built from source; continuing with rime-ice." "fcitx5-rime built from source; continuing with rime-ice.")"
+        else
+            MANUAL_ITEMS+=("rime-ice — fcitx5-rime not installed and source build failed; see $LOG_DIR/fcitx5-rime-build.log")
+            return 1
+        fi
     fi
     if ! command -v unzip &>/dev/null; then
         pm_install unzip || { MANUAL_ITEMS+=("rime-ice — unzip missing, deploy manually: $RIME_ICE_REPO"); return 1; }
@@ -2840,7 +2898,8 @@ build_hypr_stack() {
         local n="$1"
         if git_clone_gh "https://github.com/hyprwm/$n" "$_work/$n" >/dev/null 2>&1 \
            && ( cd "$_work/$n" \
-                && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr . \
+                && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
                 && cmake --build build -j"$(nproc)" \
                 && cmake --install build ) >> "$_log" 2>&1; then
             INSTALLED_PKGS+=("hypr-$n (source build)")
@@ -2914,11 +2973,6 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
             return 1
         fi
     fi
-    if ! ensure_rust; then
-        MANUAL_ITEMS+=("$pkg — Rust toolchain install failed, build manually: $repo")
-        return 1
-    fi
-
     local work
     work=$(mktemp -d)
     register_temp_path "$work"
@@ -2933,6 +2987,10 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     # running `cargo build` (which used to die with "could not find Cargo.toml").
     local logf="$LOG_DIR/$pkg-build.log" _bin=""
     if [ -f "$work/$pkg/Cargo.toml" ]; then
+        if ! ensure_rust; then
+            MANUAL_ITEMS+=("$pkg — Rust toolchain install failed, build manually: $repo")
+            return 1
+        fi
         log "$(_t "Building " "Building ") $pkg (cargo) from source (~3 min, log: $logf)..."
         ( cd "$work/$pkg" && cargo build --release ) > "$logf" 2>&1
         _bin="$work/$pkg/target/release/$pkg"
@@ -2944,7 +3002,10 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
             return 1
         fi
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
-        ( cd "$work/$pkg" && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr . \
+        export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+        export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
+        ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
             && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
         _bin="$work/$pkg/build/$pkg"
     else
@@ -2981,6 +3042,49 @@ PAMEOF
         log "$(_t "Wrote /etc/pam.d/hyprlock for source-built hyprlock" "Wrote /etc/pam.d/hyprlock for source-built hyprlock")"
     fi
     return 0
+}
+
+install_source_package() { # $1 = package, $2 = upstream repository
+    local pkg="$1" repo="$2" work logf
+    if command -v "$pkg" >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("$pkg (already installed)")
+        return 0
+    fi
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$pkg (source build)"); return "$DRY_RUN_RC"; }
+    if [[ "$pkg" = hyprlock || "$pkg" = hypridle ]]; then
+        install_hypr_source "$pkg" "$repo"
+        return $?
+    fi
+    dnf_install_tolerant "${RHEL_SOURCE_BUILD_DEPS[@]}" || true
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    logf="$LOG_DIR/$pkg-build.log"
+    if ! git_clone_gh "$repo" "$work/$pkg"; then
+        MANUAL_ITEMS+=("$pkg — source clone failed; see $logf")
+        return 1
+    fi
+    export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
+    if ! build_source_project "$pkg" "$repo" "$work" "$logf"; then
+        MANUAL_ITEMS+=("$pkg — source build failed; see $logf")
+        return 1
+    fi
+    INSTALLED_PKGS+=("$pkg (source build)")
+    success "$(_t "$pkg built from source" "$pkg built from source")"
+}
+
+build_source_project() {
+    local pkg="$1" _repo="$2" work="$3" logf="$4" src="$work/$1"
+    if [ -f "$src/CMakeLists.txt" ]; then
+        ( cd "$src" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+            && cmake --build build -j"$(nproc)" && cmake --install build ) >"$logf" 2>&1
+    elif [ -f "$src/meson.build" ]; then
+        ( cd "$src" && meson setup build --prefix=/usr --libdir=lib64 --buildtype=release \
+            && meson compile -C build -j"$(nproc)" && meson install -C build ) >"$logf" 2>&1
+    else
+        return 1
+    fi
 }
 
 install_debian() {
@@ -3065,7 +3169,7 @@ install_debian() {
         else
             if [ -n "${SOURCE_PKGS[$p]:-}" ]; then
                 warn "$(_t "No apt package for " "No apt package for ") $p, building from source..."
-                install_hypr_source "$p" "${SOURCE_PKGS[$p]}"
+                install_source_package "$p" "${SOURCE_PKGS[$p]}"
             elif [ -n "${DEB_FAIL_HINT[$p]:-}" ]; then
                 MANUAL_ITEMS+=("$name — not available in repo. ${DEB_FAIL_HINT[$p]}")
             else
