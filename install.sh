@@ -384,9 +384,11 @@ DISABLE_SYS=(
     "systemunit|gnome-screensaver.service|GNOME screensaver system service (replaced by hyprlock)"
     
     # --- GDM / display manager session helpers (niri handles display) ---
-    "systemunit|gdm-launch-environment.service|GDM launch environment"
-    "systemunit|gdm-x11-session.service|GDM X11 session"
-    "systemunit|gdm-wayland-session.service|GDM Wayland session"
+    # Do NOT mask GDM Wayland session on RHEL系 — this causes black screen on login.
+    # Only mask if the user explicitly wants to switch back to another DE.
+    # "systemunit|gdm-launch-environment.service|GDM launch environment"
+    # "systemunit|gdm-x11-session.service|GDM X11 session"
+    # "systemunit|gdm-wayland-session.service|GDM Wayland session"
     
     # --- misc GNOME system services ---
     "systemunit|gnome-remote-desktop.service|GNOME remote desktop"
