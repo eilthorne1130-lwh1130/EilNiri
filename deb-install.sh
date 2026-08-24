@@ -2092,18 +2092,25 @@ EOF
 install_waypaper_venv() {
     local venv="$HOME_DIR/.local/share/eilniri/waypaper-venv"
     local wrapper="$HOME_DIR/.local/bin/waypaper"
+    local venv_log="$LOG_DIR/waypaper-venv.log"
+    local pip_index="${EILNIRI_PIP_INDEX_URL:-https://pypi.org/simple}"
     if [ "$DRY_RUN" -eq 1 ]; then
         DRY_PKGS+=("waypaper (python venv)")
         return "$DRY_RUN_RC"
     fi
-    pm_install python3-venv python3-pip >/dev/null 2>&1 || true
+    pm_install python3-venv python3-pip >>"$LOG_DIR/apt-errors.log" 2>&1 || true
     if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
-        MANUAL_ITEMS+=("waypaper — python3-venv is unavailable; install python3-venv and python3-pip")
+        MANUAL_ITEMS+=("waypaper — python3-venv is unavailable; install python3-venv and python3-pip; see $LOG_DIR/apt-errors.log")
         return 1
     fi
     mkdir -p "$(dirname "$venv")" "$HOME_DIR/.local/bin"
-    if ! as_user python3 -m venv "$venv" ||
-       ! as_user "$venv/bin/python" -m pip install --upgrade pip waypaper \
+    if ! as_user env HOME="$HOME_DIR" python3 -m venv "$venv" >"$venv_log" 2>&1; then
+        MANUAL_ITEMS+=("waypaper — venv creation failed; see $venv_log")
+        return 1
+    fi
+    if ! as_user env HOME="$HOME_DIR" \
+       "$venv/bin/python" -m pip install --disable-pip-version-check --no-input \
+           --index-url "$pip_index" --upgrade pip waypaper \
            >"$LOG_DIR/waypaper-pip.log" 2>&1; then
         MANUAL_ITEMS+=("waypaper — venv installation failed; see $LOG_DIR/waypaper-pip.log")
         return 1
@@ -2429,19 +2436,28 @@ build_hypr_stack() {
     _work=$(mktemp -d)
     register_temp_path "$_work"
 
-    # Build+install one component into /usr. Returns 0 on success.
+    local _prefix=/usr/local _libdir=lib
+    [ "$DISTRO_FAMILY" != debian ] && _prefix=/usr && _libdir=lib64
+    export CMAKE_PREFIX_PATH="$_prefix:/usr:${CMAKE_PREFIX_PATH:-}"
+    export PKG_CONFIG_PATH="$_prefix/$_libdir/pkgconfig:/usr/lib/pkgconfig:/usr/lib/*/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+    # Build+install one component into a predictable prefix. Returns 0 on success.
     _build_hypr_one() { # $1 = name
-        local n="$1"
+        local n="$1" component_log="$_log-$1.log"
+        printf '\n=== %s ===\n' "$n" >>"$_log"
         if git_clone_gh "https://github.com/hyprwm/$n" "$_work/$n" >/dev/null 2>&1 \
            && ( cd "$_work/$n" \
                 && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-                    -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+                    -DCMAKE_INSTALL_PREFIX="$_prefix" -DCMAKE_INSTALL_LIBDIR="$_libdir" \
                 && cmake --build build -j"$(nproc)" \
-                && cmake --install build ) >> "$_log" 2>&1; then
+                && cmake --install build \
+                && command -v ldconfig >/dev/null 2>&1 && ldconfig || true ) >"$component_log" 2>&1; then
             INSTALLED_PKGS+=("hypr-$n (source build)")
             log "$(_t "Built " "Built ") hypr-$n$(_t " from source" " from source")"
             return 0
         fi
+        cat "$component_log" >>"$_log" 2>/dev/null || true
+        warn "$(_t "Hypr component failed: " "Hypr component failed: ") $n (see $component_log)"
         return 1
     }
 
@@ -2539,7 +2555,8 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         fi
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
         export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-        export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
+        export CMAKE_PREFIX_PATH="/usr/local:/usr:/usr/local/lib:/usr/lib:${CMAKE_PREFIX_PATH:-}"
+        export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/lib/pkgconfig:/usr/lib/*/pkgconfig:${PKG_CONFIG_PATH:-}"
         ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
             && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
