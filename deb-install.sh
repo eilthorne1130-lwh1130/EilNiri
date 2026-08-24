@@ -961,6 +961,12 @@ stage_apps_select() {
 
 # --- 4.3 app install ---
 
+# Download configuration is initialized before any helper can be called. The
+# script uses nounset, so these defaults must exist even during direct function
+# tests or early failures before the normal restore initialization path.
+CURL_DL_FLAGS=(-fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 1800 -C -)
+GH_MIRRORS="https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/ https://gh.llkk.cc/"
+
 _dl_gh_bounded() { # $1=github asset url, $2=outfile, $3=seconds cap (default 90)
     local url="$1" out="$2" cap="${3:-90}" prox full
     [ -n "$url" ] && [ -n "$out" ] || return 1
@@ -968,7 +974,7 @@ _dl_gh_bounded() { # $1=github asset url, $2=outfile, $3=seconds cap (default 90
     if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$url" 2>/dev/null && archive_is_valid "$out"; then
         return 0
     fi
-    for prox in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
+    for prox in ${EILNIRI_GH_PROXY:-${GH_MIRRORS:-}}; do
         full="${prox%/}/$url"
         rm -f "$out"
         if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$full" 2>/dev/null && archive_is_valid "$out"; then
@@ -1017,7 +1023,7 @@ git_clone_gh() { # $1 = github repo URL, $2 = dest dir; returns 0 on success
         clone --depth 1 "$repo" "$dest" >/dev/null 2>&1; then
         return 0
     fi
-    for prox in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
+    for prox in ${EILNIRI_GH_PROXY:-${GH_MIRRORS:-}}; do
         full="${prox%/}/$repo"
         rm -rf "$dest"
         if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
@@ -1050,7 +1056,7 @@ download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the cur
     # direct download failed — try mirror proxies (CN-friendly; configurable via EILNIRI_GH_PROXY)
     log "$(_t "Direct download failed (curl " "Direct download failed (curl ") $rc), trying mirror proxies..."
     local proxy prefix
-    for proxy in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
+    for proxy in ${EILNIRI_GH_PROXY:-${GH_MIRRORS:-}}; do
         prefix="${proxy%/}"
         if try_dl "${prefix}/${url}" "$out"; then
             return 0
