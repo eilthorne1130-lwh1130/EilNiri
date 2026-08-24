@@ -2147,6 +2147,18 @@ EOF
     return 0
 }
 
+install_waypaper_pipx() {
+    local bin="$HOME_DIR/.local/bin/waypaper"
+    if ! command -v pipx >/dev/null 2>&1; then
+        pm_install pipx python3-venv python3-full >/dev/null 2>&1 || return 1
+    fi
+    as_user env HOME="$HOME_DIR" PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        pipx install --force waypaper >"$LOG_DIR/waypaper-pipx.log" 2>&1 || return 1
+    [ -x "$bin" ] || return 1
+    INSTALLED_PKGS+=("waypaper (pipx)")
+    return 0
+}
+
 # --- satty install (Debian/RHEL families; no package) ---
 # Strategy: 1) official prebuilt binary from GitHub releases (satty-<arch>-unknown-linux-gnu.tar.gz)
 #           2) cargo install fallback (needs GTK4/libadwaita/librsvg dev packages) 3) manual report
@@ -2542,6 +2554,13 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     # build deps (tolerant: many hypr deps are absent on older releases / Rocky/Alma)
     local _brc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
+        local apt_hypr="$pkg"
+        if apt-cache policy "$apt_hypr" 2>/dev/null | grep -qE '^ ?Candidate: [^ (]'; then
+            if pm_install "$apt_hypr" && command -v "$pkg" >/dev/null 2>&1; then
+                INSTALLED_PKGS+=("$pkg (apt)")
+                return 0
+            fi
+        fi
         apt_install_tolerant "${HYPR_BUILD_DEPS_DEB[@]}" || _brc=$?
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
             warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
@@ -2588,11 +2607,10 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
             return 1
         fi
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
-        export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
         export CMAKE_PREFIX_PATH="/usr/local:/usr:/usr/local/lib:/usr/lib:${CMAKE_PREFIX_PATH:-}"
         export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
         ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib \
             && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
         _bin="$work/$pkg/build/$pkg"
     else
@@ -2747,7 +2765,9 @@ install_debian() {
                 continue
             fi
             if [ "$p" = waypaper ]; then
-                install_waypaper_venv
+                if ! install_waypaper_pipx && ! install_waypaper_venv; then
+                    MANUAL_ITEMS+=("waypaper — apt, pipx and venv installation all failed")
+                fi
             else
                 erc=0
                 exe as_user pip3 install --user --break-system-packages "${PIP_PKGS[$p]}" || erc=$?
@@ -3148,19 +3168,18 @@ stage_dm() {
         return   # not marked: rerun retries
     fi
 
-    # --- disable every known DM and the display-manager.service entry ---
-    local dm
-    for dm in "${known_dms[@]}"; do
-        exe systemctl disable "$dm" 2>/dev/null || true
-    done
-    if [ -e /etc/systemd/system/display-manager.service ]; then
-        exe systemctl disable display-manager.service 2>/dev/null || rm -f /etc/systemd/system/display-manager.service
+    # Enable and validate the replacement before touching the existing DM.
+    local dm_service="/lib/systemd/system/${dm_unit}.service"
+    [ -e "$dm_service" ] || dm_service="/usr/lib/systemd/system/${dm_unit}.service"
+    if [ ! -e "$dm_service" ]; then
+        FAILED_PKGS+=("dm:$dm_unit")
+        warn "$(_t "Installed DM has no systemd unit: " "Installed DM has no systemd unit: ")$dm_unit"
+        return
     fi
-
-    # --- enable the chosen DM ---
     if exe systemctl enable "$dm_unit" &&
-       exe systemctl set-default graphical.target &&
-       systemctl daemon-reload 2>/dev/null; then
+       ln -sfn "$dm_service" /etc/systemd/system/display-manager.service &&
+       exe systemctl daemon-reload &&
+       exe systemctl set-default graphical.target; then
         # verify: the unit must be enabled, and (except ly, which runs on tty1 directly)
         # display-manager.service must point at the new DM
         local _verify_ok=1
@@ -3168,27 +3187,17 @@ stage_dm() {
             _verify_ok=0
             warn "$(_t "Verification failed: " "Verification failed: ") $dm_unit $(_t "is not enabled." "is not enabled.")"
         fi
-        if [ "$dm_unit" != "ly@tty1" ] && [ -e /etc/systemd/system/display-manager.service ]; then
-            local _dm_link
-            _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
-            if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
-                _verify_ok=0
-                warn "$(_t "Verification failed: display-manager.service points to " "Verification failed: display-manager.service points to ") ${_dm_link:-unknown}$(_t ", expected " ", expected ") $dm_unit"
-            fi
+        local _dm_link
+        _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
+        if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
+            _verify_ok=0
+            warn "$(_t "display-manager.service is not linked to " "display-manager.service is not linked to ")$dm_unit"
         fi
         if [ "$_verify_ok" -eq 1 ]; then
-            local _dm_link
-            _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
-            if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
-                systemctl enable "$dm_unit" >/dev/null 2>&1 || true
-                _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
-            fi
-            if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
-                _verify_ok=0
-                warn "$(_t "display-manager.service is not linked to the selected DM" "display-manager.service is not linked to the selected DM")"
-            fi
-        fi
-        if [ "$_verify_ok" -eq 1 ]; then
+            local dm
+            for dm in "${known_dms[@]}"; do
+                [ "$dm" = "$dm_unit" ] || exe systemctl disable "$dm" 2>/dev/null || true
+            done
             ENABLED_SVCS+=("$dm_unit")
             success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
             stage_mark dm
@@ -3196,7 +3205,7 @@ stage_dm() {
             FAILED_PKGS+=("dm:$dm_unit")
             if [ -n "$old_dm" ] && [ "$old_dm" != "$dm_unit" ]; then
                 systemctl enable "$old_dm" >/dev/null 2>&1 || true
-                systemctl enable display-manager.service >/dev/null 2>&1 || true
+                ln -sfn "/lib/systemd/system/${old_dm}.service" /etc/systemd/system/display-manager.service 2>/dev/null || true
                 warn "$(_t "Restored previous display manager after GDM verification failed: " "Restored previous display manager after GDM verification failed: ")$old_dm"
             fi
             warn "$(_t "Display manager enable verification failed; run niri-session from tty after reboot." "Display manager enable verification failed; run niri-session from tty after reboot.")"
@@ -3204,7 +3213,10 @@ stage_dm() {
         fi
     else
         FAILED_PKGS+=("dm:$dm_unit")
-        [ -n "$old_dm" ] && systemctl enable "$old_dm" >/dev/null 2>&1 || true
+        if [ -n "$old_dm" ]; then
+            systemctl enable "$old_dm" >/dev/null 2>&1 || true
+            ln -sfn "/lib/systemd/system/${old_dm}.service" /etc/systemd/system/display-manager.service 2>/dev/null || true
+        fi
         warn "$(_t "Display manager enable failed; run niri-session from tty after reboot." "Display manager enable failed; run niri-session from tty after reboot.")"
         # not marked: rerun retries
     fi
