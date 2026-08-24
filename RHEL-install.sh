@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# eilNiri - install.sh
+# eilNiri - RHEL-install.sh
 #
-#   One-click niri desktop setup for a fresh Arch / RHEL / Debian family system.
+#   One-click niri desktop setup for a fresh Fedora / Rocky / Alma / CentOS Stream / RHEL system.
 #   Packages come from a built-in list and the script installs everything:
 #   niri/awww/satty builds, rime-ice dictionary, display manager (replacing any
 #   existing one), services and config deploy. Desktop config is optional and read
 #   from the repo's configs/.config/ if you choose to ship any.
 #
 #   Usage:
-#     ./install.sh restore [--dry-run]     restore on new system (root)
-#     ./install.sh status                  show background build progress
-#     ./install.sh rollback                rollback config from backup (root)
-#     ./install.sh --help
+#     ./RHEL-install.sh restore [--dry-run]     restore on new system (root)
+#     ./RHEL-install.sh status                  show background build progress
+#     ./RHEL-install.sh rollback                rollback config from backup (root)
+#     ./RHEL-install.sh --help
 #
 #   Interaction style & visual engine reference: https://github.com/SHORiN-KiWATA/shorin-arch-setup
 #   Snapshot rollback design reference:          https://github.com/ech678/NyxNiri
@@ -95,7 +95,7 @@ LOG_DIR="${XDG_STATE_HOME:-$_LOG_HOME/.local/state}/eilNiri"
 unset _LOG_USER _LOG_HOME
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 export TEMP_LOG_FILE="$LOG_DIR/replicate.log"
-# Per-build state for ./install.sh status (name|pid|logfile|srcdir per line)
+# Per-build state for ./RHEL-install.sh status (name|pid|logfile|srcdir per line)
 export BUILD_STATE_FILE="$LOG_DIR/builds.state"
 
 init_logger() {
@@ -243,12 +243,6 @@ declare -A SVC_PROVIDER=(
     [libvirtd.service]=libvirt
     [power-profiles-daemon.service]=power-profiles-daemon
 )
-# Debian-family service provider names (built-in Arch names; remapped per family on restore)
-declare -A DEB_SVC_PROVIDER=(
-    [bluetooth.service]=bluez
-    [libvirtd.service]=libvirt-daemon-system
-    [power-profiles-daemon.service]=power-profiles-daemon
-)
 
 # --- Arch -> RHEL family translation layer ---
 # Rename mapping
@@ -303,31 +297,6 @@ declare -A RHEL_FAIL_HINT=(
     [hyprlock]="Available in the Fedora official repo (dnf install hyprlock); on Rocky/Alma/CentOS try EPEL / Copr, or install the RPM from the Fedora repo manually"
     [hypridle]="Available in the Fedora official repo (dnf install hypridle); on Rocky/Alma/CentOS try EPEL / Copr, or install the RPM from the Fedora repo manually"
 )
-# --- Arch -> Debian family translation layer ---
-# Rename mapping
-declare -A DEB_MAP=(
-    [mako]=mako-notifier
-    [fcitx5-configtool]=fcitx5-config-qt
-    # Ubuntu/Debian name the GTK/Qt frontends fcitx5-frontend-* (no fcitx5-gtk / fcitx5-qt binaries);
-    # fcitx5-frontend-all covers gtk2/gtk3/gtk4 + qt5/qt6 frontends and exists on both Debian 13 and Ubuntu 24.04+
-    [fcitx5-gtk]=fcitx5-frontend-all
-    [fcitx5-qt]=fcitx5-frontend-all
-    [ttf-jetbrains-mono-nerd]=fonts-jetbrains-mono
-    [wqy-zenhei]=fonts-wqy-zenhei
-    [libnotify]=libnotify-bin
-    # polkit-gnome was renamed to policykit-1-gnome in Ubuntu 24.04+ / Debian 13+ (binary name unchanged)
-    [polkit-gnome]=policykit-1-gnome
-)
-# Packages with no official .deb -> go to the "manual install" report (value = reason/advice)
-# (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
-declare -A DEB_MANUAL=(
-)
-# Debian family: extra hint when apt install fails (not in repo but may have an alternative)
-# (xwayland-satellite falls back to cargo install automatically)
-declare -A DEB_FAIL_HINT=(
-    [hyprlock]="Installable on Debian 13 via trixie-backports (apt-get install -t trixie-backports hyprlock); already in Ubuntu 26.04+ repos; otherwise build manually"
-    [hypridle]="Installable on Debian 13 via trixie-backports (apt-get install -t trixie-backports hypridle); already in Ubuntu 26.04+ repos; otherwise build manually"
-)
 # Packages installable via pip as a fallback (common to Arch/RHEL/Debian)
 declare -A PIP_PKGS=(
     [waypaper]=waypaper
@@ -357,12 +326,6 @@ declare -A SOURCE_PKGS=(
 # absent and build_hypr_stack() compiles them from source in dependency order first.
 # Missing entries are tolerated (apt_install_tolerant / dnf_install_tolerant), so a
 # package absent on an older release never aborts the whole build-deps step.
-HYPR_BUILD_DEPS_DEB=(build-essential cmake ninja-build pkg-config git libwayland-dev wayland-protocols hyprland-protocols
-    libpango1.0-dev libgbm-dev libdrm-dev libxkbcommon-dev libxcb1-dev
-    libcairo2-dev libpam0g-dev libpixman-1-dev libjpeg-dev libwebp-dev
-    librsvg2-dev libmagic-dev libpng-dev libpugixml-dev
-    libhyprutils-dev libhyprlang-dev libhyprgraphics-dev libhyprcursor-dev
-    libsdbus-c++-dev hyprwayland-scanner)
 # hyprlock / hypridle system build dependencies (RHEL family names)
 HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git wayland-devel wayland-protocols-devel
     pango-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel libdrm-devel libxkbcommon-devel libxcb-devel
@@ -467,7 +430,7 @@ HOME_DIR=""
 
 check_root() {
     if [ "$EUID" -ne 0 ]; then
-        error "$(_t "restore requires root. Use: sudo ./install.sh restore" "restore requires root. Use: sudo ./install.sh restore")"
+        error "$(_t "restore requires root. Use: sudo ./RHEL-install.sh restore" "restore requires root. Use: sudo ./RHEL-install.sh restore")"
         exit 1
     fi
 }
@@ -481,46 +444,24 @@ detect_distro() {
     DISTRO_ID="$id"
     DISTRO_ID_LIKE="$id_like"
     case " $id $id_like " in
-        *arch*|*manjaro*|*endeavouros*) DISTRO_FAMILY=arch ;;
-        *rhel*|*fedora*|*centos*)       DISTRO_FAMILY=rhel ;;
-        *debian*|*ubuntu*|*mint*|*pop*) DISTRO_FAMILY=debian ;;
+        *rhel*|*fedora*|*centos*) DISTRO_FAMILY=rhel ;;
         *)
-            error "Unrecognized distribution (ID=$id ID_LIKE=$id_like). Only Arch / RHEL / Debian families are supported."
+            error "This script is for Fedora / Rocky / Alma / CentOS Stream / RHEL (ID=$id ID_LIKE=$id_like). Use ./arch-install.sh or ./deb-install.sh instead."
             exit 1
             ;;
     esac
-    # Ubuntu version (numeric, e.g. 24.04 -> 2404); used for release-aware hints
-    if [ "$id" = ubuntu ]; then
-        local ver maj min
-        ver=$(. /etc/os-release; echo "${VERSION_ID:-}")
-        maj=$(printf '%s' "$ver" | cut -d. -f1)
-        min=$(printf '%s' "$ver" | cut -d. -f2)
-        [[ "$maj" =~ ^[0-9]+$ ]] && UBUNTU_VER_NUM=$(( maj * 100 + 10#${min:-0} ))
-    fi
-    # apt/debconf must never block the script on prompts
-    [ "$DISTRO_FAMILY" = debian ] && export DEBIAN_FRONTEND=noninteractive
-    local uver=""
-    [ "$UBUNTU_VER_NUM" -gt 0 ] && uver=" UBUNTU $UBUNTU_VER_NUM"
-    info_kv "$(_t "Distro" "Distro")" "$DISTRO_FAMILY" "(ID=$id$uver)"
+    info_kv "$(_t "Distro" "Distro")" "$DISTRO_FAMILY" "(ID=$id)"
 }
 
 pkg_installed() { # $1 = package name
-    case "$DISTRO_FAMILY" in
-        arch)   pacman -Qi "$1" &>/dev/null ;;
-        rhel)   rpm -q "$1" &>/dev/null ;;
-        debian) dpkg -s "$1" &>/dev/null ;;
-    esac
+    rpm -q "$1" &>/dev/null
 }
 
 # Extra dnf --enablerepo flags filled by ensure_rhel_repos (epel/crb/powertools).
 RHEL_DNF_ENABLEREPO=()
 
 pm_install() { # $@ = package names
-    case "$DISTRO_FAMILY" in
-        arch)   exe pacman -S --noconfirm --needed "$@" ;;
-        rhel)   exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$@" ;;
-        debian) exe apt-get install -y "$@" ;;
-    esac
+    exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$@"
 }
 
 # Install as many packages of a batch as possible; return non-zero only when one or more
@@ -530,12 +471,9 @@ BDEPS_MISSING=()
 apt_install_tolerant() {
     BDEPS_MISSING=()
     [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$@"); return "$DRY_RUN_RC"; }
-    # apt stderr goes to LOG_DIR/apt-errors.log (never /dev/null) so a systemic
-    # apt failure (broken dpkg state, unreachable repos) stays diagnosable.
     if exe apt-get install -y "$@" 2>>"$LOG_DIR/apt-errors.log"; then
         return 0   # whole batch installed
     fi
-    # batch failed (at least one name missing) — retry one-by-one so the available ones still install
     local p erc
     for p in "$@"; do
         erc=0
@@ -545,10 +483,6 @@ apt_install_tolerant() {
     [ ${#BDEPS_MISSING[@]} -eq 0 ]
 }
 
-# dnf twin of apt_install_tolerant: install as many of a batch as possible.
-# `dnf install -y a b c` aborts the WHOLE transaction when one name is absent
-# (e.g. hyprutils-devel not in Rocky/Alma base repos), so a failed batch is retried
-# one-by-one; genuinely absent names land in BDEPS_MISSING (shared array).
 dnf_install_tolerant() {
     BDEPS_MISSING=()
     [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$@"); return "$DRY_RUN_RC"; }
@@ -778,114 +712,6 @@ WRAPEOF
 # NOTE: fzf may not be installed yet at this point (ensure_fzf runs after
 # preflight, and apt being broken can block its install), so this falls back to a
 # plain numbered prompt when fzf is absent.
-_url_http_code() { # $1 = URL; echoes HTTP status code (000 on network failure)
-    curl -sI -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || echo "000"
-}
-
-# 检测系统时钟偏差：与官方源服务器 Last-Modified 对比，偏差 >= 3 天时警告。
-# apt 报 "Release 文件已经过期 / expired / Valid-Until" 的常见原因不是镜像滞后，
-# 而是本地时钟偏快（VM 常见，无 NTP）——此时换任何镜像都没用，必须先校准时间。
-check_clock_drift() {
-    local _cname _lastmod _mod_epoch _local_epoch _drift
-    _cname=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
-    [ -z "$_cname" ] && _cname="stable"
-    _lastmod=$(curl -sI --max-time 8 "http://security.ubuntu.com/ubuntu/dists/$_cname-security/InRelease" 2>/dev/null \
-        | awk -F': ' 'tolower($1)=="last-modified"{print $2; exit}' | tr -d '\r')
-    if [ -n "$_lastmod" ] && _mod_epoch=$(date -d "$_lastmod" +%s 2>/dev/null) && [ -n "$_mod_epoch" ]; then
-        _local_epoch=$(date +%s)
-        _drift=$(( (_local_epoch - _mod_epoch) / 86400 ))
-        [ "$_drift" -lt 0 ] && _drift=$(( -_drift ))
-        if [ "$_drift" -ge 3 ]; then
-            warn "$(_t "SYSTEM CLOCK seems off by about $_drift days (local: " "SYSTEM CLOCK seems off by about $_drift days (local: ") $(date '+%F %T %z')$(_t ", server Last-Modified: " ", server Last-Modified: ") $_lastmod$(_t ") — this makes ALL apt sources report 'Release file expired'. Calibrate first: sudo timedatectl set-ntp true (or: sudo ntpdate -u time.nist.gov), then rerun." ") — this makes ALL apt sources report 'Release file expired'. Calibrate first: sudo timedatectl set-ntp true (or: sudo ntpdate -u time.nist.gov), then rerun.")"
-        fi
-    fi
-}
-
-# 从 apt 错误日志里提取第一个 404 的 .deb 下载 URL（用于换源后验证新镜像是否已同步）
-_apt_404_url() {
-    grep -aoE 'https?://[^ ]+\.deb' "$LOG_DIR/apt-errors.log" 2>/dev/null | head -n 1
-}
-
-set_debian_mirror() { # $1 = 可选：直接指定镜像 (tuna|aliyun|ustc)，缺省时弹 fzf/编号菜单
-    local _force="${1:-}"
-    local _src_files=()
-    # Debian/Ubuntu 的源文件分散在 /etc/apt/sources.list 和 /etc/apt/sources.list.d/
-    while IFS= read -r -d '' _f; do
-        grep -qiE 'archive\.ubuntu\.com|security\.ubuntu\.com|ports\.ubuntu\.com|cn\.archive|deb\.debian\.org|security\.debian\.org' "$_f" 2>/dev/null \
-            && _src_files+=("$_f")
-    done < <(find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
-    [ ${#_src_files[@]} -eq 0 ] && { warn "$(_t "No Ubuntu/Debian apt source files found to rewrite." "No Ubuntu/Debian apt source files found to rewrite.")"; return 1; }
-
-    local choice="${1:-}"
-    if [ -z "$choice" ]; then
-        # fzf 可用时用菜单；否则退化为编号选择
-        if command -v fzf >/dev/null 2>&1; then
-            choice=$(printf "%s\n" \
-                "tuna\t清华大学镜像 (mirrors.tuna.tsinghua.edu.cn)" \
-                "aliyun\t阿里云镜像 (mirrors.aliyun.com)" \
-                "ustc\t中科大镜像 (mirrors.ustc.edu.cn)" \
-                "skip\t不更换，继续" \
-                | fzf_single " Debian/Ubuntu 软件源异常（更新失败或 404），选择是否更换镜像源 ") || choice="skip"
-            choice=${choice%%$'\t'*}
-        else
-            section "$(_t "Mirror Switch" "Mirror Switch")" "$(_t "use plain prompt (fzf not available)" "use plain prompt (fzf not available)")"
-            echo -e "   ${H_CYAN}[1]${NC} 清华大学镜像 (tuna)   ${H_CYAN}[2]${NC} 阿里云 (aliyun)   ${H_CYAN}[3]${NC} 中科大 (ustc)   ${H_CYAN}[4]${NC} 不更换继续"
-            local _ans; read -r -t 30 _ans || _ans="4"
-            case "$_ans" in
-                1) choice="tuna" ;;
-                2) choice="aliyun" ;;
-                3) choice="ustc" ;;
-                *) choice="skip" ;;
-            esac
-        fi
-    fi
-
-    [ "$choice" = "skip" ] && { log "$(_t "Keeping current apt sources." "Keeping current apt sources.")"; return 0; }
-
-    local _ts _mirror=""
-    case "$choice" in
-        tuna|*tuna*) _mirror="mirrors.tuna.tsinghua.edu.cn" ;;
-        aliyun|*aliyun*) _mirror="mirrors.aliyun.com" ;;
-        ustc|*ustc*)     _mirror="mirrors.ustc.edu.cn" ;;
-        *) log "$(_t "Unknown choice, skipping." "Unknown choice, skipping.")"; return 0 ;;
-    esac
-
-    section "$(_t "Mirror Switch" "Mirror Switch")" "$_mirror"
-    _ts=$(date +%Y%m%d-%H%M%S)
-    local _f _bak
-    for _f in "${_src_files[@]}"; do
-        _bak="$_f.mirror-bak-$_ts"
-        exe cp -a "$_f" "$_bak" || true
-        # Ubuntu: archive/security/ports/cn.archive -> mirror (保留路径结构 ubuntu/...)
-        exe sed -i -E "s#(https?://)(archives?\.|security\.|ports\.|cn\.)?archive\.ubuntu\.com#\1$_mirror#g; s#(https?://)security\.ubuntu\.com#\1$_mirror#g; s#(https?://)ports\.ubuntu\.com#\1$_mirror#g; s#(https?://)cn\.archive\.ubuntu\.com#\1$_mirror#g; s#(https?://)deb\.debian\.org#\1$_mirror#g; s#(https?://)security\.debian\.org#\1$_mirror#g" "$_f" || true
-        log "$(_t "Rewrote " "Rewrote ") $_f -> $_mirror (backup: $_bak)"
-    done
-    log "$(_t "Reloading package index from new mirror..." "Reloading package index from new mirror...")"
-    exe apt-get update 2>>"$LOG_DIR/apt-errors.log" || true
-
-    # 验证新镜像确实同步了之前 404 的 .deb：把 apt 错误里的第一个 .deb URL 换到新
-    # 镜像域名再探测。只有显式 404 才判为"镜像也未同步"（网络不通/无法验证不阻塞）。
-    local _probe _code
-    _probe=$(_apt_404_url)
-    if [ -n "$_probe" ]; then
-        _probe=$(printf '%s' "$_probe" | sed -E "s#https?://[^/]+#http://$_mirror#")
-        _code=$(_url_http_code "$_probe")
-        if [ "$_code" = "404" ]; then
-            warn "$(_t "New mirror " "New mirror ") $_mirror$(_t " also returns 404 for the missing .deb (同步滞后？) — trying next mirror." " also returns 404 for the missing .deb (sync lag?) — trying next mirror.")"
-            return 1
-        fi
-        log "$(_t "New mirror verified: " "New mirror verified: ") $_probe -> HTTP $_code"
-    fi
-    return 0
-}
-
-# --- 4.1 Pre-flight ---
-# Enable EPEL + CRB on RHEL family so the -devel build packages (xcb-cursor,
-# dav1d, pixman, librsvg, fcitx5-rime, sdbus-c++, ...) are actually available.
-# CRB is CodeReady Builder on RHEL / "CRB" on Rocky/Alma; dnf5 (EL10+/Fedora 41+)
-# uses `config-manager setopt`, dnf4 uses `config-manager --set-enabled`.
-# Collect --enablerepo=ID for every extra repo we care about that dnf knows
-# (enabled or disabled). Unknown IDs must never be passed — dnf treats them as errors.
 _rhel_refresh_enablerepo() {
     RHEL_DNF_ENABLEREPO=()
     local _ids _id
@@ -913,7 +739,6 @@ resolve_rhel_package() { # $1 = logical package name; prints an installable cand
 # RHEL itself uses CodeReady Builder / RHUI IDs. Fedora already has most packages
 # in the official repos — extra enables are best-effort and ignored if absent.
 ensure_rhel_repos() {
-    [ "$DISTRO_FAMILY" = rhel ] || return 0
     [ "$DRY_RUN" -eq 1 ] && { log "$(_t "[DRY-RUN] would enable EPEL + CRB/PowerTools repos." "[DRY-RUN] would enable EPEL + CRB/PowerTools repos.")"; return 0; }
     if [ ! -f /etc/yum.repos.d/epel.repo ] && ! rpm -q epel-release >/dev/null 2>&1; then
         log "$(_t "Enabling EPEL..." "Enabling EPEL...")"
@@ -958,7 +783,6 @@ ensure_rhel_repos() {
 # Enable the COPRs that carry Wayland extras on EL10. Idempotent: already-enabled
 # COPRs succeed quickly. Missing chroots (EL8/9) fail quietly; callers fall back.
 ensure_rhel_coprs() {
-    [ "$DISTRO_FAMILY" = rhel ] || return 0
     [ "$DRY_RUN" -eq 1 ] && return 0
     if ! dnf copr --help >/dev/null 2>&1; then
         dnf install -y dnf-plugins-core 2>/dev/null || true
@@ -981,7 +805,6 @@ ensure_rhel_coprs() {
 }
 
 ensure_rhel_graphics_runtime() {
-    [ "$DISTRO_FAMILY" = rhel ] || return 0
     if [ "$DRY_RUN" -eq 1 ]; then
         DRY_PKGS+=("${RHEL_GRAPHICS_RUNTIME[@]}")
         return "$DRY_RUN_RC"
@@ -1002,29 +825,6 @@ stage_preflight() {
         log "$(_t "Pre-flight done, skipping (delete .replicate_progress to force rerun)." "Pre-flight done, skipping (delete .replicate_progress to force rerun).")"
         return
     fi
-    case "$DISTRO_FAMILY" in
-        arch)
-            # Parallel download speedup
-            sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true
-            # Reflector mirror optimization (CN timezone -> China mirrors, otherwise skip)
-            local tz
-            tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
-            if [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]]; then
-                if command -v reflector &>/dev/null; then
-                    log "$(_t "Detected CN timezone, refreshing CN mirrors..." "Detected CN timezone, refreshing CN mirrors...")"
-                    exe reflector --country China --protocol https --sort rate --save /etc/pacman.d/mirrorlist --latest 10 2>/dev/null || \
-                        warn "$(_t "Reflector failed, using existing mirrors." "Reflector failed, using existing mirrors.")"
-                fi
-            fi
-            exe pacman -Sy --noconfirm archlinux-keyring || warn "$(_t "keyring refresh failed, continuing." "keyring refresh failed, continuing.")"
-            if [ "$DRY_RUN" -eq 1 ]; then
-                log "$(_t "[DRY-RUN] Skipping system upgrade." "[DRY-RUN] Skipping system upgrade.")"
-            elif ! exe pacman -Su --noconfirm; then
-                error "$(_t "System update failed. Check network." "System update failed. Check network.")"
-                exit 1
-            fi
-            ;;
-        rhel)
             ensure_rhel_repos   # enable EPEL + CRB so -devel build packages are available
             ensure_rhel_graphics_runtime
             # Install the Rime engine before the optional dictionary stage. The
@@ -1037,73 +837,7 @@ stage_preflight() {
             elif ! exe dnf -y upgrade --refresh; then
                 warn "$(_t "System update partially failed, continuing." "System update partially failed, continuing.")"
             fi
-            ;;
-        debian)
-            # Refresh package index first (a fresh system may have no cache); also ensure curl/tar are available (niri download dependency)
-            if [ "$DRY_RUN" -eq 1 ]; then
-                log "$(_t "[DRY-RUN] Skipping apt update/upgrade." "[DRY-RUN] Skipping apt update/upgrade.")"
-                DRY_PKGS+=("curl tar")
-            else
-                # Ubuntu release too old: most of the niri suite is not packaged before 24.04
-                if [ "$UBUNTU_VER_NUM" -gt 0 ] && [ "$UBUNTU_VER_NUM" -lt 2404 ]; then
-                    warn "$(_t "Ubuntu $UBUNTU_VER_NUM detected: most niri-suite packages require Ubuntu 24.04+ (universe) or Debian 13+. Continue at your own risk." "Ubuntu $UBUNTU_VER_NUM detected: most niri-suite packages require Ubuntu 24.04+ (universe) or Debian 13+. Continue at your own risk.")"
-                fi
-                # Fresh log for apt errors this run (apt_install_tolerant and the
-                # critical-deps retry append here instead of swallowing stderr).
-                : > "$LOG_DIR/apt-errors.log" 2>/dev/null || true
-                # Repair a broken dpkg state left by an interrupted previous run:
-                # without this, EVERY later apt-get install fails and unrelated
-                # packages all report "unavailable" (classic symptom: build deps
-                # AND service provider packages failing at the same time).
-                local _dpkg_audit
-                _dpkg_audit=$(dpkg --audit 2>/dev/null)
-                if [ -n "$_dpkg_audit" ]; then
-                    log "$(_t "dpkg reports half-installed packages; running dpkg --configure -a ..." "dpkg reports half-installed packages; running dpkg --configure -a ...")"
-                    exe dpkg --configure -a 2>>"$LOG_DIR/apt-errors.log" || warn "$(_t "dpkg repair failed; see " "dpkg repair failed; see ") $LOG_DIR/apt-errors.log"
-                fi
-                if ! exe apt-get update; then
-                    warn "$(_t "apt-get update FAILED — package installs will fail too. Check network / apt sources (mirror), run 'sudo apt-get update' manually, then rerun." "apt-get update FAILED — package installs will fail too. Check network / apt sources (mirror), run 'sudo apt-get update' manually, then rerun.")"
-                    # 若报 "Release 文件已经过期/expired"，先查系统时钟（常见根因，换镜像无效）
-                    check_clock_drift
-                    # 网络受限于当前源时，提供一键换源（fzf 选择；fzf 未装则退化编号提示）
-                    if confirm "$(_t "Switch the Debian/Ubuntu apt mirror to a CN mirror? [Y/n] (default Y):" "Switch the Debian/Ubuntu apt mirror to a CN mirror? [Y/n] (default Y):")" "Y" 15 2>/dev/null; then
-                        set_debian_mirror
-                    fi
-                fi
-                # Ubuntu: the niri-suite packages (fuzzel, mako-notifier, waybar, fcitx5-rime, hyprlock, ...) live in
-                # universe, which is NOT enabled by default on Ubuntu Server/minimal/cloud images. Enable it automatically
-                # (硬校验：启用后必须能看到 universe 包，否则警告并给出手动命令）。
-                # 注意：openkylin/deepin 等 Ubuntu 衍生版 ID 不是 ubuntu，但同样需要 universe。
-                if _is_ubuntu_like; then
-                    if _ensure_ubuntu_universe; then
-                        log "$(_t "universe component OK." "universe component OK.")"
-                    else
-                        warn "$(_t "universe 仍未启用/不可见 — 部分构建依赖（universe 组件，如 libxcb-render-util0-dev）将无法安装。手动执行: sudo add-apt-repository universe && sudo apt-get update" "universe 仍未启用/不可见 — 部分构建依赖（universe 组件，如 libxcb-render-util0-dev）将无法安装。手动执行: sudo add-apt-repository universe && sudo apt-get update")"
-                    fi
-                fi
-                if ! exe apt-get -y upgrade; then
-                    warn "$(_t "System update partially failed, continuing." "System update partially failed, continuing.")"
-                fi
-                pm_install curl tar unzip
-                # Generate the zh_CN / en_US locales: envvars.conf sets LANG=zh_CN.UTF-8 and
-                # a missing locale triggers noisy "cannot set locale" warnings on every command.
-                if ! command -v locale-gen >/dev/null 2>&1; then
-                    exe apt-get install -y locales 2>/dev/null || true
-                fi
-                if command -v locale-gen >/dev/null 2>&1; then
-                    local _lg
-                    for _lg in "zh_CN.UTF-8 UTF-8" "en_US.UTF-8 UTF-8"; do
-                        local _loc="${_lg%% *}"
-                        grep -q "^#*${_lg}$" /etc/locale.gen 2>/dev/null \
-                            && sed -i "s/^#*${_lg}$/${_lg}/" /etc/locale.gen \
-                            || echo "$_lg" >> /etc/locale.gen
-                    done
-                    exe locale-gen 2>/dev/null || warn "$(_t "locale-gen failed, locale warnings may appear." "locale-gen failed, locale warnings may appear.")"
-                fi
-            fi
-            ;;
-    esac
-    success "$(_t "System ready." "System ready.")"
+        success "$(_t "System ready." "System ready.")"
     stage_mark preflight
 }
 
@@ -1198,57 +932,6 @@ stage_apps_select() {
 }
 
 # --- 4.3 app install ---
-
-install_arch() {
-    local p
-    # --- repo packages: batch install, fall back to per-package isolation on failure ---
-    local queue=()
-    for p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
-        if [ -n "${PIP_PKGS[$p]:-}" ]; then
-            # pip fallback install
-            if [ "$DRY_RUN" -eq 1 ]; then
-                DRY_PKGS+=("$p (pip)")
-                continue
-            fi
-            pm_install python-pip
-            local per=0
-            exe as_user pip install --user "${PIP_PKGS[$p]}" || per=$?
-            if [ "$per" -eq 0 ]; then
-                INSTALLED_PKGS+=("$p (pip)")
-            else
-                MANUAL_ITEMS+=("$p — pip install failed, do it manually: pip install --user ${PIP_PKGS[$p]}")
-            fi
-            continue
-        fi
-        if pkg_installed "$p"; then
-            SKIPPED_PKGS+=("$p (already installed)")
-        else
-            queue+=("$p")
-        fi
-    done
-    if [ ${#queue[@]} -gt 0 ]; then
-        local rc=0
-        pm_install "${queue[@]}" || rc=$?
-        if [ "$rc" -eq 0 ]; then
-            INSTALLED_PKGS+=("${queue[@]}")
-        elif [ "$rc" -eq "$DRY_RUN_RC" ]; then
-            DRY_PKGS+=("${queue[@]}")
-        else
-            warn "$(_t "Batch install failed, switching to individual installs..." "Batch install failed, switching to individual installs...")"
-            for p in "${queue[@]}"; do
-                local prc=0
-                pm_install "$p" || prc=$?
-                if [ "$prc" -eq 0 ]; then
-                    INSTALLED_PKGS+=("$p")
-                elif [ "$prc" -eq "$DRY_RUN_RC" ]; then
-                    DRY_PKGS+=("$p")
-                else
-                    FAILED_PKGS+=("repo:$p")
-                fi
-            done
-        fi
-    fi
-}
 
 install_rhel() {
     local p name erc resolved
@@ -1701,80 +1384,6 @@ _pc_alias_patch() {
 # 确保 Ubuntu 的 universe 组件已启用（很多构建 -dev 包在 universe，如 libxcb-render-util0-dev）。
 # 返回 0 = universe 可见；1 = 仍不可见。
 # 是否为 Ubuntu 或 Ubuntu 衍生发行版（openkylin/deepin/UOS 等 ID_LIKE 含 ubuntu）
-_is_ubuntu_like() {
-    case " $DISTRO_ID $DISTRO_ID_LIKE " in
-        *" ubuntu "*) return 0 ;;
-        *" linuxmint "*) return 0 ;;
-        *" pop "*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-_ensure_ubuntu_universe() {
-    _is_ubuntu_like || return 0
-    # 已能看到 universe 包就算启用（两个代表性包）
-    apt-cache show libxcb-render-util0-dev >/dev/null 2>&1 && return 0
-    apt-cache show mako-notifier >/dev/null 2>&1 && return 0
-    if ! command -v add-apt-repository >/dev/null 2>&1; then
-        pm_install software-properties-common 2>>"$LOG_DIR/apt-errors.log" || true
-    fi
-    if command -v add-apt-repository >/dev/null 2>&1; then
-        exe add-apt-repository -y universe 2>>"$LOG_DIR/apt-errors.log" || true
-    else
-        # 无 add-apt-repository：直接往 deb822 .sources 的 Components 行追加 universe
-        local _f
-        for _f in /etc/apt/sources.list.d/*.sources; do
-            [ -f "$_f" ] || continue
-            grep -q '^Components:' "$_f" 2>/dev/null || continue
-            grep -qE '^\s*Components:.*\buniverse\b' "$_f" 2>/dev/null || {
-                exe sed -i -E 's/^(Components:.*)$/\1 universe/' "$_f" || true
-            }
-        done
-    fi
-    # 捕获 update 输出：若成功但索引里没有 universe 行，说明当前源/镜像不含 universe 组件
-    local _upout _univ_lines
-    _upout=$(apt-get update 2>&1)
-    exe apt-get update 2>>"$LOG_DIR/apt-errors.log" || true
-    _univ_lines=$(printf '%s\n' "$_upout" | grep -iE 'universe' | head -n 3)
-    if [ -z "$_univ_lines" ] && ! apt-cache show mako-notifier >/dev/null 2>&1; then
-        warn "$(_t "apt-get update 未获取到 universe 索引（当前源/镜像可能不含 universe 组件）— 需要换源或手动确认 sources。当前源:" "apt-get update 未获取到 universe 索引（当前源/镜像可能不含 universe 组件）— 需要换源或手动确认 sources。当前源:")"
-        grep -hE '^(URIs|Components):' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null | head -n 6 || true
-    fi
-    apt-cache show libxcb-render-util0-dev >/dev/null 2>&1 || apt-cache show mako-notifier >/dev/null 2>&1
-}
-_pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔）
-    case "$1" in
-        libdisplay-info)  echo "libdisplay-info-dev" ;;
-        xkbcommon)         echo "libxkbcommon-dev" ;;
-        xkbcommon-x11)     echo "libxkbcommon-x11-dev" ;;
-        wayland-client)    echo "libwayland-dev" ;;
-        wayland-server)    echo "libwayland-dev" ;;
-        libinput)          echo "libinput-dev" ;;
-        libseat)           echo "libseat-dev" ;;
-        libpipewire-0.3)   echo "libpipewire-0.3-dev" ;;
-        dbus-1)            echo "libdbus-1-dev" ;;
-        pango)             echo "libpango1.0-dev" ;;
-        gbm)               echo "libgbm-dev" ;;
-        egl)               echo "libegl1-mesa-dev" ;;
-        liblz4)            echo "liblz4-dev" ;;
-        lz4)               echo "liblz4-dev" ;;
-        dav1d)             echo "libdav1d-dev" ;;
-        xcb-cursor)        echo "libxcb-cursor-dev" ;;
-        xcb-composite)     echo "libxcb-composite0-dev libxcb-composite-dev" ;;
-        xcb-ewmh)          echo "libxcb-ewmh-dev" ;;
-        xcb-icccm)         echo "libxcb-icccm4-dev libxcb-icccm-dev" ;;
-        xcb-randr)         echo "libxcb-randr0-dev libxcb-randr-dev" ;;
-        xcb-xfixes)        echo "libxcb-xfixes0-dev libxcb-xfixes-dev" ;;
-        xcb-present)       echo "libxcb-present-dev" ;;
-        xcb-render-util)   echo "libxcb-render-util0-dev libxcb-render-util-dev" ;;
-        xcb-res)           echo "libxcb-res0-dev libxcb-res-dev" ;;
-        xcb-shape)         echo "libxcb-shape0-dev" ;;
-        xcb-util)          echo "libxcb-util-dev" ;;
-        xcb-xkb)           echo "libxcb-xkb-dev" ;;
-        xcb-xinerama)      echo "libxcb-xinerama0-dev libxcb-xinerama-dev" ;;
-        *)                 echo "" ;;
-    esac
-}
 _pc_pkg_map_rhel() { # $1 = .pc 名; echo 候选 -devel 包名
     case "$1" in
         libdisplay-info)  echo "libdisplay-info-devel display-info-devel" ;;
@@ -1818,50 +1427,6 @@ _pc_auto_install_rhel() { # $1 = .pc 名
     done
     return 1
 }
-_pc_auto_install() { # $1 = .pc 名（Debian 系专用）
-    local _cand _found=0 _try
-    for _try in 1 2; do
-        for _cand in $(_pc_pkg_map "$1"); do
-            if apt-cache policy "$_cand" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
-                _found=1
-                log "$(_t "Auto-installing missing build dep: " "Auto-installing missing build dep: ") $_cand"
-                pm_install "$_cand" 2>>"$LOG_DIR/apt-errors.log" || true
-                PC_AUTO_INSTALLED=$(( PC_AUTO_INSTALLED + 1 ))
-                pkg-config --exists "$1" 2>/dev/null && return 0
-            fi
-        done
-        # 候选包一个都不在 apt 列表里 → 大概率 universe 未启用（这些 -dev 包多在
-        # universe，如 libxcb-render-util0-dev）或源列表缺失；启用 universe 后重试一轮
-        if [ "$_found" -eq 0 ] && [ "$_try" -eq 1 ]; then
-            PC_NO_CANDIDATE=1
-            warn "$(_t "No apt candidate for " "No apt candidate for ") $1$(_t " — 尝试启用 universe 并刷新索引..." " — 尝试启用 universe 并刷新索引...")"
-            _ensure_ubuntu_universe || true
-            _found=0
-        else
-            break
-        fi
-    done
-    # 兜底：包已装但 pkg-config 仍找不到（.pc 在磁盘但不在搜索路径 / Requires 依赖缺失）——
-    # 在磁盘上找到 .pc 就把所在目录加入 PKG_CONFIG_PATH（cargo 构建继承该环境变量）
-    if ! pkg-config --exists "$1" 2>/dev/null; then
-        local _pcerr2
-        _pcerr2=$(pkg-config --print-errors "$1" 2>&1 | tail -n 1)
-        local _pcf _pcdir
-        _pcf=$(find /usr /lib /opt -name "$1.pc" -type f 2>/dev/null | head -n 1)
-        if [ -n "$_pcf" ]; then
-            _pcdir=$(dirname "$_pcf")
-            case ":${PKG_CONFIG_PATH:-}:" in
-                *":$_pcdir:"*) ;;
-                *) export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$_pcdir" ;;
-            esac
-            log "$(_t "Found " "Found ") $1.pc$(_t " at " " at ") $_pcf$(_t " — added " " — added ") $_pcdir$(_t " to PKG_CONFIG_PATH" " to PKG_CONFIG_PATH")"
-            pkg-config --exists "$1" 2>/dev/null && return 0
-        else
-            warn "$(_t "pkg-config error for " "pkg-config error for ") $1.pc: $_pcerr2"
-        fi
-    fi
-    return 1
-}
 ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_STILL_MISSING 列出）
     PC_STILL_MISSING=()
     _pc_alias_patch   # xcb-renderutil.pc ↔ xcb-render-util.pc 命名分歧兼容
@@ -1875,11 +1440,7 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
             if ! pkg-config --exists "$_pc" 2>/dev/null; then
                 warn "$(_t "build prerequisite missing: " "build prerequisite missing: ") $_pc.pc"
                 if [ "$DRY_RUN" -eq 0 ]; then
-                    if [ "$DISTRO_FAMILY" = debian ]; then
-                        _pc_auto_install "$_pc"
-                    elif [ "$DISTRO_FAMILY" = rhel ]; then
-                        _pc_auto_install_rhel "$_pc"
-                    fi
+                    _pc_auto_install_rhel "$_pc"
                 fi
             fi
         done
@@ -1892,29 +1453,12 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
         [ ${#PC_STILL_MISSING[@]} -eq 0 ] && return 0
         # 仍缺且 (a) apt 报镜像/源故障特征，或 (b) 候选包根本不在 apt 列表（universe 缺失/
         # 源列表陈旧，apt 无报错）→ 先查时钟，再换源重试一轮（最多一次）
-        if [ "$_attempt" -eq 0 ] && [ "$DISTRO_FAMILY" = debian ] && [ "$DRY_RUN" -eq 0 ] \
-            && { [ "$PC_NO_CANDIDATE" -eq 1 ] \
-                 || grep -qiE '404|无法下载|Failed to fetch|Unable to fetch|Unable to locate package|has no installation candidate|Release 文件已经过期|expired|Valid-Until' "$LOG_DIR/apt-errors.log" 2>/dev/null; }; then
-            check_clock_drift
-            if confirm "$(_t "apt cannot fetch some packages (mirror/source issue) — switch mirror and retry? [Y/n] (default Y):" "apt cannot fetch some packages (mirror/source issue) — switch mirror and retry? [Y/n] (default Y):")" "Y" 10 2>/dev/null; then
-                if set_debian_mirror; then
-                    _attempt=1
-                    PC_NO_CANDIDATE=0
-                    log "$(_t "Retrying .pc pre-check after mirror switch..." "Retrying .pc pre-check after mirror switch...")"
-                    continue
-                fi
-            fi
-        fi
         break
     done
     # 失败原因说明（按发行版系生成，避免在 RHEL/Arch 上误报 Debian 专属的 universe/apt 提示）
     local _perr _hint
     _perr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
-    case "$DISTRO_FAMILY" in
-        rhel)   _hint="dnf 里没有提供该 .pc 的 -devel 包（xcb-cursor 对应 xcb-util-cursor-devel；需 EPEL/CRB）。可运行 'dnf install --enablerepo=epel,crb xcb-util-cursor-devel' 后重跑" ;;
-        arch)   _hint="pacman 里没有提供该 .pc 的开发包（可尝试 'pacman -S <对应包名>' 或 AUR）后重跑" ;;
-        *)      if [ -n "$_perr" ]; then _hint="apt error: $_perr"; else _hint="apt 无报错 — 候选 -dev 包不在 apt 列表中（大概率 universe 未启用或源列表缺失）"; fi ;;
-    esac
+    _hint="dnf 里没有提供该 .pc 的 -devel 包（xcb-cursor 对应 xcb-util-cursor-devel；需 EPEL/CRB）。可运行 'dnf install --enablerepo=epel,crb xcb-util-cursor-devel' 后重跑"
     PC_FAIL_HINT="$_hint"
     [ ${#PC_STILL_MISSING[@]} -eq 0 ]
 }
@@ -3087,102 +2631,6 @@ build_source_project() {
     fi
 }
 
-install_debian() {
-    local p name erc
-    local all=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
-
-    # pip fallback pre-check
-    local has_pip_target=0
-    for p in "${all[@]}"; do
-        if [ -n "${PIP_PKGS[$p]:-}" ]; then has_pip_target=1; break; fi
-    done
-    if [ "$has_pip_target" -eq 1 ]; then
-        if [ "$DRY_RUN" -eq 1 ]; then
-            DRY_PKGS+=("python3-pip")
-        else
-            pm_install python3-pip
-        fi
-        if [ "$DRY_RUN" -eq 0 ] && ! command -v pip3 &>/dev/null; then
-            MANUAL_ITEMS+=("python3-pip — pip3 not installed, run: sudo apt-get install python3-pip")
-        fi
-    fi
-
-    for p in ${all[@]+"${all[@]}"}; do
-        # niri: not in official repos, use prebuilt/source install
-        if [ "$p" = "niri" ]; then
-            install_niri_binary
-            continue
-        fi
-        # awww/satty: no .deb in any Debian-family repo (prebuilt binary / cargo build)
-        if [ "$p" = "awww" ]; then
-            install_awww
-            continue
-        fi
-        if [ "$p" = "satty" ]; then
-            install_satty
-            continue
-        fi
-        # rime-ice: no .deb; deploy the dictionary from GitHub (fcitx5-rime package provides the engine)
-        if [ "$p" = "rime-ice-pinyin-git" ]; then
-            install_rime_ice
-            continue
-        fi
-        # xwayland-satellite: not in Debian/Ubuntu stable repos; cargo install fallback
-        if [ "$p" = "xwayland-satellite" ]; then
-            install_xwayland_satellite
-            continue
-        fi
-        if [ -n "${DEB_MANUAL[$p]:-}" ]; then
-            MANUAL_ITEMS+=("$p — ${DEB_MANUAL[$p]}")
-            continue
-        fi
-        if [ -n "${PIP_PKGS[$p]:-}" ]; then
-            if [ "$DRY_RUN" -eq 1 ]; then
-                DRY_PKGS+=("$p (pip)")
-                continue
-            fi
-            if ! command -v pip3 &>/dev/null; then
-                MANUAL_ITEMS+=("$p — pip3 not installed, run: sudo apt-get install python3-pip")
-                continue
-            fi
-            erc=0
-            # PEP 668 (externally-managed-environment) requires --break-system-packages
-            exe as_user pip3 install --user --break-system-packages "${PIP_PKGS[$p]}" || erc=$?
-            if [ "$erc" -eq 0 ]; then
-                INSTALLED_PKGS+=("$p (pip)")
-            else
-                MANUAL_ITEMS+=("$p — pip install failed, do it manually: pip3 install --user --break-system-packages ${PIP_PKGS[$p]}")
-            fi
-            continue
-        fi
-        name="${DEB_MAP[$p]:-$p}"
-        if pkg_installed "$name"; then
-            SKIPPED_PKGS+=("$name (already installed)")
-            continue
-        fi
-        erc=0
-        pm_install "$name" || erc=$?
-        if [ "$erc" -eq 0 ]; then
-            INSTALLED_PKGS+=("$name")
-        elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
-            DRY_PKGS+=("$name")
-        else
-            if [ -n "${SOURCE_PKGS[$p]:-}" ]; then
-                warn "$(_t "No apt package for " "No apt package for ") $p, building from source..."
-                install_source_package "$p" "${SOURCE_PKGS[$p]}"
-            elif [ -n "${DEB_FAIL_HINT[$p]:-}" ]; then
-                MANUAL_ITEMS+=("$name — not available in repo. ${DEB_FAIL_HINT[$p]}")
-            else
-                FAILED_PKGS+=("apt:$name")
-            fi
-        fi
-    done
-}
-
-# [fonts] 分组的 ttf-jetbrains-mono-nerd 在 Debian/RHEL 上 apt/dnf 装的只是普通
-# JetBrains Mono（无 Nerd Font 图标）。waybar 等用 Nerd Font 字形渲染图标，缺了
-# 图标就显示成方框。从 nerd-fonts 官方 release 下载带图标的版本装到用户字体目录
-# （download_gh 自动带 GitHub 代理回退，CN 可用）。
 install_nerd_font() {
     local _has_nf=0 _p
     for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
@@ -3265,11 +2713,7 @@ stage_apps_install() {
     # baseline failure counts: the stage is only marked complete when nothing new failed
     local _bf=${#FAILED_PKGS[@]} _bm=${#MANUAL_ITEMS[@]}
     apply_cargo_mirror
-    case "$DISTRO_FAMILY" in
-        arch)   install_arch ;;
-        rhel)   install_rhel ;;
-        debian) install_debian ;;
-    esac
+    install_rhel
     install_nerd_font   # waybar 图标字体（Debian/RHEL 的 apt 包不带 Nerd Font 图标）
     install_vm_agent    # QEMU/虚拟机：spice-vdagent（剪贴板桥 + 光标同步）
     # Defer the progress mark while background builds (niri/awww) are still running
@@ -3296,7 +2740,7 @@ build_progress_line() { # $1 = logfile
 stage_wait_builds() {
     [ ${#BG_JOBS[@]} -eq 0 ] && { stage_mark apps; return; }
     section "$(_t "Background Builds" "Background Builds")" "$(_t "waiting for cargo builds (niri/awww)" "waiting for cargo builds (niri/awww)")"
-    log "$(_t "Run './install.sh status' in another terminal to watch progress live." "Run './install.sh status' in another terminal to watch progress live.")"
+    log "$(_t "Run './RHEL-install.sh status' in another terminal to watch progress live." "Run './RHEL-install.sh status' in another terminal to watch progress live.")"
     local entry name pid logfile srcdir rc tailmsg start now prog any_failed=0
     for entry in "${BG_JOBS[@]}"; do
         IFS='|' read -r name pid logfile srcdir <<< "$entry"
@@ -3337,7 +2781,7 @@ stage_wait_builds() {
     fi
 }
 
-# --- 4.3c build status (./install.sh status, run from another terminal while restore is building) ---
+# --- 4.3c build status (./RHEL-install.sh status, run from another terminal while restore is building) ---
 
 do_status() {
     if [ ! -f "$BUILD_STATE_FILE" ]; then
@@ -3371,7 +2815,7 @@ do_status() {
             [ -n "$logfile" ] && [ -f "$logfile" ] && echo -e "       ${H_CYAN}tail -f $logfile${NC}"
         done < "$BUILD_STATE_FILE"
     fi
-    echo -e "   ${DIM}$(_t "or: watch -n 5 ./install.sh status" "or: watch -n 5 ./install.sh status")${NC}"
+    echo -e "   ${DIM}$(_t "or: watch -n 5 ./RHEL-install.sh status" "or: watch -n 5 ./RHEL-install.sh status")${NC}"
 }
 
 # --- 4.4 system services (built-in list, fzf selection; snapshot-free mode) ---
@@ -3401,11 +2845,6 @@ stage_services() {
         unit=$(echo "$line" | cut -f1 -d"$(printf '\t')" | xargs)
         [ -z "$unit" ] && continue
         provider="${SVC_PROVIDER[$unit]:-}"
-        # provider names are Arch names; remap per family for Debian
-        if [ "$DISTRO_FAMILY" = debian ] && [ -n "${DEB_SVC_PROVIDER[$unit]:-}" ]; then
-            provider="${DEB_SVC_PROVIDER[$unit]}"
-        fi
-
         # install the provider package if it is missing
         if [ -n "$provider" ] && ! pkg_installed "$provider"; then
             log "$(_t "Installing service provider: " "Installing service provider: ")$provider"
@@ -3413,14 +2852,14 @@ stage_services() {
             pm_install "$provider" || erc=$?
             # RHEL family: some providers (power-profiles-daemon, ...) are only in EPEL,
             # not the base repos — enable EPEL once and retry before declaring failure.
-            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ "$DISTRO_FAMILY" = rhel ] \
+            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] \
                 && ! rpm -q epel-release >/dev/null 2>&1 && [ ! -f /etc/yum.repos.d/epel.repo ]; then
                 log "$(_t "Provider not in base RHEL repos — enabling EPEL and retrying..." "Provider not in base RHEL repos — enabling EPEL and retrying...")"
                 pm_install epel-release 2>/dev/null || true
                 erc=0
                 pm_install "$provider" || erc=$?
             fi
-            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ "$DISTRO_FAMILY" = rhel ]; then
+            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
                 log "$(_t "Retrying service provider with EPEL: " "Retrying service provider with EPEL: ")$provider"
                 erc=0
                 exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$provider" || erc=$?
@@ -3498,11 +2937,8 @@ stage_dm() {
 
     local known_dms=(gdm3 gdm sddm lxdm ly greetd plasma-login-manager lemurs)
     local dm_pkgs dm_unit
-    case "$DISTRO_FAMILY" in
-        arch)   dm_pkgs="ly";           dm_unit="ly@tty1" ;;
-        # deb/rhel: prefer gdm (Ubuntu 26.04+, Fedora, Rocky), fall back to gdm3 (Ubuntu 24.04-, Debian)
-        *)      dm_pkgs="gdm";          dm_unit="gdm" ;;
-    esac
+    # prefer gdm (Ubuntu 26.04+, Fedora, Rocky), fall back to gdm3 (Ubuntu 24.04-, Debian)
+    dm_pkgs="gdm"; dm_unit="gdm"
 
     # what is currently configured/installed?
     local current=""
@@ -3655,105 +3091,6 @@ stage_backup() {
 # collected .zshrc only ever worked on the Arch reference machine.  Runs only
 # when zsh was selected; every step is best-effort with a MANUAL_ITEMS note on
 # failure (the .zshrc itself is tolerant of missing pieces).
-install_zsh_extras() {
-    [ "$DISTRO_FAMILY" = arch ] || return 0
-    local _has_zsh=0 _p
-    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
-        [ "$_p" = "zsh" ] && _has_zsh=1
-    done
-    [ "$_has_zsh" -eq 1 ] || return 0
-
-    if [ "$DRY_RUN" -eq 1 ]; then
-        DRY_PKGS+=("oh-my-zsh (git clone) starship eza bat")
-        return "$DRY_RUN_RC"
-    fi
-
-    # git is needed for the clones; not guaranteed present on Debian/RHEL.
-    command -v git >/dev/null 2>&1 || pm_install git 2>/dev/null || true
-
-    # 1) oh-my-zsh itself (official repo first; gitee mirror fallback for CN networks)
-    if [ ! -d "$HOME_DIR/.oh-my-zsh" ]; then
-        log "$(_t "Installing oh-my-zsh..." "Installing oh-my-zsh...")"
-        if as_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null \
-            || as_user git clone --depth=1 https://gitee.com/mirrors/oh-my-zsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null; then
-            INSTALLED_PKGS+=("oh-my-zsh")
-        else
-            MANUAL_ITEMS+=("oh-my-zsh — clone failed (GitHub 与 gitee 镜像均不可达); 手动: git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git $HOME_DIR/.oh-my-zsh")
-        fi
-    else
-        log "$(_t "oh-my-zsh already present, skipping." "oh-my-zsh already present, skipping.")"
-    fi
-
-    # 2) the two plugins listed in configs/.zshrc — must live in $ZSH_CUSTOM/plugins
-    #    for oh-my-zsh's plugins=() to find them (distro packages don't).
-    if [ -d "$HOME_DIR/.oh-my-zsh" ]; then
-        mkdir -p "$HOME_DIR/.oh-my-zsh/custom/plugins"
-        local _plugin _plug_url
-        for _plugin in zsh-autosuggestions zsh-syntax-highlighting; do
-            if [ ! -d "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" ]; then
-                case "$_plugin" in
-                    zsh-autosuggestions)   _plug_url="https://github.com/zsh-users/zsh-autosuggestions" ;;
-                    zsh-syntax-highlighting) _plug_url="https://github.com/zsh-users/zsh-syntax-highlighting" ;;
-                esac
-                log "$(_t "Installing oh-my-zsh plugin: " "Installing oh-my-zsh plugin: ") $_plugin"
-                as_user git clone --depth=1 "$_plug_url" \
-                    "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" 2>/dev/null \
-                    || MANUAL_ITEMS+=("oh-my-zsh plugin $_plugin — clone failed")
-            fi
-        done
-        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
-            "$HOME_DIR/.oh-my-zsh" 2>/dev/null || true
-    fi
-
-    # 3) starship (configs/.zshrc evals `starship init zsh`); not packaged on Debian
-    if ! command -v starship >/dev/null 2>&1; then
-        log "$(_t "Installing starship..." "Installing starship...")"
-        if exe bash -c 'curl -sSfL https://starship.rs/install.sh | sh -s -- -y -b /usr/local/bin' 2>/dev/null; then
-            INSTALLED_PKGS+=("starship")
-        else
-            MANUAL_ITEMS+=("starship — install failed; run: curl -sSfL https://starship.rs/install.sh | sh -s -- -y")
-        fi
-    fi
-    # 保证 .zshrc 有可用的主题美化：即使 starship 没装上、或参考机配置是空主题，
-    # 也把 ZSH_THEME 设为内置主题（agnoster，nerd font 提供 powerline 符号）。
-    # 若 starship 可用，其 eval 在 .zshrc 末尾会覆盖 PROMPT，主题作为兜底。
-    if [ -f "$HOME_DIR/.zshrc" ] && grep -q '^ZSH_THEME=""' "$HOME_DIR/.zshrc" 2>/dev/null; then
-        sed -i 's/^ZSH_THEME=""/ZSH_THEME="agnoster"/' "$HOME_DIR/.zshrc" 2>/dev/null || true
-        log "$(_t "Set ZSH_THEME=agnoster (oh-my-zsh beautification)" "Set ZSH_THEME=agnoster (oh-my-zsh beautification)")"
-    fi
-
-    # 4) eza (aliased in .zshrc): repo package first, cargo --root /usr/local as fallback
-    #    (Debian 12 / Ubuntu 24.04 have no eza package yet; on RHEL eza lives in EPEL)
-    if ! command -v eza >/dev/null 2>&1; then
-        log "$(_t "Installing eza..." "Installing eza...")"
-        pm_install eza 2>/dev/null || true
-        if ! command -v eza >/dev/null 2>&1; then
-            # RHEL family: eza is in EPEL, not the base repos (Fedora has it in base)
-            if [ "$DISTRO_FAMILY" = rhel ] && ! rpm -q epel-release >/dev/null 2>&1; then
-                log "$(_t "eza not in base RHEL repos — enabling EPEL and retrying..." "eza not in base RHEL repos — enabling EPEL and retrying...")"
-                pm_install epel-release 2>/dev/null || true
-                pm_install eza 2>/dev/null || true
-            fi
-            if ! command -v eza >/dev/null 2>&1; then
-                if ensure_rust && exe cargo install --locked --root /usr/local eza 2>/dev/null; then
-                    INSTALLED_PKGS+=("eza (cargo build)")
-                else
-                    MANUAL_ITEMS+=("eza — no repo package and cargo build failed; install manually (dnf --enablerepo=epel install eza / apt install eza / cargo install eza)")
-                fi
-            fi
-        fi
-    fi
-
-    # 5) bat (aliased in .zshrc): on Debian/Ubuntu the binary is named batcat,
-    #    so provide /usr/local/bin/bat -> batcat when needed.
-    if ! command -v bat >/dev/null 2>&1; then
-        pm_install bat 2>/dev/null || true
-        if ! command -v bat >/dev/null 2>&1 && command -v batcat >/dev/null 2>&1; then
-            ln -sf /usr/bin/batcat /usr/local/bin/bat
-        fi
-    fi
-}
-
 prune_config_backups() { # $1 = directory, $2 = basename glob
     local dir="$1" pattern="$2" backup
     [ -d "$dir" ] || return 0
@@ -3944,20 +3281,6 @@ IMEEOF
             fi
         fi
     fi
-    # Keep zsh and its shell customization exclusive to Arch. Debian/RHEL use
-    # the system bash without installing or changing the user's login shell.
-    if [ "$DISTRO_FAMILY" = arch ]; then
-        for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
-            if [ "$_p" = "zsh" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != "/usr/bin/zsh" ]; then
-                exe chsh -s /usr/bin/zsh "$TARGET_USER" 2>/dev/null || warn "$(_t "Failed to set zsh as default shell" "Failed to set zsh as default shell")"
-                break
-            fi
-        done
-    fi
-
-    # oh-my-zsh + starship + eza + bat (the runtime configs/.zshrc needs)
-    install_zsh_extras
-
     success "$(_t "Config deploy complete." "Config deploy complete.")"
     stage_mark configs
 }
@@ -3972,7 +3295,6 @@ DISABLE_MANIFEST="$BASE_DIR/.system_disabled"
 # Wayland session handoff appear as an immediate black screen. Always remove
 # those stale masks on RHEL-family restores; they are never valid cleanup targets.
 unmask_gdm_wayland() {
-    [ "$DISTRO_FAMILY" = rhel ] || return 0
     [ "$DRY_RUN" -eq 1 ] && return 0
     local unit
     for unit in gdm-wayland-session.service gdm-x11-session.service gdm-launch-environment.service; do
@@ -4251,7 +3573,7 @@ stage_hardware_adapt() {
     fi
 
     # --- 4) polkit agent path per family (Arch: /usr/lib; Debian/RHEL: /usr/libexec) ---
-    if [ "$DISTRO_FAMILY" != arch ] && [ -f "$niri_cfg" ] && grep -q 'polkit-gnome-authentication-agent-1' "$niri_cfg" 2>/dev/null; then
+    if [ -f "$niri_cfg" ] && grep -q 'polkit-gnome-authentication-agent-1' "$niri_cfg" 2>/dev/null; then
         if grep -q '/usr/lib/polkit-gnome-authentication-agent-1' "$niri_cfg"; then
             sed -i 's#/usr/lib/polkit-gnome-authentication-agent-1#/usr/libexec/polkit-gnome-authentication-agent-1#g' "$niri_cfg"
             log "$(_t "polkit agent path adapted to /usr/libexec (Debian/RHEL layout)" "polkit agent path adapted to /usr/libexec (Debian/RHEL layout)")"
@@ -4283,35 +3605,24 @@ stage_verify() {
     # package audit
     local all_sel=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
     if [ ${#all_sel[@]} -gt 0 ]; then
-        if [ "$DISTRO_FAMILY" = arch ]; then
-            local m
-            m=$(pacman -T "${all_sel[@]}" 2>/dev/null) && true
-            [ -n "$m" ] && mapfile -t missing <<< "$m"
-        else
-            local p name
-            for p in "${all_sel[@]}"; do
-                [ -n "${PIP_PKGS[$p]:-}" ] && continue
-                # niri/awww/satty/xwayland-satellite may be installed via dnf/prebuilt/source/cargo; check by PATH (common to Debian/RHEL)
-                case "$p" in
-                    niri|awww|satty|xwayland-satellite)
-                        command -v "$p" >/dev/null 2>&1 || missing+=("$p")
-                        continue
-                        ;;
-                    rime-ice-pinyin-git)
-                        [ -f "$HOME_DIR/.local/share/fcitx5/rime/rime_ice.schema.yaml" ] || missing+=("rime-ice")
-                        continue
-                        ;;
-                esac
-                if [ "$DISTRO_FAMILY" = rhel ]; then
-                    [ -n "${RHEL_MANUAL[$p]:-}" ] && continue
-                    name="${RHEL_MAP[$p]:-$p}"
-                else
-                    [ -n "${DEB_MANUAL[$p]:-}" ] && continue
-                    name="${DEB_MAP[$p]:-$p}"
-                fi
-                pkg_installed "$name" || missing+=("$name")
-            done
-        fi
+        local p name
+        for p in "${all_sel[@]}"; do
+            [ -n "${PIP_PKGS[$p]:-}" ] && continue
+            # niri/awww/satty/xwayland-satellite may be installed via dnf/prebuilt/source/cargo; check by PATH
+            case "$p" in
+                niri|awww|satty|xwayland-satellite)
+                    command -v "$p" >/dev/null 2>&1 || missing+=("$p")
+                    continue
+                    ;;
+                rime-ice-pinyin-git)
+                    [ -f "$HOME_DIR/.local/share/fcitx5/rime/rime_ice.schema.yaml" ] || missing+=("rime-ice")
+                    continue
+                    ;;
+            esac
+            [ -n "${RHEL_MANUAL[$p]:-}" ] && continue
+            name="${RHEL_MAP[$p]:-$p}"
+            pkg_installed "$name" || missing+=("$name")
+        done
     fi
     if [ ${#missing[@]} -gt 0 ]; then
         warn "$(_t "Selected packages failed to install:" "Selected packages failed to install:")"
@@ -4379,7 +3690,7 @@ do_restore() {
 
     # configs/ is optional: if present it's deployed as the desktop config; if absent
     # the script still installs and configures everything else and niri runs with
-    # default config. Never block or prompt the user about it — a plain `./install.sh
+    # default config. Never block or prompt the user about it — a plain `./RHEL-install.sh
     # restore` must just work with no prep.
     if [ ! -d "$BASE_DIR/configs" ]; then
         log "$(_t "configs/ not present — desktop config deploy skipped (niri will run with default config). To ship your own dotfiles, put them under configs/.config/" "configs/ not present — desktop config deploy skipped (niri will run with default config). To ship your own dotfiles, put them under configs/.config/")"
@@ -4405,8 +3716,6 @@ do_restore() {
     stage_wait_builds
     stage_hardware_adapt
     stage_verify
-    # clean the pacman cache to free disk space
-    [ "$DISTRO_FAMILY" = arch ] && exe pacman -Sc --noconfirm 2>/dev/null || true
     ensure_dm_session   # idempotent: re-checks every run (niri build may have finished late)
     boot_env_check
     print_niri_status
@@ -4465,11 +3774,7 @@ save_diag_bundle() {
         command -v niri 2>/dev/null && niri --version 2>&1 | head -1 || echo "(not found)"
         echo
         echo "=== installed pkgs (gdm/niri/rust/accountsservice/hypr) ==="
-        case "$DISTRO_FAMILY" in
-            debian) dpkg -l 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr' ;;
-            rhel)   rpm -qa 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr' ;;
-            arch)   pacman -Q 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr' ;;
-        esac
+        rpm -qa 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr'
         echo
         echo "=== build logs tail ==="
         for _f in "$LOG_DIR/niri-build.log" "$LOG_DIR/awww-build.log" "$LOG_DIR/xwayland-satellite-build.log" "$LOG_DIR/hyprlock-build.log" "$LOG_DIR/hypridle-build.log"; do
@@ -4571,7 +3876,6 @@ EOF
 # dispatch: pick the right mechanism for the DM that actually owns display-manager.service
 ensure_dm_session() {
     [ "$DRY_RUN" -eq 1 ] && return 0
-    [ "$DISTRO_FAMILY" = arch ] && return 0
     local _dm
     if [ -e /etc/systemd/system/display-manager.service ]; then
         _dm=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
@@ -4811,14 +4115,14 @@ do_restore_system() {
 
 usage() {
     cat <<EOF
-eilNiri install.sh v$SCRIPT_VERSION — niri desktop environment replication tool
+eilNiri RHEL-install.sh v$SCRIPT_VERSION — niri desktop environment replication tool
 
 Usage:
-  ./install.sh restore [--dry-run]      restore desktop on new system (root)
-  ./install.sh status                   show background build progress (run from another terminal)
-  ./install.sh rollback                 rollback config from backup (root)
-  ./install.sh restore-system           re-enable system components disabled by restore (root)
-  ./install.sh --help                   show this help
+  ./RHEL-install.sh restore [--dry-run]      restore desktop on new system (root)
+  ./RHEL-install.sh status                   show background build progress (run from another terminal)
+  ./RHEL-install.sh rollback                 rollback config from backup (root)
+  ./RHEL-install.sh restore-system           re-enable system components disabled by restore (root)
+  ./RHEL-install.sh --help                   show this help
 
 Options:
   --dry-run      print plan only, no actual install/enable/deploy
@@ -4830,12 +4134,12 @@ Environment:
 
 Workflow:
   1. Copy this eilNiri directory to the target machine (USB / network)
-  2. On the machine (Arch/RHEL/Debian): sudo ./install.sh restore   — no prep required;
+  2. On the machine (Fedora / Rocky / Alma / CentOS Stream / RHEL): sudo ./RHEL-install.sh restore   — no prep required;
      optionally drop your own dotfiles into configs/.config/ and they get deployed
-     - niri/awww compile in background:  ./install.sh status   (live progress)
+     - niri/awww compile in background:  ./RHEL-install.sh status   (live progress)
      - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
-  3. Rollback config:            sudo ./install.sh rollback
-  4. Re-enable other-DE comps:   sudo ./install.sh restore-system
+  3. Rollback config:            sudo ./RHEL-install.sh rollback
+  4. Re-enable other-DE comps:   sudo ./RHEL-install.sh restore-system
 EOF
 }
 
