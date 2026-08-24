@@ -2945,7 +2945,7 @@ stage_services() {
 # --- 4.5 display manager (automatic, all families) ---
 # One-script goal: after reboot the machine boots straight into the niri desktop.
 #   Arch  : ly (lightweight, fits niri)
-#   Debian/RHEL: gdm (fallback: gdm3 -> sddm)
+#   Debian: gdm3 (package name; service name gdm3), RHEL: gdm
 # An existing display manager (e.g. gdm3 preinstalled on Ubuntu Desktop) is DISABLED and
 # replaced by the chosen one. Safety: the replacement is installed FIRST and only then is
 # the old DM disabled — if the install fails the current DM stays untouched.
@@ -2972,8 +2972,12 @@ stage_dm() {
 
     local known_dms=(gdm3 gdm sddm lxdm ly greetd plasma-login-manager lemurs)
     local dm_pkgs dm_unit
-    # prefer gdm (Ubuntu 26.04+, Fedora, Rocky), fall back to gdm3 (Ubuntu 24.04-, Debian)
-    dm_pkgs="gdm"; dm_unit="gdm"
+    # Debian ships GDM as gdm3; RHEL/Fedora use gdm.
+    if [ "$DISTRO_FAMILY" = debian ]; then
+        dm_pkgs="gdm3"; dm_unit="gdm3"
+    else
+        dm_pkgs="gdm"; dm_unit="gdm"
+    fi
 
     # what is currently configured/installed?
     local current=""
@@ -3008,7 +3012,10 @@ stage_dm() {
 
     # --- install the chosen DM first; never disable the current one before the replacement is in place ---
     local ok=0
-    for tried in "$dm_pkgs|$dm_unit" "gdm3|gdm3" "sddm|sddm"; do
+    local dm_candidates=("$dm_pkgs|$dm_unit")
+    [ "$DISTRO_FAMILY" = debian ] && dm_candidates+=("gdm|gdm" "sddm|sddm")
+    [ "$DISTRO_FAMILY" != debian ] && dm_candidates+=("gdm3|gdm3" "sddm|sddm")
+    for tried in "${dm_candidates[@]}"; do
         local tpkg="${tried%%|*}" tunit="${tried##*|}"
         if pm_install "$tpkg"; then
             dm_pkgs="$tpkg"; dm_unit="$tunit"; ok=1
@@ -3827,7 +3834,7 @@ save_diag_bundle() {
 # still gets picked up as the DM default session.
 # Mechanism is DM-specific: gdm uses AccountsService (Session=niri).
 
-# gdm / gdm3: write /var/lib/AccountsService/users/<TARGET_USER> with Session=niri
+    # gdm / gdm3: write /var/lib/AccountsService/users/<TARGET_USER> with Session=niri
 ensure_gdm_session() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     [ -z "$TARGET_USER" ] && return 0
@@ -3950,8 +3957,13 @@ boot_env_check() {
     else
         info_kv "$(_t "Niri Session" "Niri Session")" "$(_t "NOT registered" "NOT registered")" "$(_t "(niri build incomplete — login goes to the default desktop)" "(niri build incomplete — login goes to the default desktop)")"
     fi
-    # gdm / gdm3: AccountsService
-    if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
+    # AccountsService is only the session mechanism for GDM/GDM3.
+    local _active_dm=""
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        _active_dm=$(basename "$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)" .service)
+    fi
+    if [[ "$_active_dm" = gdm || "$_active_dm" = gdm3 ]] &&
+        [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
         local _as
         _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
         if [ -n "$_as" ]; then
@@ -3964,10 +3976,11 @@ boot_env_check() {
     _sessions=$(ls /usr/share/xsessions /usr/local/share/xsessions /usr/share/wayland-sessions /usr/local/share/wayland-sessions 2>/dev/null | sort -u | tr '\n' ' ')
     info_kv "$(_t "Sessions (all)" "Sessions (all)")" "${_sessions:-none}" "$(_t "(niri present if niri.desktop listed)" "(niri present if niri.desktop listed)")"
 
-    # final assertion: will gdm actually boot into niri?
+    # final assertion: verify the active DM's session mechanism.
     local _boot_ok=1 _reason=""
     [ -z "$_niri_desktop" ] && { _boot_ok=0; _reason="niri.desktop not registered (build incomplete)"; }
-    if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
+    if [[ "$_active_dm" = gdm || "$_active_dm" = gdm3 ]] &&
+        [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
         local _as
         _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
         if [ "$_as" != "niri" ]; then
@@ -3977,10 +3990,10 @@ boot_env_check() {
         fi
     fi
     if [ "$_boot_ok" -eq 1 ]; then
-        success "$(_t "Boot check: gdm will start niri after reboot." "Boot check: gdm will start niri after reboot.")"
+        success "$(_t "Boot check: $_active_dm will start niri after reboot." "Boot check: $_active_dm will start niri after reboot.")"
     else
         echo -e "   ${H_RED}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
-        echo -e "   ${H_RED}┃  BOOT CHECK FAILED: gdm will NOT start niri.                       ┃${NC}"
+        echo -e "   ${H_RED}┃  BOOT CHECK FAILED: $_active_dm will NOT start niri.               ┃${NC}"
         echo -e "   ${H_RED}┃  Reason: $_reason${NC}"
         echo -e "   ${H_RED}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
         write_log "FAIL" "boot check failed: $_reason"
