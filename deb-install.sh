@@ -278,6 +278,9 @@ declare -A PIP_PKGS=(
     [waypaper]=waypaper
 )
 
+POLKIT_AGENT_PACKAGE=""
+POLKIT_AGENT_COMMAND=""
+
 # Packages to build from source when the distro repo has no package.
 # key = arch-style pkg name, value = upstream git URL. Add entries here to extend
 # the "apt/dnf failed -> build from source" fallback (install_debian / install_rhel).
@@ -461,6 +464,24 @@ resolve_deb_package() {
             printf '%s\n' "${DEB_MAP[$logical]:-$logical}"
             ;;
     esac
+}
+
+resolve_polkit_agent() {
+    local pkg command_path
+    for pkg in policykit-1-gnome mate-polkit lxqt-policykit polkit-kde-agent-1; do
+        if apt-cache policy "$pkg" 2>/dev/null | grep -qE '^ ?Candidate: [^ (]'; then
+            case "$pkg" in
+                policykit-1-gnome) command_path=/usr/libexec/polkit-gnome-authentication-agent-1 ;;
+                mate-polkit) command_path=/usr/libexec/polkit-mate-authentication-agent-1 ;;
+                lxqt-policykit) command_path=/usr/bin/lxqt-policykit-agent ;;
+                polkit-kde-agent-1) command_path=/usr/lib/x86_64-linux-gnu/libexec/polkit-kde-authentication-agent-1 ;;
+            esac
+            POLKIT_AGENT_PACKAGE="$pkg"
+            POLKIT_AGENT_COMMAND="$command_path"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Install as many packages of a batch as possible; return non-zero only when one or more
@@ -2068,6 +2089,35 @@ EOF
     fi
 }
 
+install_waypaper_venv() {
+    local venv="$HOME_DIR/.local/share/eilniri/waypaper-venv"
+    local wrapper="$HOME_DIR/.local/bin/waypaper"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("waypaper (python venv)")
+        return "$DRY_RUN_RC"
+    fi
+    pm_install python3-venv python3-pip >/dev/null 2>&1 || true
+    if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
+        MANUAL_ITEMS+=("waypaper — python3-venv is unavailable; install python3-venv and python3-pip")
+        return 1
+    fi
+    mkdir -p "$(dirname "$venv")" "$HOME_DIR/.local/bin"
+    if ! as_user python3 -m venv "$venv" ||
+       ! as_user "$venv/bin/python" -m pip install --upgrade pip waypaper \
+           >"$LOG_DIR/waypaper-pip.log" 2>&1; then
+        MANUAL_ITEMS+=("waypaper — venv installation failed; see $LOG_DIR/waypaper-pip.log")
+        return 1
+    fi
+    cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+exec "$venv/bin/waypaper" "\$@"
+EOF
+    chmod 755 "$wrapper"
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$wrapper"
+    INSTALLED_PKGS+=("waypaper (python venv)")
+    return 0
+}
+
 # --- satty install (Debian/RHEL families; no package) ---
 # Strategy: 1) official prebuilt binary from GitHub releases (satty-<arch>-unknown-linux-gnu.tar.gz)
 #           2) cargo install fallback (needs GTK4/libadwaita/librsvg dev packages) 3) manual report
@@ -2594,6 +2644,20 @@ install_debian() {
     fi
 
     for p in ${all[@]+"${all[@]}"}; do
+        if [ "$p" = polkit-gnome ]; then
+            if resolve_polkit_agent; then
+                if pkg_installed "$POLKIT_AGENT_PACKAGE"; then
+                    SKIPPED_PKGS+=("$POLKIT_AGENT_PACKAGE (already installed)")
+                elif pm_install "$POLKIT_AGENT_PACKAGE"; then
+                    INSTALLED_PKGS+=("$POLKIT_AGENT_PACKAGE (polkit agent)")
+                else
+                    MANUAL_ITEMS+=("polkit-gnome — selected replacement $POLKIT_AGENT_PACKAGE failed to install")
+                fi
+            else
+                MANUAL_ITEMS+=("polkit-gnome — no supported polkit authentication agent is available in apt")
+            fi
+            continue
+        fi
         # niri: not in official repos, use prebuilt/source install
         if [ "$p" = "niri" ]; then
             install_niri_binary
@@ -2631,13 +2695,16 @@ install_debian() {
                 MANUAL_ITEMS+=("$p — pip3 not installed, run: sudo apt-get install python3-pip")
                 continue
             fi
-            erc=0
-            # PEP 668 (externally-managed-environment) requires --break-system-packages
-            exe as_user pip3 install --user --break-system-packages "${PIP_PKGS[$p]}" || erc=$?
-            if [ "$erc" -eq 0 ]; then
-                INSTALLED_PKGS+=("$p (pip)")
+            if [ "$p" = waypaper ]; then
+                install_waypaper_venv
             else
-                MANUAL_ITEMS+=("$p — pip install failed, do it manually: pip3 install --user --break-system-packages ${PIP_PKGS[$p]}")
+                erc=0
+                exe as_user pip3 install --user --break-system-packages "${PIP_PKGS[$p]}" || erc=$?
+                if [ "$erc" -eq 0 ]; then
+                    INSTALLED_PKGS+=("$p (pip)")
+                else
+                    MANUAL_ITEMS+=("$p — pip install failed")
+                fi
             fi
             continue
         fi
@@ -3232,7 +3299,7 @@ stage_configs() {
                 [ -x "$_exe" ] && continue          # 路径存在就不用改
                 _base=$(basename "$_exe")
                 _new=""
-                for _cand in /usr/bin/$_base /usr/local/bin/$_base "$HOME_DIR/.local/bin/$_base"; do
+        for _cand in /usr/bin/$_base /usr/local/bin/$_base "$HOME_DIR/.local/bin/$_base" "$HOME_DIR/.local/share/eilniri/waypaper-venv/bin/$_base"; do
                     [ -x "$_cand" ] && { _new="$_cand"; break; }
                 done
                 if [ -n "$_new" ]; then
@@ -3610,9 +3677,12 @@ stage_hardware_adapt() {
 
     # --- 4) polkit agent path per family (Arch: /usr/lib; Debian/RHEL: /usr/libexec) ---
     if [ -f "$niri_cfg" ] && grep -q 'polkit-gnome-authentication-agent-1' "$niri_cfg" 2>/dev/null; then
-        if grep -q '/usr/lib/polkit-gnome-authentication-agent-1' "$niri_cfg"; then
-            sed -i 's#/usr/lib/polkit-gnome-authentication-agent-1#/usr/libexec/polkit-gnome-authentication-agent-1#g' "$niri_cfg"
-            log "$(_t "polkit agent path adapted to /usr/libexec (Debian/RHEL layout)" "polkit agent path adapted to /usr/libexec (Debian/RHEL layout)")"
+        if [ -n "$POLKIT_AGENT_COMMAND" ] && [ -x "$POLKIT_AGENT_COMMAND" ]; then
+            sed -i -E "s#spawn-at-startup \"[^\"]*polkit-[^\"]*\"#spawn-at-startup \"$POLKIT_AGENT_COMMAND\"#" "$niri_cfg"
+            log "$(_t "polkit agent path adapted: " "polkit agent path adapted: ")$POLKIT_AGENT_COMMAND"
+        else
+            sed -i '/polkit-gnome-authentication-agent-1/s#^#//#' "$niri_cfg"
+            warn "$(_t "No polkit authentication agent executable found; disabled its niri startup entry." "No polkit authentication agent executable found; disabled its niri startup entry.")"
         fi
     fi
 
