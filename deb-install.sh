@@ -467,7 +467,17 @@ resolve_deb_package() {
 }
 
 resolve_polkit_agent() {
-    local pkg command_path
+    local pkg command_path candidate
+    for candidate in \
+        /usr/libexec/polkit-gnome-authentication-agent-1 \
+        /usr/libexec/polkit-mate-authentication-agent-1 \
+        /usr/bin/lxqt-policykit-agent \
+        /usr/lib/*/libexec/polkit-kde-authentication-agent-1; do
+        if [ -x "$candidate" ]; then
+            POLKIT_AGENT_COMMAND="$candidate"
+            return 0
+        fi
+    done
     for pkg in policykit-1-gnome mate-polkit lxqt-policykit polkit-kde-agent-1; do
         if apt-cache policy "$pkg" 2>/dev/null | grep -qE '^ ?Candidate: [^ (]'; then
             case "$pkg" in
@@ -2098,13 +2108,25 @@ install_waypaper_venv() {
         DRY_PKGS+=("waypaper (python venv)")
         return "$DRY_RUN_RC"
     fi
-    pm_install python3-venv python3-pip >>"$LOG_DIR/apt-errors.log" 2>&1 || true
+    local pyver pyvenv_pkg
+    pyver=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)
+    pyvenv_pkg="python3-venv"
+    [ -n "$pyver" ] && pyvenv_pkg="python${pyver}-venv"
+    pm_install "$pyvenv_pkg" python3-pip >>"$LOG_DIR/apt-errors.log" 2>&1 ||
+        pm_install python3-venv python3-pip >>"$LOG_DIR/apt-errors.log" 2>&1 || true
     if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
         MANUAL_ITEMS+=("waypaper — python3-venv is unavailable; install python3-venv and python3-pip; see $LOG_DIR/apt-errors.log")
         return 1
     fi
     mkdir -p "$(dirname "$venv")" "$HOME_DIR/.local/bin"
-    if ! as_user env HOME="$HOME_DIR" python3 -m venv "$venv" >"$venv_log" 2>&1; then
+    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+        "$(dirname "$venv")" "$HOME_DIR/.local/bin" 2>/dev/null || true
+    if [ -e "$venv" ] && [ ! -x "$venv/bin/python" ]; then
+        rm -rf "$venv"
+    fi
+    if ! as_user env HOME="$HOME_DIR" USER="$TARGET_USER" \
+        PATH="/usr/local/bin:/usr/bin:/bin" python3 -m venv "$venv" >"$venv_log" 2>&1 ||
+       ! as_user test -x "$venv/bin/python" || ! as_user test -x "$venv/bin/pip"; then
         MANUAL_ITEMS+=("waypaper — venv creation failed; see $venv_log")
         return 1
     fi
@@ -2432,6 +2454,9 @@ install_xwayland_satellite() {
 build_hypr_stack() {
     [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
     local _log="$LOG_DIR/hypr-stack.log"
+    if [ -f "$LOG_DIR/hypr-stack.ok" ] && command -v hyprwayland-scanner >/dev/null 2>&1; then
+        return 0
+    fi
     local _work
     _work=$(mktemp -d)
     register_temp_path "$_work"
@@ -2439,7 +2464,15 @@ build_hypr_stack() {
     local _prefix=/usr/local _libdir=lib
     [ "$DISTRO_FAMILY" != debian ] && _prefix=/usr && _libdir=lib64
     export CMAKE_PREFIX_PATH="$_prefix:/usr:${CMAKE_PREFIX_PATH:-}"
-    export PKG_CONFIG_PATH="$_prefix/$_libdir/pkgconfig:/usr/lib/pkgconfig:/usr/lib/*/pkgconfig:${PKG_CONFIG_PATH:-}"
+    local _pc_dir
+    for _pc_dir in /usr/local/lib/pkgconfig /usr/local/lib64/pkgconfig /usr/lib/pkgconfig /usr/lib/*/pkgconfig; do
+        [ -d "$_pc_dir" ] || continue
+        case ":${PKG_CONFIG_PATH:-}:" in
+            *":$_pc_dir:"*) ;;
+            *) PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$_pc_dir" ;;
+        esac
+    done
+    export PKG_CONFIG_PATH
 
     # Build+install one component into a predictable prefix. Returns 0 on success.
     _build_hypr_one() { # $1 = name
@@ -2483,6 +2516,7 @@ build_hypr_stack() {
     _hypr_ok hyprutils "hyprutils" || _build_hypr_one hyprutils || return 1
     _hypr_ok hyprlang "hyprlang" || _build_hypr_one hyprlang || return 1
     _hypr_ok hyprgraphics "hyprgraphics" || _build_hypr_one hyprgraphics || return 1
+    touch "$LOG_DIR/hypr-stack.ok"
     return 0
 }
 
@@ -2556,7 +2590,7 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
         export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
         export CMAKE_PREFIX_PATH="/usr/local:/usr:/usr/local/lib:/usr/lib:${CMAKE_PREFIX_PATH:-}"
-        export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/lib/pkgconfig:/usr/lib/*/pkgconfig:${PKG_CONFIG_PATH:-}"
+        export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
         ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
             && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
@@ -2671,7 +2705,7 @@ install_debian() {
                     MANUAL_ITEMS+=("polkit-gnome — selected replacement $POLKIT_AGENT_PACKAGE failed to install")
                 fi
             else
-                MANUAL_ITEMS+=("polkit-gnome — no supported polkit authentication agent is available in apt")
+                warn "$(_t "No polkit authentication agent package or executable is available; continuing without a polkit startup agent." "No polkit authentication agent package or executable is available; continuing without a polkit startup agent.")"
             fi
             continue
         fi
@@ -3075,6 +3109,7 @@ stage_dm() {
             if pkg_installed "$dm"; then current="$dm"; break; fi
         done
     fi
+    local old_dm="$current"
 
     # keep the existing DM on request, or when it already is the chosen one
     if [ -n "$current" ] && { [ "${EILNIRI_KEEP_DM:-0}" = "1" ] || [ "$current" = "$dm_unit" ]; }; then
@@ -3123,7 +3158,9 @@ stage_dm() {
     fi
 
     # --- enable the chosen DM ---
-    if exe systemctl enable "$dm_unit"; then
+    if exe systemctl enable "$dm_unit" &&
+       exe systemctl set-default graphical.target &&
+       systemctl daemon-reload 2>/dev/null; then
         # verify: the unit must be enabled, and (except ly, which runs on tty1 directly)
         # display-manager.service must point at the new DM
         local _verify_ok=1
@@ -3140,16 +3177,34 @@ stage_dm() {
             fi
         fi
         if [ "$_verify_ok" -eq 1 ]; then
+            local _dm_link
+            _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
+            if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
+                systemctl enable "$dm_unit" >/dev/null 2>&1 || true
+                _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
+            fi
+            if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
+                _verify_ok=0
+                warn "$(_t "display-manager.service is not linked to the selected DM" "display-manager.service is not linked to the selected DM")"
+            fi
+        fi
+        if [ "$_verify_ok" -eq 1 ]; then
             ENABLED_SVCS+=("$dm_unit")
             success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
             stage_mark dm
         else
             FAILED_PKGS+=("dm:$dm_unit")
+            if [ -n "$old_dm" ] && [ "$old_dm" != "$dm_unit" ]; then
+                systemctl enable "$old_dm" >/dev/null 2>&1 || true
+                systemctl enable display-manager.service >/dev/null 2>&1 || true
+                warn "$(_t "Restored previous display manager after GDM verification failed: " "Restored previous display manager after GDM verification failed: ")$old_dm"
+            fi
             warn "$(_t "Display manager enable verification failed; run niri-session from tty after reboot." "Display manager enable verification failed; run niri-session from tty after reboot.")"
             # not marked: rerun retries
         fi
     else
         FAILED_PKGS+=("dm:$dm_unit")
+        [ -n "$old_dm" ] && systemctl enable "$old_dm" >/dev/null 2>&1 || true
         warn "$(_t "Display manager enable failed; run niri-session from tty after reboot." "Display manager enable failed; run niri-session from tty after reboot.")"
         # not marked: rerun retries
     fi
@@ -3693,12 +3748,12 @@ stage_hardware_adapt() {
     fi
 
     # --- 4) polkit agent path per family (Arch: /usr/lib; Debian/RHEL: /usr/libexec) ---
-    if [ -f "$niri_cfg" ] && grep -q 'polkit-gnome-authentication-agent-1' "$niri_cfg" 2>/dev/null; then
+    if [ -f "$niri_cfg" ] && grep -qE 'polkit-(gnome|mate|kde)|lxqt-policykit' "$niri_cfg" 2>/dev/null; then
         if [ -n "$POLKIT_AGENT_COMMAND" ] && [ -x "$POLKIT_AGENT_COMMAND" ]; then
             sed -i -E "s#spawn-at-startup \"[^\"]*polkit-[^\"]*\"#spawn-at-startup \"$POLKIT_AGENT_COMMAND\"#" "$niri_cfg"
             log "$(_t "polkit agent path adapted: " "polkit agent path adapted: ")$POLKIT_AGENT_COMMAND"
         else
-            sed -i '/polkit-gnome-authentication-agent-1/s#^#//#' "$niri_cfg"
+            sed -i -E '/spawn-at-startup "[^" ]*(polkit-|lxqt-policykit)[^" ]*"/s#^#//#' "$niri_cfg"
             warn "$(_t "No polkit authentication agent executable found; disabled its niri startup entry." "No polkit authentication agent executable found; disabled its niri startup entry.")"
         fi
     fi
