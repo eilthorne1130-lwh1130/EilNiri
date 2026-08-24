@@ -262,8 +262,6 @@ declare -A DEB_MAP=(
     [ttf-jetbrains-mono-nerd]=fonts-jetbrains-mono
     [wqy-zenhei]=fonts-wqy-zenhei
     [libnotify]=libnotify-bin
-    # polkit-gnome was renamed to policykit-1-gnome in Ubuntu 24.04+ / Debian 13+ (binary name unchanged)
-    [polkit-gnome]=policykit-1-gnome
 )
 # Packages with no official .deb -> go to the "manual install" report (value = reason/advice)
 # (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
@@ -443,6 +441,26 @@ pkg_installed() { # $1 = package name
 
 pm_install() { # $@ = package names
     exe apt-get install -y "$@"
+}
+
+# Resolve release-specific Debian package names against the current apt index.
+resolve_deb_package() {
+    local logical="$1" candidate
+    case "$logical" in
+        polkit-gnome)
+            for candidate in policykit-1-gnome polkit-gnome; do
+                if apt-cache policy "$candidate" 2>/dev/null |
+                    grep -qE '^ ?Candidate: [^ (]'; then
+                    printf '%s\n' "$candidate"
+                    return 0
+                fi
+            done
+            return 1
+            ;;
+        *)
+            printf '%s\n' "${DEB_MAP[$logical]:-$logical}"
+            ;;
+    esac
 }
 
 # Install as many packages of a batch as possible; return non-zero only when one or more
@@ -947,17 +965,46 @@ _dl_gh_bounded() { # $1=github asset url, $2=outfile, $3=seconds cap (default 90
     local url="$1" out="$2" cap="${3:-90}" prox full
     [ -n "$url" ] && [ -n "$out" ] || return 1
     rm -f "$out"
-    if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$url" 2>/dev/null && [ -s "$out" ]; then
+    if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$url" 2>/dev/null && archive_is_valid "$out"; then
         return 0
     fi
     for prox in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
         full="${prox%/}/$url"
         rm -f "$out"
-        if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$full" 2>/dev/null && [ -s "$out" ]; then
+        if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$full" 2>/dev/null && archive_is_valid "$out"; then
             return 0
         fi
     done
     return 1
+}
+
+# Reject empty files, HTML error pages, and truncated archives before extraction.
+archive_is_valid() {
+    local file_path="$1" kind
+    [ -s "$file_path" ] || return 1
+    kind=$(file -b "$file_path" 2>/dev/null || true)
+    case "$kind" in
+        *"Zip archive"*|*"gzip compressed"*|*"XZ compressed"*) ;;
+        *) return 1 ;;
+    esac
+    case "$file_path" in
+        *.zip) unzip -tqq "$file_path" >/dev/null 2>&1 || return 1 ;;
+        *.tar.gz|*.tgz) tar tzf "$file_path" >/dev/null 2>&1 || return 1 ;;
+        *.tar.xz) tar tJf "$file_path" >/dev/null 2>&1 || return 1 ;;
+    esac
+}
+
+# Return the first matching GitHub release asset URL. API failures are allowed so
+# callers can fall back to their stable latest/download URL.
+github_release_asset() { # $1=repo owner/name, $2=asset regex
+    local repo="$1" pattern="$2" json name url
+    json=$(curl -fsSL --retry 1 --connect-timeout 8 --max-time 20 \
+        "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null) || return 1
+    name=$(printf '%s\n' "$json" | sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+        | grep -E "$pattern" | head -n 1)
+    [ -n "$name" ] || return 1
+    url="https://github.com/$repo/releases/latest/download/$name"
+    printf '%s\n' "$url"
 }
 
 # Clone a GitHub repo, falling back to the CN mirror proxies when direct git fails
@@ -991,7 +1038,7 @@ try_dl() { # $1 = URL, $2 = output file; returns 0 on success
         curl "${CURL_DL_FLAGS[@]}" -o "$out" "$url" 2>/dev/null
         rc=$?
     fi
-    return "$rc"
+    [ "$rc" -eq 0 ] && archive_is_valid "$out" || return "$rc"
 }
 
 download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the curl exit code
@@ -2054,7 +2101,8 @@ install_satty() {
     work=$(mktemp -d)
     register_temp_path "$tmp"
     register_temp_path "$work"
-    url="$SATTY_GH/latest/download/satty-${arch}-unknown-linux-gnu.tar.gz"
+    url=$(github_release_asset Satty-org/Satty "satty.*${arch}.*(tar\\.gz|tgz)" 2>/dev/null || true)
+    [ -n "$url" ] || url="$SATTY_GH/latest/download/satty-${arch}-unknown-linux-gnu.tar.gz"
     log "$(_t "Downloading satty official prebuilt binary..." "Downloading satty official prebuilt binary...")"
     
     local _satty_attempts=3 _satty_delay=10 _sattyrc=0
@@ -2115,12 +2163,15 @@ install_satty() {
         return 1
     fi
     log "$(_t "Building satty via cargo (about 5 min)..." "Building satty via cargo (about 5 min)...")"
-    if exe cargo install --root /usr/local satty; then
+    local satty_log="$LOG_DIR/satty-build.log"
+    if exe bash -c "cargo install --root /usr/local satty >'$satty_log' 2>&1"; then
         INSTALLED_PKGS+=("satty (cargo build)")
         success "$(_t "satty built from source" "satty built from source")"
         return 0
     fi
-    MANUAL_ITEMS+=("satty — build failed, install manually: $SATTY_GH")
+    local satty_tail
+    satty_tail=$(tail -n 8 "$satty_log" 2>/dev/null | tr '\n' ' ')
+    MANUAL_ITEMS+=("satty — build failed ($satty_tail); install manually: $SATTY_GH")
     return 1
 }
 
@@ -2176,7 +2227,9 @@ install_rime_ice() {
     register_temp_path "$unzipdir"
     log "$(_t "Downloading rime-ice release zip..." "Downloading rime-ice release zip...")"
     
-    local _rime_attempts=3 _rime_delay=10 _rimerc=0
+    local _rime_attempts=3 _rime_delay=10 _rimerc=0 _rime_asset
+    _rime_asset=$(github_release_asset iDvel/rime-ice '(^|/)full\.zip$' 2>/dev/null || true)
+    [ -n "$_rime_asset" ] && RIME_ICE_ZIP_URL="$_rime_asset"
     for (( _rattempt=1; _rattempt<=$_rime_attempts; _rattempt++ )); do
         if download_gh "$RIME_ICE_ZIP_URL" "$zipfile"; then
             _rimerc=0
@@ -2195,13 +2248,20 @@ install_rime_ice() {
         MANUAL_ITEMS+=("rime-ice — download failed after $_rime_attempts attempts, deploy manually: $RIME_ICE_REPO")
         return 1
     fi
-    if ! exe unzip -q "$zipfile" -d "$unzipdir"; then
+    if ! archive_is_valid "$zipfile" || ! exe unzip -q "$zipfile" -d "$unzipdir"; then
         MANUAL_ITEMS+=("rime-ice — zip extraction failed, deploy manually: $RIME_ICE_REPO")
         return 1
     fi
 
+    local rime_root
+    rime_root=$(find "$unzipdir" -type f -name rime_ice.schema.yaml -printf '%h\n' 2>/dev/null | head -n 1)
+    if [ -z "$rime_root" ]; then
+        MANUAL_ITEMS+=("rime-ice — archive contains no rime_ice.schema.yaml; downloaded archive may be invalid")
+        return 1
+    fi
+
     exe mkdir -p "$dest"
-    for item in "$unzipdir"/*; do
+    for item in "$rime_root"/*; do
         [ -e "$item" ] || continue
         b=$(basename "$item")
         case "$b" in
@@ -2575,7 +2635,11 @@ install_debian() {
             fi
             continue
         fi
-        name="${DEB_MAP[$p]:-$p}"
+        name=$(resolve_deb_package "$p" 2>/dev/null || true)
+        if [ -z "$name" ]; then
+            MANUAL_ITEMS+=("$p — no package candidate in the configured apt repositories")
+            continue
+        fi
         if pkg_installed "$name"; then
             SKIPPED_PKGS+=("$name (already installed)")
             continue
@@ -3579,7 +3643,8 @@ stage_verify() {
                     ;;
             esac
             [ -n "${DEB_MANUAL[$p]:-}" ] && continue
-            name="${DEB_MAP[$p]:-$p}"
+            name=$(resolve_deb_package "$p" 2>/dev/null || true)
+            [ -n "$name" ] || continue
             pkg_installed "$name" || missing+=("$name")
         done
     fi
