@@ -1897,6 +1897,22 @@ install_awww() {
             warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
         exe apt-get install -y libdav1d6 2>/dev/null || true
+        prepare_debian_pkgconfig
+        local wayland_protocols_dir
+        wayland_protocols_dir=$(pkg-config --variable=pkgdatadir wayland-protocols 2>/dev/null || true)
+        if [ -z "$wayland_protocols_dir" ]; then
+            for wayland_protocols_dir in \
+                /usr/share/wayland-protocols \
+                /usr/local/share/wayland-protocols \
+                /usr/share/wayland-protocols-*; do
+                [ -d "$wayland_protocols_dir" ] && break
+            done
+        fi
+        if [ ! -d "${wayland_protocols_dir:-}" ]; then
+            MANUAL_ITEMS+=("awww — wayland-protocols data directory not found; install wayland-protocols and retry")
+            return 1
+        fi
+        export WAYLAND_PROTOCOLS_DIR="$wayland_protocols_dir"
         # pkg-config 预检 + 自愈：wayland-client / xkbcommon / liblz4 / dav1d 缺哪个自动装哪个
         # （注意 lz4 的 .pc 文件名是 liblz4.pc，lz4-sys 探测的也是 liblz4）
         if ! ensure_pc_deps wayland-client xkbcommon liblz4 dav1d; then
@@ -1956,7 +1972,7 @@ install_awww() {
     # Build in background so the rest of the install proceeds meanwhile.
     # On low-RAM machines, wait for the niri build to finish first (avoids OOM from two parallel cargo builds).
     local awww_cmd ram_mb niri_pid
-    awww_cmd="cd '$work/awww' && cargo build --release --workspace -j $(cargo_jobs)"
+    awww_cmd="cd '$work/awww' && WAYLAND_PROTOCOLS_DIR='${WAYLAND_PROTOCOLS_DIR:-}' cargo build --release --workspace -j $(cargo_jobs)"
     ram_mb=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
     if [ "${ram_mb:-0}" -lt 8192 ] && [ ${#BG_JOBS[@]} -gt 0 ]; then
         niri_pid=$(echo "${BG_JOBS[0]}" | awk '{print $2}')
@@ -2269,7 +2285,7 @@ hypridle_pkgconfig_check() {
     local check_log="$LOG_DIR/hypridle-pkgconfig.log"
     prepare_debian_pkgconfig
     : > "$check_log"
-    for pc in wayland-client xkbcommon pixman-1 libdrm egl gbm sdbus-c++ hyprland-protocols; do
+    for pc in wayland-client xkbcommon pixman-1 libdrm egl gbm sdbus-c++; do
         pkg-config --exists "$pc" 2>/dev/null || missing+=("$pc")
     done
     if [ ${#missing[@]} -gt 0 ]; then
