@@ -2213,15 +2213,19 @@ install_waypaper_source() {
     mkdir -p "$HOME_DIR/.local/bin" "$HOME_DIR/.local/share/applications"
     chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$install_root"
     if [ -f "$src/pyproject.toml" ] || [ -f "$src/setup.py" ]; then
+        if ! command -v pip3 >/dev/null 2>&1; then
+            pm_install python3-pip || {
+                MANUAL_ITEMS+=("waypaper — python3-pip is unavailable")
+                return 1
+            }
+        fi
         if ! as_user env HOME="$HOME_DIR" PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-            python3 -m pip install --user --break-system-packages --no-deps "$src" >"$LOG_DIR/waypaper-pip.log" 2>&1; then
+            python3 -m pip install --user --break-system-packages "$src" >"$LOG_DIR/waypaper-pip.log" 2>&1; then
             MANUAL_ITEMS+=("waypaper — source package installation failed; see $LOG_DIR/waypaper-pip.log")
             return 1
         fi
         if [ -x "$HOME_DIR/.local/bin/waypaper" ]; then
             launcher="$HOME_DIR/.local/bin/waypaper"
-        elif command -v waypaper >/dev/null 2>&1; then
-            launcher=$(command -v waypaper)
         else
             MANUAL_ITEMS+=("waypaper — source installed but no launcher was produced; see $LOG_DIR/waypaper-pip.log")
             return 1
@@ -2341,7 +2345,13 @@ hypridle_pkgconfig_check() {
     : > "$check_log"
     source_file="${1:-}"
     if [ -n "$source_file" ] && [ -f "$source_file" ]; then
-        mapfile -t _hypr_pcs < <(sed -nE 's/^[[:space:]]*pkg_check_modules\([^ ]+[[:space:]]+([^ )]+).*/\1/p' "$source_file" | sort -u)
+        mapfile -t _hypr_pcs < <(
+            sed -nE 's/^[[:space:]]*pkg_check_modules\([^ ]+[[:space:]]+([^)]*).*/\1/p' "$source_file" \
+                | tr ' ' '\n' \
+                | sed -E '/^(REQUIRED|QUIET|NO_CMAKE_PATH|NO_CMAKE_ENVIRONMENT_PATH|IMPORTED_TARGET|STATIC_LIBRARIES)$/d' \
+                | sed -E '/^[A-Z_][A-Z0-9_]*$/d' \
+                | sed '/^$/d' | sort -u
+        )
     fi
     if [ ${#_hypr_pcs[@]} -eq 0 ]; then
         _hypr_pcs=(wayland-client xkbcommon pixman-1 libdrm egl gbm sdbus++ libinput)
@@ -2933,7 +2943,7 @@ install_debian() {
 
     for p in ${all[@]+"${all[@]}"}; do
         if [ "$p" = waypaper ]; then
-            install_waypaper_source || MANUAL_ITEMS+=("waypaper — source installation failed")
+            install_waypaper_source
             continue
         fi
         if [ "$p" = polkit-gnome ]; then
@@ -2988,7 +2998,7 @@ install_debian() {
                 continue
             fi
             if [ "$p" = waypaper ]; then
-                install_waypaper_source || MANUAL_ITEMS+=("waypaper — source installation failed")
+                install_waypaper_source
             else
                 erc=0
                 exe as_user pip3 install --user --break-system-packages "${PIP_PKGS[$p]}" || erc=$?
@@ -3304,7 +3314,7 @@ stage_services() {
 # --- 4.5 display manager (automatic, all families) ---
 # One-script goal: after reboot the machine boots straight into the niri desktop.
 #   Arch  : ly (lightweight, fits niri)
-#   Debian: gdm3 (package name; service name gdm3), RHEL: gdm
+#   Debian: sddm, RHEL: gdm
 # An existing display manager (e.g. gdm3 preinstalled on Ubuntu Desktop) is DISABLED and
 # replaced by the chosen one. Safety: the replacement is installed FIRST and only then is
 # the old DM disabled — if the install fails the current DM stays untouched.
@@ -3331,9 +3341,9 @@ stage_dm() {
 
     local known_dms=(gdm3 gdm sddm lxdm ly greetd plasma-login-manager lemurs)
     local dm_pkgs dm_unit
-    # Debian ships GDM as gdm3; RHEL/Fedora use gdm.
+    # Debian uses SDDM for this Niri setup; RHEL/Fedora use GDM.
     if [ "$DISTRO_FAMILY" = debian ]; then
-        dm_pkgs="gdm3"; dm_unit="gdm3"
+        dm_pkgs="sddm"; dm_unit="sddm"
     else
         dm_pkgs="gdm"; dm_unit="gdm"
     fi
@@ -3375,7 +3385,7 @@ stage_dm() {
     # --- install the chosen DM first; never disable the current one before the replacement is in place ---
     local ok=0
     local dm_candidates=("$dm_pkgs|$dm_unit")
-    [ "$DISTRO_FAMILY" = debian ] && dm_candidates+=("gdm|gdm" "sddm|sddm")
+    [ "$DISTRO_FAMILY" = debian ] && dm_candidates+=("gdm3|gdm3" "gdm|gdm")
     [ "$DISTRO_FAMILY" != debian ] && dm_candidates+=("gdm3|gdm3" "sddm|sddm")
     for tried in "${dm_candidates[@]}"; do
         local tpkg="${tried%%|*}" tunit="${tried##*|}"
@@ -3391,26 +3401,6 @@ stage_dm() {
         return   # not marked: rerun retries
     fi
 
-    if [ "$DISTRO_FAMILY" = debian ] && [ "$dm_pkgs" = gdm3 ] && [ "$DRY_RUN" -eq 0 ]; then
-        local gdm_conf=/etc/gdm3/custom.conf
-        mkdir -p /etc/gdm3
-        if [ ! -f "$gdm_conf" ]; then
-            printf '%s\n' '[daemon]' > "$gdm_conf"
-        fi
-        if ! grep -qE '^\[daemon\]' "$gdm_conf"; then
-            printf '%s\n' '[daemon]' >> "$gdm_conf"
-        fi
-        if grep -qE '^[[:space:]]*WaylandEnable[[:space:]]*=' "$gdm_conf"; then
-            sed -i -E 's/^[[:space:]]*WaylandEnable[[:space:]]*=.*/WaylandEnable=true/' "$gdm_conf"
-        else
-            printf '%s\n' 'WaylandEnable=true' >> "$gdm_conf"
-        fi
-        # Let Debian's gdm3 package manage display-manager.service when possible.
-        if command -v dpkg-reconfigure >/dev/null 2>&1; then
-            DEBIAN_FRONTEND=noninteractive dpkg-reconfigure gdm3 >/dev/null 2>&1 || true
-        fi
-    fi
-
     # Enable and validate the replacement before touching the existing DM.
     local dm_service=""
     for dm_service in "/lib/systemd/system/${dm_unit}.service" "/usr/lib/systemd/system/${dm_unit}.service"; do
@@ -3419,9 +3409,10 @@ stage_dm() {
     # Debian's gdm3 package may expose the unit as gdm.service, while the
     # package/configuration command still uses gdm3. Resolve the real unit
     # before enabling or creating the display-manager symlink.
-    if [ "$dm_unit" = gdm3 ] && [ ! -e "$dm_service" ] && [ -e /lib/systemd/system/gdm.service ]; then
-        dm_unit=gdm
-        dm_service=/lib/systemd/system/gdm.service
+    if [ "$dm_unit" = gdm3 ] && [ ! -e "$dm_service" ]; then
+        for dm_service in /lib/systemd/system/gdm.service /usr/lib/systemd/system/gdm.service; do
+            [ -e "$dm_service" ] && { dm_unit=gdm; break; }
+        done
     fi
     if [ ! -e "$dm_service" ]; then
         FAILED_PKGS+=("dm:$dm_unit")
@@ -3441,7 +3432,7 @@ stage_dm() {
         fi
         local _dm_link
         _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
-        if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ] && [ "$dm_unit" != gdm3 ]; then
+        if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
             _verify_ok=0
             warn "$(_t "display-manager.service is not linked to " "display-manager.service is not linked to ")$dm_unit"
         fi
