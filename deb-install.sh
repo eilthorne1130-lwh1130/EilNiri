@@ -2335,6 +2335,7 @@ EOF
 
 hypridle_pkgconfig_check() {
     local missing=() pc source_file
+    local -a _hypr_pcs=()
     local check_log="$LOG_DIR/hypridle-pkgconfig.log"
     prepare_debian_pkgconfig
     : > "$check_log"
@@ -2342,7 +2343,7 @@ hypridle_pkgconfig_check() {
     if [ -n "$source_file" ] && [ -f "$source_file" ]; then
         mapfile -t _hypr_pcs < <(sed -nE 's/^[[:space:]]*pkg_check_modules\([^ ]+[[:space:]]+([^ )]+).*/\1/p' "$source_file" | sort -u)
     fi
-    if [ ${#_hypr_pcs[@]:-0} -eq 0 ]; then
+    if [ ${#_hypr_pcs[@]} -eq 0 ]; then
         _hypr_pcs=(wayland-client xkbcommon pixman-1 libdrm egl gbm sdbus++ libinput)
     fi
     for pc in "${_hypr_pcs[@]}"; do
