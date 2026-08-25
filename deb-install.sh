@@ -4252,7 +4252,7 @@ save_diag_bundle() {
 # The stage_dm write only happens while that stage runs, but the niri.desktop session file
 # arrives later (background build). This step re-checks on every run so a late niri build
 # still gets picked up as the DM default session.
-# Mechanism is DM-specific: gdm uses AccountsService (Session=niri).
+# Mechanism is DM-specific: gdm uses AccountsService; sddm uses its config.
 
     # gdm / gdm3: write /var/lib/AccountsService/users/<TARGET_USER> with Session=niri
 ensure_gdm_session() {
@@ -4330,6 +4330,25 @@ EOF
     fi
 }
 
+ensure_sddm_session() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local niri_desktop=""
+    [ -f /usr/local/share/wayland-sessions/niri.desktop ] && niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
+    [ -z "$niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && niri_desktop=/usr/share/wayland-sessions/niri.desktop
+    if [ -z "$niri_desktop" ]; then
+        warn "$(_t "niri.desktop session not registered; SDDM cannot offer Niri." "niri.desktop session not registered; SDDM cannot offer Niri.")"
+        return 0
+    fi
+    mkdir -p /etc/sddm.conf.d
+    cat > /etc/sddm.conf.d/10-eilniri.conf <<'EOF'
+[General]
+DisplayServer=wayland
+DefaultSession=niri.desktop
+EOF
+    chmod 644 /etc/sddm.conf.d/10-eilniri.conf
+    log "$(_t "SDDM default session set to niri.desktop" "SDDM default session set to niri.desktop")"
+}
+
 # dispatch: pick the right mechanism for the DM that actually owns display-manager.service
 ensure_dm_session() {
     [ "$DRY_RUN" -eq 1 ] && return 0
@@ -4342,7 +4361,7 @@ ensure_dm_session() {
     fi
     case "$_dm" in
         gdm|gdm3) ensure_gdm_session ;;
-        sddm)     warn "$(_t "sddm default session not supported by this script; login may go to the wrong desktop." "sddm default session not supported by this script; login may go to the wrong desktop.")" ;;
+        sddm)     ensure_sddm_session ;;
         *)        warn "$(_t "Unknown DM '$_dm' — cannot set niri as the default session." "Unknown DM '$_dm' — cannot set niri as the default session.")" ;;
     esac
 }
@@ -4389,6 +4408,15 @@ boot_env_check() {
         if [ -n "$_as" ]; then
             info_kv "$(_t "gdm Session" "gdm Session")" "AccountsService=$_as" "$(_t "(must be niri)" "(must be niri)")"
             [ "$_as" != "niri" ] && warn "$(_t "gdm AccountsService Session=$_as — login will not go to niri." "gdm AccountsService Session=$_as — login will not go to niri.")"
+        fi
+    fi
+    if [ "$_active_dm" = sddm ]; then
+        if [ -f /etc/sddm.conf.d/10-eilniri.conf ] && grep -q '^DefaultSession=niri.desktop$' /etc/sddm.conf.d/10-eilniri.conf; then
+            info_kv "$(_t "sddm Session" "sddm Session")" "DefaultSession=niri.desktop" "$(_t "(Niri)" "(Niri)")"
+        else
+            _boot_ok=0
+            [ -n "$_reason" ] && _reason="; "
+            _reason="${_reason}SDDM DefaultSession is not niri.desktop"
         fi
     fi
     # session files visible to the DM
