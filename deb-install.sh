@@ -275,7 +275,6 @@ declare -A DEB_FAIL_HINT=(
 )
 # Packages installable via pip as a fallback (common to Arch/RHEL/Debian)
 declare -A PIP_PKGS=(
-    [waypaper]=waypaper
 )
 
 POLKIT_AGENT_PACKAGE=""
@@ -296,6 +295,8 @@ declare -A SOURCE_PKGS=(
     [hyprlock]="https://github.com/hyprwm/hyprlock"
     [hypridle]="https://github.com/hyprwm/hypridle"
 )
+
+WAYPAPER_REPO="https://github.com/anufrievroman/waypaper"
 
 # hyprlock / hypridle system build dependencies (Debian/Ubuntu names).
 # NOTE: upstream migrated hyprlock/hypridle from Rust to C++/CMake (repos no longer
@@ -707,7 +708,15 @@ if [ -n "$out" ] && [ -n "$mode" ] && [ -f "$cfg" ]; then
     ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
 fi
 
-exec /usr/local/bin/niri-session.real "$@"
+export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:${PATH:-}"
+if [ -x /usr/local/bin/niri-session.real ]; then
+    exec /usr/local/bin/niri-session.real "$@"
+fi
+if command -v niri-session >/dev/null 2>&1; then
+    exec niri-session "$@"
+fi
+echo "eilNiri: niri-session launcher is missing" >&2
+exit 127
 WRAPEOF
     chmod 755 "$_wrapper"
 }
@@ -1831,6 +1840,12 @@ install_niri_from_build() { # $1 = srcdir, $2 = logfile
         ensure_localbin_on_path
         exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/local/share/wayland-sessions/niri.desktop 2>/dev/null || true
         exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/share/wayland-sessions/niri.desktop 2>/dev/null || true
+        # GDM must invoke the wrapper, not a bare niri-session whose PATH and
+        # systemd user environment differ between Debian releases.
+        for _desk in /usr/local/share/wayland-sessions/niri.desktop /usr/share/wayland-sessions/niri.desktop; do
+            [ -f "$_desk" ] || continue
+            sed -i 's#^Exec=.*#Exec=/usr/local/bin/eilniri-niri-session#' "$_desk"
+        done
         exe install -Dm644 "$srcdir/resources/niri-portals.conf" /usr/local/share/xdg-desktop-portal/niri-portals.conf 2>/dev/null || true
         # 关键：niri-session 用 systemd user session 启动 niri（systemctl --user start niri.service）。
         # 必须把 niri 源码 resources/ 里的 systemd user unit 装到 /usr/lib/systemd/user/，
@@ -2144,6 +2159,66 @@ EOF
     chmod 755 "$wrapper"
     chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$wrapper"
     INSTALLED_PKGS+=("waypaper (python venv)")
+    return 0
+}
+
+# waypaper's Python dependency graph is increasingly incompatible with the
+# externally-managed Python policy and incomplete python3-venv packages found
+# on older Debian/Ubuntu releases. Build the application from its source tree
+# and install its launcher and desktop file without touching system site-packages.
+install_waypaper_source() {
+    local work logf src launcher
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("waypaper (source build)")
+        return "$DRY_RUN_RC"
+    fi
+    if command -v waypaper >/dev/null 2>&1 || [ -x "$HOME_DIR/.local/bin/waypaper" ]; then
+        SKIPPED_PKGS+=("waypaper (already installed)")
+        return 0
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        pm_install git || return 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        pm_install python3 || return 1
+    fi
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    logf="$LOG_DIR/waypaper-source.log"
+    if ! git_clone_gh "$WAYPAPER_REPO" "$work/waypaper" >"$logf" 2>&1; then
+        MANUAL_ITEMS+=("waypaper — source clone failed; see $logf")
+        return 1
+    fi
+    src="$work/waypaper"
+    launcher="$HOME_DIR/.local/bin/waypaper"
+    mkdir -p "$HOME_DIR/.local/bin" "$HOME_DIR/.local/share/applications"
+    if [ -f "$src/waypaper" ]; then
+        exe install -Dm755 "$src/waypaper" "$launcher"
+    elif [ -f "$src/waypaper/__main__.py" ]; then
+        cat > "$launcher" <<EOF
+#!/usr/bin/env bash
+exec python3 "$src/waypaper/__main__.py" "\$@"
+EOF
+        chmod 755 "$launcher"
+    elif [ -f "$src/pyproject.toml" ] || [ -f "$src/setup.py" ]; then
+        # Keep the source-build route independent from venv creation, but use
+        # the project's own entry point when upstream does not ship a script.
+        cat > "$launcher" <<EOF
+#!/usr/bin/env bash
+exec python3 -m waypaper "\$@"
+EOF
+        chmod 755 "$launcher"
+    else
+        MANUAL_ITEMS+=("waypaper — source tree has no supported launcher; see $logf")
+        return 1
+    fi
+    if [ -f "$src/data/waypaper.desktop" ]; then
+        exe install -Dm644 "$src/data/waypaper.desktop" "$HOME_DIR/.local/share/applications/waypaper.desktop"
+    fi
+    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+        "$HOME_DIR/.local/bin" "$HOME_DIR/.local/share/applications" 2>/dev/null || true
+    INSTALLED_PKGS+=("waypaper (source build)")
+    success "$(_t "waypaper built from source" "waypaper built from source")"
     return 0
 }
 
@@ -2765,9 +2840,7 @@ install_debian() {
                 continue
             fi
             if [ "$p" = waypaper ]; then
-                if ! install_waypaper_pipx && ! install_waypaper_venv; then
-                    MANUAL_ITEMS+=("waypaper — apt, pipx and venv installation all failed")
-                fi
+                install_waypaper_source || MANUAL_ITEMS+=("waypaper — source installation failed")
             else
                 erc=0
                 exe as_user pip3 install --user --break-system-packages "${PIP_PKGS[$p]}" || erc=$?
@@ -3171,6 +3244,13 @@ stage_dm() {
     # Enable and validate the replacement before touching the existing DM.
     local dm_service="/lib/systemd/system/${dm_unit}.service"
     [ -e "$dm_service" ] || dm_service="/usr/lib/systemd/system/${dm_unit}.service"
+    # Debian's gdm3 package may expose the unit as gdm.service, while the
+    # package/configuration command still uses gdm3. Resolve the real unit
+    # before enabling or creating the display-manager symlink.
+    if [ "$dm_unit" = gdm3 ] && [ ! -e "$dm_service" ] && [ -e /lib/systemd/system/gdm.service ]; then
+        dm_unit=gdm
+        dm_service=/lib/systemd/system/gdm.service
+    fi
     if [ ! -e "$dm_service" ]; then
         FAILED_PKGS+=("dm:$dm_unit")
         warn "$(_t "Installed DM has no systemd unit: " "Installed DM has no systemd unit: ")$dm_unit"
