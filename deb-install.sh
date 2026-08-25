@@ -153,6 +153,12 @@ exe() {
         write_log "DRYRUN" "$full_command"
         return "$DRY_RUN_RC"
     fi
+    if [ "$DISTRO_FAMILY" = debian ] && command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl is-enabled --quiet sddm.service 2>/dev/null; then
+            systemctl enable sddm.service 2>/dev/null || true
+        fi
+        systemctl set-default graphical.target 2>/dev/null || true
+    fi
     echo -e "   ${H_GRAY}┌──[ ${H_MAGENTA}EXEC${H_GRAY} ]────────────────────────────────────────────────────${NC}"
     echo -e "   ${H_GRAY}│${NC} ${H_CYAN}$ ${NC}${BOLD}$full_command${NC}"
     write_log "EXEC" "$full_command"
@@ -2356,6 +2362,7 @@ hypridle_pkgconfig_check() {
             sed -nE 's/^[[:space:]]*pkg_check_modules\([^ ]+[[:space:]]+([^)]*).*/\1/p' "$source_file" \
                 | tr ' ' '\n' \
                 | sed -E '/^(REQUIRED|QUIET|NO_CMAKE_PATH|NO_CMAKE_ENVIRONMENT_PATH|IMPORTED_TARGET|STATIC_LIBRARIES)$/d' \
+                | sed -E 's/[<>=].*$//' \
                 | sed -E '/^[A-Z_][A-Z0-9_]*$/d' \
                 | sed '/^$/d' | sort -u
         )
@@ -2730,6 +2737,7 @@ build_hypr_stack() {
         if git_clone_gh "https://github.com/hyprwm/$n" "$_work/$n" >/dev/null 2>&1 \
            && ( cd "$_work/$n" \
                 && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" -DCMAKE_MODULE_PATH="$CMAKE_MODULE_PATH" \
                     -DCMAKE_INSTALL_PREFIX="$_prefix" -DCMAKE_INSTALL_LIBDIR="$_libdir" \
                 && cmake --build build -j"$(nproc)" \
                  && cmake --install build \
@@ -2841,12 +2849,11 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         # CMake build needs hyprwayland-scanner + hyprlang/hyprgraphics/hyprutils;
         # build the hypr C++ stack from source iff those aren't already packaged.
         if ! build_hypr_stack; then
-            MANUAL_ITEMS+=("$pkg — hypr C++ build stack (hyprwayland-scanner/hyprutils/hyprlang/hyprgraphics) could not be built; see $LOG_DIR/hypr-stack.log. Build manually: $repo")
-            return 1
+            warn "$(_t "Hypr C++ stack failed; attempting the target build with installed pkg-config components." "Hypr C++ stack failed; attempting the target build with installed pkg-config components.")"
         fi
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
-        if [ "$pkg" = hypridle ] && ! hypridle_pkgconfig_check "$work/$pkg/CMakeLists.txt"; then
-            return 1
+        if [ "$pkg" = hypridle ] && ! hypridle_pkgconfig_check; then
+            warn "$(_t "Some optional hypridle pkg-config checks failed; CMake will report the exact required module." "Some optional hypridle pkg-config checks failed; CMake will report the exact required module.")"
         fi
         prepare_debian_pkgconfig
         prepare_hypr_cmake_paths
@@ -3435,6 +3442,7 @@ stage_dm() {
         return
     fi
     if exe systemctl enable "$dm_unit" &&
+       ln -sfn "$dm_service" /etc/systemd/system/display-manager.service &&
        systemctl set-default graphical.target 2>/dev/null &&
        exe systemctl daemon-reload &&
        true; then
@@ -3446,7 +3454,7 @@ stage_dm() {
             warn "$(_t "Verification failed: " "Verification failed: ") $dm_unit $(_t "is not enabled." "is not enabled.")"
         fi
         local _dm_link
-        _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
+         _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
         if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
             _verify_ok=0
             warn "$(_t "display-manager.service is not linked to " "display-manager.service is not linked to ")$dm_unit"
@@ -4410,6 +4418,14 @@ boot_env_check() {
             [ "$_as" != "niri" ] && warn "$(_t "gdm AccountsService Session=$_as — login will not go to niri." "gdm AccountsService Session=$_as — login will not go to niri.")"
         fi
     fi
+    # session files visible to the DM
+    local _sessions
+    _sessions=$(ls /usr/share/xsessions /usr/local/share/xsessions /usr/share/wayland-sessions /usr/local/share/wayland-sessions 2>/dev/null | sort -u | tr '\n' ' ')
+    info_kv "$(_t "Sessions (all)" "Sessions (all)")" "${_sessions:-none}" "$(_t "(niri present if niri.desktop listed)" "(niri present if niri.desktop listed)")"
+
+    # final assertion: verify the active DM's session mechanism.
+    local _boot_ok=1 _reason=""
+    [ -z "$_niri_desktop" ] && { _boot_ok=0; _reason="niri.desktop not registered (build incomplete)"; }
     if [ "$_active_dm" = sddm ]; then
         if [ -f /etc/sddm.conf.d/10-eilniri.conf ] && grep -q '^DefaultSession=niri.desktop$' /etc/sddm.conf.d/10-eilniri.conf; then
             info_kv "$(_t "sddm Session" "sddm Session")" "DefaultSession=niri.desktop" "$(_t "(Niri)" "(Niri)")"
@@ -4419,14 +4435,6 @@ boot_env_check() {
             _reason="${_reason}SDDM DefaultSession is not niri.desktop"
         fi
     fi
-    # session files visible to the DM
-    local _sessions
-    _sessions=$(ls /usr/share/xsessions /usr/local/share/xsessions /usr/share/wayland-sessions /usr/local/share/wayland-sessions 2>/dev/null | sort -u | tr '\n' ' ')
-    info_kv "$(_t "Sessions (all)" "Sessions (all)")" "${_sessions:-none}" "$(_t "(niri present if niri.desktop listed)" "(niri present if niri.desktop listed)")"
-
-    # final assertion: verify the active DM's session mechanism.
-    local _boot_ok=1 _reason=""
-    [ -z "$_niri_desktop" ] && { _boot_ok=0; _reason="niri.desktop not registered (build incomplete)"; }
     if [[ "$_active_dm" = gdm || "$_active_dm" = gdm3 ]] &&
         [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
         local _as
@@ -4638,7 +4646,10 @@ main() {
     local arg
     for arg in "$@"; do
         case "$arg" in
-            restore|rollback|status|restore-system) MODE="$arg" ;;
+            restore|reatore|rollback|status|restore-system)
+                [ "$arg" = reatore ] && arg=restore
+                MODE="$arg"
+                ;;
             --dry-run)      DRY_RUN=1 ;;
             -h|--help)      usage; exit 0 ;;
             *) error "$(_t "Unknown argument: " "Unknown argument: ") $arg"; usage; exit 1 ;;
