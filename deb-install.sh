@@ -1897,22 +1897,10 @@ install_awww() {
             warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
         exe apt-get install -y libdav1d6 2>/dev/null || true
-        prepare_debian_pkgconfig
-        local wayland_protocols_dir
-        wayland_protocols_dir=$(pkg-config --variable=pkgdatadir wayland-protocols 2>/dev/null || true)
-        if [ -z "$wayland_protocols_dir" ]; then
-            for wayland_protocols_dir in \
-                /usr/share/wayland-protocols \
-                /usr/local/share/wayland-protocols \
-                /usr/share/wayland-protocols-*; do
-                [ -d "$wayland_protocols_dir" ] && break
-            done
-        fi
-        if [ ! -d "${wayland_protocols_dir:-}" ]; then
-            MANUAL_ITEMS+=("awww — wayland-protocols data directory not found; install wayland-protocols and retry")
+        if ! ensure_wayland_protocols_pkgconfig; then
+            MANUAL_ITEMS+=("awww — wayland-protocols pkg-config setup failed; install wayland-protocols and retry")
             return 1
         fi
-        export WAYLAND_PROTOCOLS_DIR="$wayland_protocols_dir"
         # pkg-config 预检 + 自愈：wayland-client / xkbcommon / liblz4 / dav1d 缺哪个自动装哪个
         # （注意 lz4 的 .pc 文件名是 liblz4.pc，lz4-sys 探测的也是 liblz4）
         if ! ensure_pc_deps wayland-client xkbcommon liblz4 dav1d; then
@@ -1972,7 +1960,7 @@ install_awww() {
     # Build in background so the rest of the install proceeds meanwhile.
     # On low-RAM machines, wait for the niri build to finish first (avoids OOM from two parallel cargo builds).
     local awww_cmd ram_mb niri_pid
-    awww_cmd="cd '$work/awww' && WAYLAND_PROTOCOLS_DIR='${WAYLAND_PROTOCOLS_DIR:-}' cargo build --release --workspace -j $(cargo_jobs)"
+    awww_cmd="cd '$work/awww' && PKG_CONFIG_PATH='${PKG_CONFIG_PATH:-}' PKG_CONFIG_LIBDIR='${PKG_CONFIG_LIBDIR:-}' WAYLAND_PROTOCOLS_DIR='${WAYLAND_PROTOCOLS_DIR:-}' cargo build --release --workspace -j $(cargo_jobs)"
     ram_mb=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
     if [ "${ram_mb:-0}" -lt 8192 ] && [ ${#BG_JOBS[@]} -gt 0 ]; then
         niri_pid=$(echo "${BG_JOBS[0]}" | awk '{print $2}')
@@ -2280,12 +2268,77 @@ prepare_debian_pkgconfig() {
     export PKG_CONFIG_LIBDIR="${PKG_CONFIG_LIBDIR:-$PKG_CONFIG_PATH}"
 }
 
+prepare_hypr_cmake_paths() {
+    local multiarch cmake_dir pc_dir
+    multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)
+    CMAKE_PREFIX_PATH="/usr/local:/usr:/usr/local/lib:/usr/lib${multiarch:+:/usr/lib/$multiarch}:${CMAKE_PREFIX_PATH:-}"
+    CMAKE_MODULE_PATH="/usr/local/lib/cmake:/usr/local/share/cmake:/usr/lib/cmake${multiarch:+:/usr/lib/$multiarch/cmake}:${CMAKE_MODULE_PATH:-}"
+    for pc_dir in /usr/local/lib/pkgconfig /usr/local/lib64/pkgconfig /usr/lib/pkgconfig /usr/lib64/pkgconfig "/usr/lib/${multiarch}/pkgconfig"; do
+        [ -d "$pc_dir" ] || continue
+        case ":${PKG_CONFIG_PATH:-}:" in
+            *":$pc_dir:"*) ;;
+            *) PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$pc_dir" ;;
+        esac
+    done
+    export CMAKE_PREFIX_PATH CMAKE_MODULE_PATH PKG_CONFIG_PATH
+}
+
+ensure_wayland_protocols_pkgconfig() {
+    local protocol_dir pc_dir pc_file version
+    prepare_debian_pkgconfig
+    protocol_dir=$(pkg-config --variable=pkgdatadir wayland-protocols 2>/dev/null || true)
+    if [ ! -d "$protocol_dir" ]; then
+        for protocol_dir in \
+            /usr/share/wayland-protocols \
+            /usr/local/share/wayland-protocols \
+            /usr/share/wayland-protocols-*; do
+            [ -d "$protocol_dir" ] && break
+        done
+    fi
+    if [ ! -d "${protocol_dir:-}" ]; then
+        MANUAL_ITEMS+=("wayland-protocols — protocol data directory not found; install wayland-protocols")
+        return 1
+    fi
+    if pkg-config --exists wayland-protocols 2>/dev/null &&
+       [ "$(pkg-config --variable=pkgdatadir wayland-protocols 2>/dev/null)" = "$protocol_dir" ]; then
+        export WAYLAND_PROTOCOLS_DIR="$protocol_dir"
+        return 0
+    fi
+    pc_dir="$HOME_DIR/.local/share/eilniri/pkgconfig"
+    pc_file="$pc_dir/wayland-protocols.pc"
+    mkdir -p "$pc_dir"
+    version=$(dpkg-query -W -f='${Version}' wayland-protocols 2>/dev/null || echo 1.0)
+    version=${version%%-*}
+    cat > "$pc_file" <<EOF
+prefix=/usr
+datarootdir=\${prefix}/share
+pkgdatadir=$protocol_dir
+Name: wayland-protocols
+Description: Wayland protocol files
+Version: $version
+EOF
+    case ":${PKG_CONFIG_PATH:-}:" in
+        *":$pc_dir:"*) ;;
+        *) PKG_CONFIG_PATH="$pc_dir${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" ;;
+    esac
+    case ":${PKG_CONFIG_LIBDIR:-}:" in
+        *":$pc_dir:"*) ;;
+        *) PKG_CONFIG_LIBDIR="$pc_dir${PKG_CONFIG_LIBDIR:+:$PKG_CONFIG_LIBDIR}" ;;
+    esac
+    export PKG_CONFIG_PATH PKG_CONFIG_LIBDIR WAYLAND_PROTOCOLS_DIR="$protocol_dir"
+    if [ "$(pkg-config --variable=pkgdatadir wayland-protocols 2>/dev/null || true)" != "$protocol_dir" ]; then
+        MANUAL_ITEMS+=("wayland-protocols — pkg-config cannot resolve pkgdatadir; see $LOG_DIR/awww-build.log")
+        return 1
+    fi
+    return 0
+}
+
 hypridle_pkgconfig_check() {
     local missing=() pc
     local check_log="$LOG_DIR/hypridle-pkgconfig.log"
     prepare_debian_pkgconfig
     : > "$check_log"
-    for pc in wayland-client xkbcommon pixman-1 libdrm egl gbm sdbus-c++; do
+    for pc in wayland-client xkbcommon pixman-1 libdrm egl gbm sdbus-c++ libinput; do
         pkg-config --exists "$pc" 2>/dev/null || missing+=("$pc")
     done
     if [ ${#missing[@]} -gt 0 ]; then
@@ -2625,6 +2678,7 @@ build_hypr_stack() {
 
     local _prefix=/usr/local _libdir=lib
     [ "$DISTRO_FAMILY" != debian ] && _prefix=/usr && _libdir=lib64
+    prepare_hypr_cmake_paths
     export CMAKE_PREFIX_PATH="$_prefix:/usr:${CMAKE_PREFIX_PATH:-}"
     local _pc_dir
     for _pc_dir in /usr/local/lib/pkgconfig /usr/local/lib64/pkgconfig /usr/lib/pkgconfig /usr/lib/*/pkgconfig; do
@@ -2762,9 +2816,10 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
             return 1
         fi
         prepare_debian_pkgconfig
-        export CMAKE_PREFIX_PATH="/usr/local:/usr:/usr/local/lib:/usr/lib:${CMAKE_PREFIX_PATH:-}"
+        prepare_hypr_cmake_paths
         ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
             -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
+            -DCMAKE_MODULE_PATH="$CMAKE_MODULE_PATH" \
             -DPKG_CONFIG_EXECUTABLE="$(command -v pkg-config)" \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib \
             && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
