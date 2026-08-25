@@ -1077,6 +1077,7 @@ git_clone_gh() { # $1 = github repo URL, $2 = dest dir; returns 0 on success
 # one download attempt with resume support; rc 33 = server rejects range requests -> restart
 try_dl() { # $1 = URL, $2 = output file; returns 0 on success
     local url="$1" out="$2" rc
+    rm -f "$out"
     curl "${CURL_DL_FLAGS[@]}" -C - -o "$out" "$url" 2>/dev/null
     rc=$?
     if [ "$rc" -eq 33 ]; then
@@ -1084,7 +1085,7 @@ try_dl() { # $1 = URL, $2 = output file; returns 0 on success
         curl "${CURL_DL_FLAGS[@]}" -o "$out" "$url" 2>/dev/null
         rc=$?
     fi
-    [ "$rc" -eq 0 ] && archive_is_valid "$out" || return "$rc"
+    [ "$rc" -eq 0 ] && [ -s "$out" ] && archive_is_valid "$out" || return "${rc:-1}"
 }
 
 download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the curl exit code
@@ -2171,7 +2172,7 @@ EOF
 # on older Debian/Ubuntu releases. Build the application from its source tree
 # and install its launcher and desktop file without touching system site-packages.
 install_waypaper_source() {
-    local work logf src launcher install_root
+    local work logf src launcher install_root target_group
     if [ "$DRY_RUN" -eq 1 ]; then
         DRY_PKGS+=("waypaper (source build)")
         return "$DRY_RUN_RC"
@@ -2211,7 +2212,12 @@ install_waypaper_source() {
     fi
     launcher="$HOME_DIR/.local/bin/waypaper"
     mkdir -p "$HOME_DIR/.local/bin" "$HOME_DIR/.local/share/applications"
-    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$install_root"
+    target_group=$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")
+    mkdir -p "$HOME_DIR/.local" "$HOME_DIR/.local/bin" "$HOME_DIR/.local/lib" "$HOME_DIR/.cache/pip"
+    # Previous runs may have created ~/.local/bin and pip entry points as root.
+    # Repair ownership before pip creates f2py/waypaper and other console scripts.
+    chown -R "$TARGET_USER:$target_group" "$HOME_DIR/.local" "$HOME_DIR/.cache/pip" 2>/dev/null || true
+    chown -R "$TARGET_USER:$target_group" "$install_root" 2>/dev/null || true
     if [ -f "$src/pyproject.toml" ] || [ -f "$src/setup.py" ]; then
         if ! command -v pip3 >/dev/null 2>&1; then
             pm_install python3-pip || {
@@ -2219,7 +2225,8 @@ install_waypaper_source() {
                 return 1
             }
         fi
-        if ! as_user env HOME="$HOME_DIR" PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        if ! as_user env HOME="$HOME_DIR" USER="$TARGET_USER" \
+            PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
             python3 -m pip install --user --break-system-packages "$src" >"$LOG_DIR/waypaper-pip.log" 2>&1; then
             MANUAL_ITEMS+=("waypaper — source package installation failed; see $LOG_DIR/waypaper-pip.log")
             return 1
@@ -2566,9 +2573,17 @@ install_rime_ice() {
         MANUAL_ITEMS+=("rime-ice — download failed after $_rime_attempts attempts, deploy manually: $RIME_ICE_REPO")
         return 1
     fi
-    if ! archive_is_valid "$zipfile" || ! exe unzip -q "$zipfile" -d "$unzipdir"; then
-        MANUAL_ITEMS+=("rime-ice — zip extraction failed, deploy manually: $RIME_ICE_REPO")
-        return 1
+    if [ ! -s "$zipfile" ] || ! archive_is_valid "$zipfile" || ! unzip -q "$zipfile" -d "$unzipdir"; then
+        rm -rf "$unzipdir"
+        unzipdir=$(mktemp -d)
+        register_temp_path "$unzipdir"
+        if [ -s "$zipfile" ] && unzip -tqq "$zipfile" >/dev/null 2>&1 && unzip -q "$zipfile" -d "$unzipdir"; then
+            :
+        else
+            MANUAL_ITEMS+=("rime-ice — zip extraction failed; downloaded file is invalid; see $LOG_DIR/rime-ice-download.log")
+            cp "$zipfile" "$LOG_DIR/rime-ice-download.log" 2>/dev/null || true
+            return 1
+        fi
     fi
 
     local rime_root
@@ -2717,7 +2732,7 @@ build_hypr_stack() {
                 && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
                     -DCMAKE_INSTALL_PREFIX="$_prefix" -DCMAKE_INSTALL_LIBDIR="$_libdir" \
                 && cmake --build build -j"$(nproc)" \
-                && cmake --install build \
+                 && cmake --install build \
                 && command -v ldconfig >/dev/null 2>&1 && ldconfig || true ) >"$component_log" 2>&1; then
             INSTALLED_PKGS+=("hypr-$n (source build)")
             log "$(_t "Built " "Built ") hypr-$n$(_t " from source" " from source")"
