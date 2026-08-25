@@ -2167,7 +2167,7 @@ EOF
 # on older Debian/Ubuntu releases. Build the application from its source tree
 # and install its launcher and desktop file without touching system site-packages.
 install_waypaper_source() {
-    local work logf src launcher
+    local work logf src launcher install_root
     if [ "$DRY_RUN" -eq 1 ]; then
         DRY_PKGS+=("waypaper (source build)")
         return "$DRY_RUN_RC"
@@ -2182,30 +2182,52 @@ install_waypaper_source() {
     if ! command -v python3 >/dev/null 2>&1; then
         pm_install python3 || return 1
     fi
+    install_root="$HOME_DIR/.local/share/eilniri/waypaper-src"
     work=$(mktemp -d)
     register_temp_path "$work"
     logf="$LOG_DIR/waypaper-source.log"
-    if ! git_clone_gh "$WAYPAPER_REPO" "$work/waypaper" >"$logf" 2>&1; then
+    if [ -d "$install_root/.git" ]; then
+        if ! as_user git -C "$install_root" fetch --depth 1 origin main >"$logf" 2>&1 ||
+           ! as_user git -C "$install_root" reset --hard origin/main >>"$logf" 2>&1; then
+            MANUAL_ITEMS+=("waypaper — source update failed; see $logf")
+            return 1
+        fi
+        src="$install_root"
+    elif ! git_clone_gh "$WAYPAPER_REPO" "$work/waypaper" >"$logf" 2>&1; then
         MANUAL_ITEMS+=("waypaper — source clone failed; see $logf")
         return 1
+    else
+        mkdir -p "$(dirname "$install_root")"
+        rm -rf "$install_root"
+        if ! mv "$work/waypaper" "$install_root"; then
+            MANUAL_ITEMS+=("waypaper — could not persist source tree; see $logf")
+            return 1
+        fi
+        src="$install_root"
     fi
-    src="$work/waypaper"
     launcher="$HOME_DIR/.local/bin/waypaper"
     mkdir -p "$HOME_DIR/.local/bin" "$HOME_DIR/.local/share/applications"
-    if [ -f "$src/waypaper" ]; then
+    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$install_root"
+    if [ -f "$src/pyproject.toml" ] || [ -f "$src/setup.py" ]; then
+        if ! as_user env HOME="$HOME_DIR" PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+            python3 -m pip install --user --break-system-packages --no-deps "$src" >"$LOG_DIR/waypaper-pip.log" 2>&1; then
+            MANUAL_ITEMS+=("waypaper — source package installation failed; see $LOG_DIR/waypaper-pip.log")
+            return 1
+        fi
+        if [ -x "$HOME_DIR/.local/bin/waypaper" ]; then
+            launcher="$HOME_DIR/.local/bin/waypaper"
+        elif command -v waypaper >/dev/null 2>&1; then
+            launcher=$(command -v waypaper)
+        else
+            MANUAL_ITEMS+=("waypaper — source installed but no launcher was produced; see $LOG_DIR/waypaper-pip.log")
+            return 1
+        fi
+    elif [ -f "$src/waypaper" ]; then
         exe install -Dm755 "$src/waypaper" "$launcher"
     elif [ -f "$src/waypaper/__main__.py" ]; then
         cat > "$launcher" <<EOF
 #!/usr/bin/env bash
 exec python3 "$src/waypaper/__main__.py" "\$@"
-EOF
-        chmod 755 "$launcher"
-    elif [ -f "$src/pyproject.toml" ] || [ -f "$src/setup.py" ]; then
-        # Keep the source-build route independent from venv creation, but use
-        # the project's own entry point when upstream does not ship a script.
-        cat > "$launcher" <<EOF
-#!/usr/bin/env bash
-exec python3 -m waypaper "\$@"
 EOF
         chmod 755 "$launcher"
     else
@@ -2219,6 +2241,43 @@ EOF
         "$HOME_DIR/.local/bin" "$HOME_DIR/.local/share/applications" 2>/dev/null || true
     INSTALLED_PKGS+=("waypaper (source build)")
     success "$(_t "waypaper built from source" "waypaper built from source")"
+    return 0
+}
+
+prepare_debian_pkgconfig() {
+    local multiarch pc_dir
+    command -v pkg-config >/dev/null 2>&1 || pm_install pkg-config
+    multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)
+    for pc_dir in \
+        /usr/local/lib/pkgconfig \
+        /usr/local/lib64/pkgconfig \
+        /usr/lib/pkgconfig \
+        /usr/lib64/pkgconfig \
+        "/usr/lib/${multiarch}/pkgconfig"; do
+        [ -d "$pc_dir" ] || continue
+        case ":${PKG_CONFIG_PATH:-}:" in
+            *":$pc_dir:"*) ;;
+            *) PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$pc_dir" ;;
+        esac
+    done
+    export PKG_CONFIG_PATH
+    export PKG_CONFIG_LIBDIR="${PKG_CONFIG_LIBDIR:-$PKG_CONFIG_PATH}"
+}
+
+hypridle_pkgconfig_check() {
+    local missing=() pc
+    local check_log="$LOG_DIR/hypridle-pkgconfig.log"
+    prepare_debian_pkgconfig
+    : > "$check_log"
+    for pc in wayland-client xkbcommon pixman-1 libdrm egl gbm sdbus-c++ hyprland-protocols; do
+        pkg-config --exists "$pc" 2>/dev/null || missing+=("$pc")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        warn "$(_t "hypridle pkg-config dependencies missing:" "hypridle pkg-config dependencies missing:") ${missing[*]}"
+        pkg-config --list-all >"$check_log" 2>&1 || true
+        MANUAL_ITEMS+=("hypridle — missing pkg-config modules: ${missing[*]}; see $check_log")
+        return 1
+    fi
     return 0
 }
 
@@ -2629,6 +2688,7 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     # build deps (tolerant: many hypr deps are absent on older releases / Rocky/Alma)
     local _brc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
+        prepare_debian_pkgconfig
         local apt_hypr="$pkg"
         if apt-cache policy "$apt_hypr" 2>/dev/null | grep -qE '^ ?Candidate: [^ (]'; then
             if pm_install "$apt_hypr" && command -v "$pkg" >/dev/null 2>&1; then
@@ -2682,9 +2742,14 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
             return 1
         fi
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
+        if [ "$pkg" = hypridle ] && ! hypridle_pkgconfig_check; then
+            return 1
+        fi
+        prepare_debian_pkgconfig
         export CMAKE_PREFIX_PATH="/usr/local:/usr:/usr/local/lib:/usr/lib:${CMAKE_PREFIX_PATH:-}"
-        export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
         ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
+            -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
+            -DPKG_CONFIG_EXECUTABLE="$(command -v pkg-config)" \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib \
             && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
         _bin="$work/$pkg/build/$pkg"
@@ -3241,6 +3306,26 @@ stage_dm() {
         return   # not marked: rerun retries
     fi
 
+    if [ "$DISTRO_FAMILY" = debian ] && [ "$dm_pkgs" = gdm3 ] && [ "$DRY_RUN" -eq 0 ]; then
+        local gdm_conf=/etc/gdm3/custom.conf
+        mkdir -p /etc/gdm3
+        if [ ! -f "$gdm_conf" ]; then
+            printf '%s\n' '[daemon]' > "$gdm_conf"
+        fi
+        if ! grep -qE '^\[daemon\]' "$gdm_conf"; then
+            printf '%s\n' '[daemon]' >> "$gdm_conf"
+        fi
+        if grep -qE '^[[:space:]]*WaylandEnable[[:space:]]*=' "$gdm_conf"; then
+            sed -i -E 's/^[[:space:]]*WaylandEnable[[:space:]]*=.*/WaylandEnable=true/' "$gdm_conf"
+        else
+            printf '%s\n' 'WaylandEnable=true' >> "$gdm_conf"
+        fi
+        # Let Debian's gdm3 package manage display-manager.service when possible.
+        if command -v dpkg-reconfigure >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive dpkg-reconfigure gdm3 >/dev/null 2>&1 || true
+        fi
+    fi
+
     # Enable and validate the replacement before touching the existing DM.
     local dm_service="/lib/systemd/system/${dm_unit}.service"
     [ -e "$dm_service" ] || dm_service="/usr/lib/systemd/system/${dm_unit}.service"
@@ -3278,6 +3363,8 @@ stage_dm() {
             for dm in "${known_dms[@]}"; do
                 [ "$dm" = "$dm_unit" ] || exe systemctl disable "$dm" 2>/dev/null || true
             done
+            [ "$dm_unit" = gdm3 ] && exe systemctl disable --now sddm.service 2>/dev/null || true
+            [ "$dm_unit" = gdm ] && exe systemctl disable --now sddm.service 2>/dev/null || true
             ENABLED_SVCS+=("$dm_unit")
             success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
             stage_mark dm
