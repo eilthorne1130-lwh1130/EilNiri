@@ -2334,11 +2334,18 @@ EOF
 }
 
 hypridle_pkgconfig_check() {
-    local missing=() pc
+    local missing=() pc source_file
     local check_log="$LOG_DIR/hypridle-pkgconfig.log"
     prepare_debian_pkgconfig
     : > "$check_log"
-    for pc in wayland-client xkbcommon pixman-1 libdrm egl gbm sdbus-c++ libinput; do
+    source_file="${1:-}"
+    if [ -n "$source_file" ] && [ -f "$source_file" ]; then
+        mapfile -t _hypr_pcs < <(sed -nE 's/^[[:space:]]*pkg_check_modules\([^ ]+[[:space:]]+([^ )]+).*/\1/p' "$source_file" | sort -u)
+    fi
+    if [ ${#_hypr_pcs[@]:-0} -eq 0 ]; then
+        _hypr_pcs=(wayland-client xkbcommon pixman-1 libdrm egl gbm sdbus++ libinput)
+    fi
+    for pc in "${_hypr_pcs[@]}"; do
         pkg-config --exists "$pc" 2>/dev/null || missing+=("$pc")
     done
     if [ ${#missing[@]} -gt 0 ]; then
@@ -2812,7 +2819,7 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
             return 1
         fi
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
-        if [ "$pkg" = hypridle ] && ! hypridle_pkgconfig_check; then
+        if [ "$pkg" = hypridle ] && ! hypridle_pkgconfig_check "$work/$pkg/CMakeLists.txt"; then
             return 1
         fi
         prepare_debian_pkgconfig
@@ -2924,6 +2931,10 @@ install_debian() {
     fi
 
     for p in ${all[@]+"${all[@]}"}; do
+        if [ "$p" = waypaper ]; then
+            install_waypaper_source || MANUAL_ITEMS+=("waypaper — source installation failed")
+            continue
+        fi
         if [ "$p" = polkit-gnome ]; then
             if resolve_polkit_agent; then
                 if pkg_installed "$POLKIT_AGENT_PACKAGE"; then
@@ -3340,11 +3351,13 @@ stage_dm() {
     fi
     local old_dm="$current"
 
-    # keep the existing DM on request, or when it already is the chosen one
-    if [ -n "$current" ] && { [ "${EILNIRI_KEEP_DM:-0}" = "1" ] || [ "$current" = "$dm_unit" ]; }; then
+    # Keep the existing DM only when explicitly requested. Even an already
+    # installed GDM must pass through the switch path so a stale SDDM/GDM
+    # enablement and display-manager symlink are corrected.
+    if [ "${EILNIRI_KEEP_DM:-0}" = "1" ]; then
         local reason="already the chosen DM"
-        [ "${EILNIRI_KEEP_DM:-0}" = "1" ] && reason="EILNIRI_KEEP_DM=1, keep"
-        info_kv "$(_t "DM" "DM")" "$current" "$reason"
+        reason="EILNIRI_KEEP_DM=1, keep"
+        info_kv "$(_t "DM" "DM")" "${current:-none}" "$reason"
         stage_mark dm
         return
     fi
@@ -3398,8 +3411,10 @@ stage_dm() {
     fi
 
     # Enable and validate the replacement before touching the existing DM.
-    local dm_service="/lib/systemd/system/${dm_unit}.service"
-    [ -e "$dm_service" ] || dm_service="/usr/lib/systemd/system/${dm_unit}.service"
+    local dm_service=""
+    for dm_service in "/lib/systemd/system/${dm_unit}.service" "/usr/lib/systemd/system/${dm_unit}.service"; do
+        [ -e "$dm_service" ] && break
+    done
     # Debian's gdm3 package may expose the unit as gdm.service, while the
     # package/configuration command still uses gdm3. Resolve the real unit
     # before enabling or creating the display-manager symlink.
@@ -3413,9 +3428,9 @@ stage_dm() {
         return
     fi
     if exe systemctl enable "$dm_unit" &&
-       ln -sfn "$dm_service" /etc/systemd/system/display-manager.service &&
+       systemctl set-default graphical.target 2>/dev/null &&
        exe systemctl daemon-reload &&
-       exe systemctl set-default graphical.target; then
+       true; then
         # verify: the unit must be enabled, and (except ly, which runs on tty1 directly)
         # display-manager.service must point at the new DM
         local _verify_ok=1
@@ -3425,17 +3440,19 @@ stage_dm() {
         fi
         local _dm_link
         _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
-        if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
+        if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ] && [ "$dm_unit" != gdm3 ]; then
             _verify_ok=0
             warn "$(_t "display-manager.service is not linked to " "display-manager.service is not linked to ")$dm_unit"
         fi
         if [ "$_verify_ok" -eq 1 ]; then
+            if [ ! -e /etc/systemd/system/display-manager.service ] || [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
+                ln -sfn "$dm_service" /etc/systemd/system/display-manager.service
+                systemctl daemon-reload 2>/dev/null || true
+            fi
             local dm
             for dm in "${known_dms[@]}"; do
-                [ "$dm" = "$dm_unit" ] || exe systemctl disable "$dm" 2>/dev/null || true
+                [ "$dm" = "$dm_unit" ] || exe systemctl disable --now "$dm.service" 2>/dev/null || true
             done
-            [ "$dm_unit" = gdm3 ] && exe systemctl disable --now sddm.service 2>/dev/null || true
-            [ "$dm_unit" = gdm ] && exe systemctl disable --now sddm.service 2>/dev/null || true
             ENABLED_SVCS+=("$dm_unit")
             success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
             stage_mark dm
@@ -3443,7 +3460,9 @@ stage_dm() {
             FAILED_PKGS+=("dm:$dm_unit")
             if [ -n "$old_dm" ] && [ "$old_dm" != "$dm_unit" ]; then
                 systemctl enable "$old_dm" >/dev/null 2>&1 || true
-                ln -sfn "/lib/systemd/system/${old_dm}.service" /etc/systemd/system/display-manager.service 2>/dev/null || true
+                local old_service="/lib/systemd/system/${old_dm}.service"
+                [ -e "$old_service" ] || old_service="/usr/lib/systemd/system/${old_dm}.service"
+                ln -sfn "$old_service" /etc/systemd/system/display-manager.service 2>/dev/null || true
                 warn "$(_t "Restored previous display manager after GDM verification failed: " "Restored previous display manager after GDM verification failed: ")$old_dm"
             fi
             warn "$(_t "Display manager enable verification failed; run niri-session from tty after reboot." "Display manager enable verification failed; run niri-session from tty after reboot.")"
@@ -3453,7 +3472,9 @@ stage_dm() {
         FAILED_PKGS+=("dm:$dm_unit")
         if [ -n "$old_dm" ]; then
             systemctl enable "$old_dm" >/dev/null 2>&1 || true
-            ln -sfn "/lib/systemd/system/${old_dm}.service" /etc/systemd/system/display-manager.service 2>/dev/null || true
+            local old_service="/lib/systemd/system/${old_dm}.service"
+            [ -e "$old_service" ] || old_service="/usr/lib/systemd/system/${old_dm}.service"
+            ln -sfn "$old_service" /etc/systemd/system/display-manager.service 2>/dev/null || true
         fi
         warn "$(_t "Display manager enable failed; run niri-session from tty after reboot." "Display manager enable failed; run niri-session from tty after reboot.")"
         # not marked: rerun retries
