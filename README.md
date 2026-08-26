@@ -129,7 +129,7 @@ sudo ./arch-install.sh restore-system   # 或 ./RHEL-install.sh / ./deb-install.
 - **服务提供包**：`libvirtd.service` 的提供包按家族映射（Debian 为 `libvirt-daemon-system`）。
 - **rime-ice 雾凇拼音自动部署**：无 .deb/RPM 时使用官方 release zip（`full.zip`）；restore 会先安装并验证 `fcitx5-rime`，RHEL 上依次尝试官方仓库/EPEL/源码，并在需要时先构建 `librime` 再构建 `fcitx5-rime`，成功后下载解压到 `~/.local/share/fcitx5/rime`。Arch 上仍走 archlinuxcn 包，不受影响。
 - **登录管理器自动安装**：Debian 默认 `sddm`（失败再试 gdm3/gdm），RHEL 默认 `gdm`（gdm3 兜底）；现有 DM 被自动禁用替换，`EILNIRI_KEEP_DM=1` 可保留。
-- **Debian 进 DM 黑屏自愈（v1.9.27）**：每次 restore 解除旧版误 mask 的 `gdm-wayland-session.service` 等；强制 `WaylandEnable=true`；安装 Mesa 运行时（`libgl1-mesa-dri` / `mesa-libgallium` / `mesa-vulkan-drivers` / `libegl1` / `libgbm1`，Server/云镜像编得出 niri 但登录无 DRI 会黑屏）；把 `niri.service` 的 `ExecStart=` 写成 `/usr/local/bin/niri --session`（user session 常无 `/usr/local/bin`）；会话 wrapper 只改 output 名/mode，不再掏空块；niri 不是 wlroots，WLR_* 无效，VM 改用 Mesa 软件 GL 回退。
+- **Debian 进 niri 黑屏自愈（v1.9.30）**：日志显示 niri 其实已启动并连上显示器，随后立刻 `locking session`。根因是 `spawn-at-startup "hyprlock"`——hyprlock 失败（缺壁纸/字体）时整屏全黑。restore 会注释掉开机 hyprlock（空闲锁屏仍由 hypridle），并修正 `swww-daemon`→`awww-daemon`、polkit 拼写。不再写入 `mode "WxH@60"`；禁止 `WLR_*` / `LIBGL_ALWAYS_SOFTWARE`。
 - **ly**：仅 Arch 有包（自动安装）；Debian 用 sddm（gdm 兜底），RHEL 用 gdm。
 - **Debian 无快照回滚**：`deb-install.sh` 不写 `backups/`、不提供 `rollback`。覆盖配置时仍会把旧文件改名为 `.bak-时间戳`（只保留一份）。Arch / RHEL 脚本仍保留快照。
 - **apt 镜像源自动换源（404 / 无法下载自愈）**：当 `apt-get update` 失败、或安装时 apt 报 `404`/`无法下载`/`Failed to fetch`（典型：`cn.archive.ubuntu.com` 等镜像同步滞后——索引里已有新版但 pool 里的 .deb 尚未同步，如 Ubuntu 26.04 的 `libudev-dev_259.5-0ubuntu3.3`、`libinput10 1.31.1-1`）时，脚本按 **tuna → 阿里云 → 中科大** 顺序询问并自动换源：备份原源文件（`*.mirror-bak-时间戳`）→ 改写 `.list`/`.sources` 里的 host → `apt-get update` → **用 curl 探测之前 404 的 .deb 是否真被新镜像同步**（只有显式 404 才换下一个候选）→ 换源成功后自动重试关键依赖一轮（带 `--fix-missing`）。fzf 可用时用 fzf 菜单选择，未装时退化为编号提示。手动报告只追加一次。
@@ -189,7 +189,7 @@ EilNiri/
 
 ## 注意事项
 
-- **脚本版本**：`--help`、restore 开头都会显示 `v版本号`（Debian 当前 **v1.9.28**）——目标机器上先看版本号确认拷到的是最新脚本（旧进度文件自动作废）
+- **脚本版本**：`--help`、restore 开头都会显示 `v版本号`（Debian 当前 **v1.9.29**）——目标机器上先看版本号确认拷到的是最新脚本（旧进度文件自动作废）
 - **多桌面环境**：restore 会自动禁用（不卸载）其他 DE 的冲突组件（通知/设置守护等），清单存 `.system_disabled`；切回其他 DE 前用同一份脚本的 `sudo ./arch-install.sh restore-system`（或 `./RHEL-install.sh` / `./deb-install.sh`）重新启用，或 `EILNIRI_KEEP_SYS=1` 跳过禁用
 - **诊断**：restore 结尾打印 `NIRI STATUS`（niri 二进制/desktop/gdm Session 三态）+ `Boot Environment Check`（gdm 是否真能启动 niri）+ 生成 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包（各 build 日志 + AccountsService + custom.conf + 包清单），排查时直接分享该包
 - Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 上 niri 源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**；Rocky/Alma/RHEL **10** 优先 COPR 二进制（niri/waybar/hyprlock），仅 COPR 不可用时才源码编译；satty 走官方预编译二进制（不可用时 cargo 构建）

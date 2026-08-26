@@ -287,7 +287,7 @@ spawn-at-startup "/usr/lib/polkit-gnome-authentication-agent-1"
 spawn-at-startup "mako"
 spawn-at-startup "fcitx5"
 spawn-at-startup "copyq" "--start-server"
-spawn-at-startup "hyprlock"
+// spawn-at-startup "hyprlock"  // do not lock immediately; hypridle handles idle lock
 spawn-at-startup "hypridle"
 spawn-at-startup "awww-daemon"
 //spawn-at-startup "flameshot"

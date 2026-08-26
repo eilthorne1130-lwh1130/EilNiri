@@ -62,7 +62,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.28"
+SCRIPT_VERSION="1.9.30"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -560,7 +560,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v40"
+PROGRESS_VERSION="v41"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -696,56 +696,33 @@ install_niri_output_wrapper() {
 set -u
 
 export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:${PATH:-}"
+# Do not force LIBGL_ALWAYS_SOFTWARE / GALLIUM_DRIVER here. On a real GPU
+# those produce a compositor that starts then stays black. niri is smithay,
+# not wlroots, so WLR_* is also ignored.
 cfg="${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl"
 tmp="${cfg}.eilniri-output.$$"
 
-# niri is smithay, not wlroots — WLR_* does nothing. On VMs without a
-# hardware cursor plane, point Mesa at the first DRM render node instead.
-if [ -z "${NIRI_RENDER_DRM_DEVICE:-}" ]; then
-    for _rn in /dev/dri/renderD*; do
-        [ -e "$_rn" ] || continue
-        export NIRI_RENDER_DRM_DEVICE="$_rn"
-        break
-    done
-fi
-if [ -z "${LIBGL_ALWAYS_SOFTWARE:-}" ] && [ -d /sys/class/drm ]; then
-    _connected=0
-    for _st in /sys/class/drm/card*-*/status; do
-        [ -f "$_st" ] || continue
-        [ "$(<"$_st")" = connected ] && _connected=1 && break
-    done
-    if [ "$_connected" -eq 0 ]; then
-        export LIBGL_ALWAYS_SOFTWARE=1
-        export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
-    fi
-fi
-
-out=""; mode=""
+out=""
 for status in /sys/class/drm/card*-*/status; do
     [ -f "$status" ] || continue
     [ "$(<"$status")" = connected ] || continue
     dir=${status%/status}
     candidate=${dir##*/}
     candidate=${candidate#card[0-9]-}
-    candidate_mode=$(sed -n '1p' "$dir/modes" 2>/dev/null || true)
-    [ -n "$candidate" ] && [ -n "$candidate_mode" ] || continue
-    out="$candidate"; mode="$candidate_mode"; break
+    [ -n "$candidate" ] || continue
+    out="$candidate"; break
 done
 
-# Rewrite only the first output *name* and *mode*. Keep scale/transform/etc.
+# Rename the first output block to the live connector. Never rewrite mode:
+# a hardcoded @60 (or preferred-mode @60) that the panel cannot do leaves
+# niri with "display output is not active" → black screen after login.
 if [ -n "$out" ] && [ -f "$cfg" ]; then
-    w=${mode%x*}; h=${mode#*x}
-    [ -n "$mode" ] && mode_line="mode \"${w}x${h}@60\"" || mode_line=""
-    awk -v output="$out" -v mode_line="$mode_line" '
-        BEGIN { replaced=0; inside=0 }
+    awk -v output="$out" '
+        BEGIN { replaced=0 }
         !replaced && $0 ~ /^[[:space:]]*output[[:space:]]+"/ {
             print "output \"" output "\" {"
-            replaced=1; inside=1; next
+            replaced=1; next
         }
-        inside && mode_line != "" && $0 ~ /^[[:space:]]*mode[[:space:]]+"/ {
-            print "    " mode_line; next
-        }
-        inside && $0 ~ /^[[:space:]]*}/ { print; inside=0; next }
         { print }
     ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
 fi
@@ -781,6 +758,42 @@ _patch_niri_user_units() {
         fi
     done
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+}
+
+# Idempotent: strip injected mode "WxH@60", drop software-GL env, point the
+# session desktop at the wrapper. Safe to run on every restore (including
+# machines that already have niri installed from Ubuntu's repo).
+repair_niri_blackscreen() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local cfg="$HOME_DIR/.config/niri/config.kdl"
+    if [ -f "$cfg" ]; then
+        if grep -qE '^[[:space:]]*mode[[:space:]]+"[^"]+@60"' "$cfg" 2>/dev/null; then
+            sed -i -E '/^[[:space:]]*mode[[:space:]]+"[^"]+@60"/d' "$cfg"
+            log "$(_t "Removed forced mode @60 from niri config (preferred mode will be used)" "Removed forced mode @60 from niri config (preferred mode will be used)")"
+        fi
+        if grep -qE '^[[:space:]]*spawn-at-startup[[:space:]]+"hyprlock"' "$cfg" 2>/dev/null; then
+            sed -i -E 's/^([[:space:]]*)spawn-at-startup[[:space:]]+"hyprlock".*/\1\/\/ spawn-at-startup "hyprlock" (idle lock is hypridle)/' "$cfg"
+            log "$(_t "Disabled spawn-at-startup hyprlock (immediate lock → black screen)" "Disabled spawn-at-startup hyprlock (immediate lock → black screen)")"
+        fi
+        sed -i 's#polkit-gnome-authenntication-agent-1#polkit-gnome-authentication-agent-1#g' "$cfg" 2>/dev/null || true
+        sed -i 's#spawn-at-startup "swww-daemon"#spawn-at-startup "awww-daemon"#' "$cfg" 2>/dev/null || true
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$cfg" 2>/dev/null || true
+    fi
+    local _env="$HOME_DIR/.config/environment.d/90-eilniri-cursor.conf"
+    if [ -f "$_env" ]; then
+        rm -f "$_env"
+        log "$(_t "Removed ~/.config/environment.d/90-eilniri-cursor.conf (LIBGL_ALWAYS_SOFTWARE blacks out niri)" "Removed ~/.config/environment.d/90-eilniri-cursor.conf (LIBGL_ALWAYS_SOFTWARE blacks out niri)")"
+    fi
+    install_niri_output_wrapper
+    ensure_localbin_on_path
+    _patch_niri_user_units
+    local _desk
+    for _desk in /usr/local/share/wayland-sessions/niri.desktop /usr/share/wayland-sessions/niri.desktop; do
+        [ -f "$_desk" ] || continue
+        grep -q '^Exec=/usr/local/bin/eilniri-niri-session$' "$_desk" 2>/dev/null && continue
+        sed -i 's#^Exec=.*#Exec=/usr/local/bin/eilniri-niri-session#' "$_desk"
+        log "$(_t "Pointed " "Pointed ") $_desk $(_t " at eilniri-niri-session" " at eilniri-niri-session")"
+    done
 }
 
 ensure_debian_graphics_runtime() {
@@ -2172,14 +2185,12 @@ _ensure_wallpaper() {
     command -v awww >/dev/null 2>&1 || return 0   # awww 缺失由 install_awww 处理
 
     local _img="" _cand _ext=""
-    # 1) 固定使用仓库根目录的壁纸图（用户放在 script 旁的那张 QQ图片.../wallpaper 图）。
-    #    每次部署都会把它复制到 ~/.local/share/backgrounds/wallpaper.<ext>（若文件已存在且
-    #    相同则跳过；之前不显示是因为早退逻辑/未主动 set——这里不早退，并最终主动 set）。
-    for _cand in "$BASE_DIR"/*.jpg "$BASE_DIR"/*.jpeg "$BASE_DIR"/*.png "$BASE_DIR"/*.webp; do
+    # 1) 仓库根目录那张图（QQ图片....jpeg / wallpaper.*）统一部署为
+    #    ~/.local/share/backgrounds/wallpaper.jpg，hyprlock 与 waypaper 都指向它。
+    mkdir -p "$HOME_DIR/.local/share/backgrounds"
+    for _cand in "$BASE_DIR"/QQ图片*.jpeg "$BASE_DIR"/QQ图片*.jpg "$BASE_DIR"/*.jpg "$BASE_DIR"/*.jpeg "$BASE_DIR"/*.png "$BASE_DIR"/*.webp; do
         [ -f "$_cand" ] || continue
-        case "$_cand" in *.jpg|*.jpeg) _ext=jpg;; *.png) _ext=png;; *.webp) _ext=webp;; *) continue;; esac
-        mkdir -p "$HOME_DIR/.local/share/backgrounds"
-        _img="$HOME_DIR/.local/share/backgrounds/wallpaper.$_ext"
+        _img="$HOME_DIR/.local/share/backgrounds/wallpaper.jpg"
         if [ ! -f "$_img" ] || ! cmp -s "$_cand" "$_img" 2>/dev/null; then
             cp -f "$_cand" "$_img" 2>/dev/null || true
         fi
@@ -2246,12 +2257,18 @@ PYEOF
             fi
             chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_wpconf" 2>/dev/null || true
         fi
-        # 修正 hyprlock 锁屏壁纸路径（参考机绝对路径在新机器上无效 → 锁屏背景空白）
         local _hlconf="$HOME_DIR/.config/hypr/hyprlock.conf"
-        if [ -f "$_hlconf" ] && grep -qE '^\s*path\s*=' "$_hlconf" 2>/dev/null; then
+        if [ -f "$_hlconf" ]; then
             log "$(_t "hyprlock wallpaper path -> " "hyprlock wallpaper path -> ") $_img"
             sed -i -E "s#^(\s*path\s*=).*#\1 $_img#" "$_hlconf" 2>/dev/null || true
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_hlconf" 2>/dev/null || true
+            sed -i 's/JetBrains Mono Nerd Font/JetBrainsMono Nerd Font/g' "$_hlconf" 2>/dev/null || true
+        fi
+        if [ -d "$HOME_DIR/.config/hypr" ]; then
+            chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/hypr" 2>/dev/null || true
+        fi
+        if [ -f "$_wpconf" ]; then
+            sed -i "s#^wallpaper\s*=.*#wallpaper = $_img#" "$_wpconf" 2>/dev/null || true
+            sed -i "s#^folder\s*=.*#folder = $HOME_DIR/.local/share/backgrounds#" "$_wpconf" 2>/dev/null || true
         fi
         # 主动 set：只写状态文件不够——显式让 awww-daemon 应用这张壁纸（daemon 若已响应
         # 自己读状态文件并应用；此处再主动调用一次确保生效，失败不影响已写状态）。
@@ -3812,15 +3829,16 @@ stage_configs() {
             done < <(sed -n 's/^ExecStart=//p' "$_sf" 2>/dev/null)
         done
 
-        # waybar 由 GDM/systemd session 启动；niri 中的 spawn-at-startup 会
-        # 产生第二个实例，因此将该启动项注释掉。
-        if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
-            && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
-            sed -i -E 's/^([[:space:]]*)spawn-at-startup[[:space:]]+"waybar"/\1# spawn-at-startup "waybar" (started by GDM\/systemd)/' "$HOME_DIR/.config/niri/config.kdl"
+        if [ -f "$HOME_DIR/.config/niri/config.kdl" ]; then
+            # spawn-at-startup "hyprlock" locks the session the instant niri starts.
+            # If hyprlock then fails (missing wallpaper/font), the whole desktop is black.
+            if grep -qE '^[[:space:]]*spawn-at-startup[[:space:]]+"hyprlock"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
+                sed -i -E 's/^([[:space:]]*)spawn-at-startup[[:space:]]+"hyprlock".*/\1\/\/ spawn-at-startup "hyprlock" (idle lock is hypridle)/' "$HOME_DIR/.config/niri/config.kdl"
+                log "$(_t "Disabled spawn-at-startup hyprlock (was locking the session immediately → black screen)" "Disabled spawn-at-startup hyprlock (was locking the session immediately → black screen)")"
+            fi
+            sed -i 's#polkit-gnome-authenntication-agent-1#polkit-gnome-authentication-agent-1#g' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
+            sed -i 's#spawn-at-startup "swww-daemon"#spawn-at-startup "awww-daemon"#' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
             chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
-            pkill -u "$TARGET_USER" -x waybar 2>/dev/null || true
-            sleep 1
-            log "$(_t "Disabled niri Waybar startup; GDM/systemd will provide the only instance" "Disabled niri Waybar startup; GDM/systemd will provide the only instance")"
         fi
 
         # 光标拖影：QEMU/KVM 虚拟机常因虚拟硬件 cursor plane 与 Niri 不兼容。
@@ -3833,12 +3851,11 @@ stage_configs() {
                 qemu|kvm)
                     local _cursor_env="$HOME_DIR/.config/environment.d/90-eilniri-cursor.conf"
                     mkdir -p "$(dirname "$_cursor_env")"
-                    if [ ! -f "$_cursor_env" ] || ! grep -q '^LIBGL_ALWAYS_SOFTWARE=' "$_cursor_env" 2>/dev/null; then
-                        printf '%s\n' 'LIBGL_ALWAYS_SOFTWARE=1' 'GALLIUM_DRIVER=llvmpipe' > "$_cursor_env"
-                        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cursor_env" 2>/dev/null || true
-                        log "$(_t "Enabled Mesa software GL fallback for QEMU/KVM (niri is not wlroots; WLR_* is ignored)" "Enabled Mesa software GL fallback for QEMU/KVM (niri is not wlroots; WLR_* is ignored)")"
+                    if [ -f "$_cursor_env" ] && grep -qE 'LIBGL_ALWAYS_SOFTWARE|GALLIUM_DRIVER|WLR_' "$_cursor_env" 2>/dev/null; then
+                        rm -f "$_cursor_env"
+                        log "$(_t "Removed Mesa software-GL / WLR env (forces black screen on niri after login)" "Removed Mesa software-GL / WLR env (forces black screen on niri after login)")"
                     fi
-                    warn "$(_t "检测到 QEMU/KVM：已启用软件光标回退。若仍有拖影，请将虚拟显卡设为 virtio-gpu 并开启 3D 加速（gl=on），或改用 SPICE 显示协议。" "QEMU/KVM detected: software cursor fallback is enabled. If ghosting remains, use virtio-gpu with 3D acceleration (gl=on), or use the SPICE display protocol.")"
+                    warn "$(_t "检测到 QEMU/KVM。niri 不是 wlroots，不要设 WLR_* / LIBGL_ALWAYS_SOFTWARE。请将虚拟显卡设为 virtio-gpu 并开启 3D 加速（gl=on），或改用 SPICE。" "QEMU/KVM detected. niri is not wlroots — do not set WLR_* / LIBGL_ALWAYS_SOFTWARE. Use virtio-gpu with 3D (gl=on), or SPICE.")"
                     ;;
             esac
         fi
@@ -4133,19 +4150,7 @@ stage_hardware_adapt() {
         return
     fi
 
-    # resolution format: 1920x1080 -> mode "1920x1080@60"
-    local mode_line=""
-    if [ -n "$detected_mode" ]; then
-        local w h refresh
-        w=$(echo "$detected_mode" | cut -dx -f1)
-        h=$(echo "$detected_mode" | cut -dx -f2)
-        # EDID offset 12 is NOT the refresh rate; proper refresh requires parsing
-        # the detailed timing descriptor. Default to 60Hz to avoid bogus values.
-        refresh=60
-        mode_line="mode \"${w}x${h}@${refresh}\""
-    fi
-
-    info_kv "$(_t "Detected output" "Detected output")" "$detected_out" "${detected_mode:-?}"
+    info_kv "$(_t "Detected output" "Detected output")" "$detected_out" "${detected_mode:-preferred}"
 
     # --- 2) fix niri config ---
     if [ -f "$niri_cfg" ]; then
@@ -4164,13 +4169,12 @@ stage_hardware_adapt() {
                 found_output=1
                 in_first_output=1
                 echo "output \"$detected_out\" {" >> "$tmp"
-                [ -n "$mode_line" ] && echo "    $mode_line" >> "$tmp"
                 continue
             fi
             if [ "$in_first_output" -eq 1 ]; then
-                # skip mode lines inside the original output block
+                # Drop a previously injected mode "WxH@60". niri will pick the
+                # connector's preferred mode; a wrong refresh keeps the output inactive.
                 if echo "$line" | grep -qP '^\s*mode\s+"'; then
-                    [ -n "$mode_line" ] && echo "    $mode_line" >> "$tmp" || echo "$line" >> "$tmp"
                     continue
                 fi
                 if echo "$line" | grep -qP '^\s*\}'; then
@@ -4333,10 +4337,9 @@ do_restore() {
     stage_preflight
     unmask_gdm_wayland
     ensure_debian_graphics_runtime
-    install_niri_output_wrapper
-    _patch_niri_user_units
     ensure_fzf
     detect_target_user
+    repair_niri_blackscreen
 
     if stage_apps_select; then
         stage_apps_install
