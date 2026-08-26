@@ -64,7 +64,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.26"
+SCRIPT_VERSION="1.9.27"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -312,12 +312,25 @@ WAYPAPER_REPO="https://github.com/anufrievroman/waypaper"
 # absent and build_hypr_stack() compiles them from source in dependency order first.
 # Missing entries are tolerated (apt_install_tolerant / dnf_install_tolerant), so a
 # package absent on an older release never aborts the whole build-deps step.
-HYPR_BUILD_DEPS_DEB=(build-essential cmake ninja-build pkg-config git libwayland-dev wayland-protocols hyprland-protocols
-    libpango1.0-dev libgbm-dev libdrm-dev libxkbcommon-dev libxcb1-dev
+HYPR_BUILD_DEPS_DEB=(build-essential g++ cmake ninja-build pkg-config git libwayland-dev wayland-protocols hyprland-protocols
+    libpango1.0-dev libgbm-dev libdrm-dev libxkbcommon-dev libxcb1-dev libinput-dev
     libcairo2-dev libpam0g-dev libpixman-1-dev libjpeg-dev libwebp-dev
     librsvg2-dev libmagic-dev libpng-dev libpugixml-dev
     libhyprutils-dev libhyprlang-dev libhyprgraphics-dev libhyprcursor-dev
     libsdbus-c++-dev hyprwayland-scanner)
+# Mesa/DRM runtime (not -dev). Server/cloud images can compile niri then black-screen
+# at the greeter because there is no DRI driver. Names vary by Ubuntu/Debian release.
+DEB_GRAPHICS_RUNTIME=(libgl1-mesa-dri mesa-libgallium mesa-vulkan-drivers
+    libegl1 libegl1-mesa libgbm1 libdrm2 libglx-mesa0)
+# hyprutils master needs C++26; gcc 12 (Debian 12 / Ubuntu 22.04) cannot build it.
+# These tags stay on C++23 and still satisfy current hypridle/hyprlock cmake checks.
+HYPR_PIN_CXX23_SCANNER="v0.4.4"
+HYPR_PIN_CXX23_UTILS="v0.8.4"
+HYPR_PIN_CXX23_LANG="v0.6.3"
+HYPR_PIN_CXX23_GRAPHICS="v0.1.3"
+HYPR_PIN_CXX23_PROTOCOLS="v0.6.4"
+HYPR_PIN_CXX23_IDLE="v0.1.7"
+HYPR_PIN_CXX23_LOCK="v0.7.1"
 FCITX5_RIME_REPO="https://github.com/fcitx/fcitx5-rime"
 LIBRIME_REPO="https://github.com/rime/librime"
 
@@ -684,10 +697,31 @@ install_niri_output_wrapper() {
 #!/usr/bin/env bash
 set -u
 
+export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:${PATH:-}"
 cfg="${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl"
 tmp="${cfg}.eilniri-output.$$"
-export WLR_NO_HARDWARE_CURSORS=1
-export WLR_RENDERER_ALLOW_SOFTWARE=1
+
+# niri is smithay, not wlroots — WLR_* does nothing. On VMs without a
+# hardware cursor plane, point Mesa at the first DRM render node instead.
+if [ -z "${NIRI_RENDER_DRM_DEVICE:-}" ]; then
+    for _rn in /dev/dri/renderD*; do
+        [ -e "$_rn" ] || continue
+        export NIRI_RENDER_DRM_DEVICE="$_rn"
+        break
+    done
+fi
+if [ -z "${LIBGL_ALWAYS_SOFTWARE:-}" ] && [ -d /sys/class/drm ]; then
+    _connected=0
+    for _st in /sys/class/drm/card*-*/status; do
+        [ -f "$_st" ] || continue
+        [ "$(<"$_st")" = connected ] && _connected=1 && break
+    done
+    if [ "$_connected" -eq 0 ]; then
+        export LIBGL_ALWAYS_SOFTWARE=1
+        export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
+    fi
+fi
+
 out=""; mode=""
 for status in /sys/class/drm/card*-*/status; do
     [ -f "$status" ] || continue
@@ -700,31 +734,139 @@ for status in /sys/class/drm/card*-*/status; do
     out="$candidate"; mode="$candidate_mode"; break
 done
 
-if [ -n "$out" ] && [ -n "$mode" ] && [ -f "$cfg" ]; then
-    w=${mode%x*}; h=${mode#*x}; mode_line="mode \"${w}x${h}@60\""
+# Rewrite only the first output *name* and *mode*. Keep scale/transform/etc.
+if [ -n "$out" ] && [ -f "$cfg" ]; then
+    w=${mode%x*}; h=${mode#*x}
+    [ -n "$mode" ] && mode_line="mode \"${w}x${h}@60\"" || mode_line=""
     awk -v output="$out" -v mode_line="$mode_line" '
         BEGIN { replaced=0; inside=0 }
         !replaced && $0 ~ /^[[:space:]]*output[[:space:]]+"/ {
-            print "output \"" output "\" {"; print "    " mode_line
+            print "output \"" output "\" {"
             replaced=1; inside=1; next
         }
-        inside && $0 ~ /^[[:space:]]*}/ { print "}"; inside=0; next }
-        inside { next }
+        inside && mode_line != "" && $0 ~ /^[[:space:]]*mode[[:space:]]+"/ {
+            print "    " mode_line; next
+        }
+        inside && $0 ~ /^[[:space:]]*}/ { print; inside=0; next }
         { print }
     ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
 fi
 
-export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:${PATH:-}"
 if [ -x /usr/local/bin/niri-session.real ]; then
     exec /usr/local/bin/niri-session.real "$@"
 fi
 if command -v niri-session >/dev/null 2>&1; then
     exec niri-session "$@"
 fi
+if [ -x /usr/local/bin/niri ]; then
+    exec /usr/local/bin/niri --session "$@"
+fi
 echo "eilNiri: niri-session launcher is missing" >&2
 exit 127
 WRAPEOF
     chmod 755 "$_wrapper"
+}
+
+# systemd user units ship `ExecStart=niri --session`. GDM/sddm user sessions
+# often omit /usr/local/bin from PATH → unit fails → greeter black screen.
+_patch_niri_user_units() {
+    local _f
+    for _f in /usr/lib/systemd/user/niri.service /usr/local/lib/systemd/user/niri.service; do
+        [ -f "$_f" ] || continue
+        if [ -x /usr/local/bin/niri ]; then
+            sed -i 's#^ExecStart=niri #ExecStart=/usr/local/bin/niri #' "$_f" 2>/dev/null || true
+            sed -i 's#^ExecStart=/usr/bin/niri #ExecStart=/usr/local/bin/niri #' "$_f" 2>/dev/null || true
+        elif command -v niri >/dev/null 2>&1; then
+            local _niri
+            _niri=$(command -v niri)
+            sed -i "s#^ExecStart=niri #ExecStart=$_niri #" "$_f" 2>/dev/null || true
+        fi
+    done
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+}
+
+ensure_debian_graphics_runtime() {
+    [ "$DISTRO_FAMILY" = debian ] || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("${DEB_GRAPHICS_RUNTIME[@]}")
+        return "$DRY_RUN_RC"
+    fi
+    local _pkg _have=()
+    for _pkg in "${DEB_GRAPHICS_RUNTIME[@]}"; do
+        apt-cache policy "$_pkg" 2>/dev/null | grep -qE '^ ?Candidate: [^ (]' || continue
+        pkg_installed "$_pkg" && continue
+        _have+=("$_pkg")
+    done
+    [ ${#_have[@]} -eq 0 ] && return 0
+    log "$(_t "Installing Mesa/DRM runtime for niri (prevents greeter black screen)..." "Installing Mesa/DRM runtime for niri (prevents greeter black screen)...")"
+    apt_install_tolerant "${_have[@]}" || warn "$(_t "Some Mesa/DRM runtime packages could not be installed; niri may black-screen without DRI." "Some Mesa/DRM runtime packages could not be installed; niri may black-screen without DRI.")"
+}
+
+ensure_hypr_cxx_toolchain() {
+    [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
+    local _need=(build-essential g++ cmake ninja-build pkg-config git)
+    local _p _missing=()
+    for _p in "${_need[@]}"; do
+        pkg_installed "$_p" || _missing+=("$_p")
+    done
+    if [ ${#_missing[@]} -gt 0 ]; then
+        log "$(_t "Installing C++ toolchain for hyprlock/hypridle..." "Installing C++ toolchain for hyprlock/hypridle...")"
+        if ! pm_install "${_missing[@]}"; then
+            apt_install_tolerant "${_missing[@]}" || true
+        fi
+    fi
+    command -v cmake >/dev/null 2>&1 || { MANUAL_ITEMS+=("hypr — cmake missing; install: apt-get install cmake ninja-build build-essential"); return 1; }
+    command -v ninja >/dev/null 2>&1 || command -v ninja-build >/dev/null 2>&1 || {
+        MANUAL_ITEMS+=("hypr — ninja missing; install: apt-get install ninja-build")
+        return 1
+    }
+    local _cxx="" _c
+    _cxx_ok() { echo 'int main(){return 0;}' | "$1" -std="$2" -x c++ - -fsyntax-only >/dev/null 2>&1; }
+    for _c in g++ g++-14 g++-13 g++-12 clang++ clang++-18 clang++-17; do
+        command -v "$_c" >/dev/null 2>&1 || continue
+        if _cxx_ok "$_c" c++23; then
+            _cxx="$_c"
+            break
+        fi
+    done
+    if [ -z "$_cxx" ]; then
+        apt_install_tolerant g++-14 g++-13 clang-18 || true
+        for _c in g++-14 g++-13 clang++-18 clang++; do
+            command -v "$_c" >/dev/null 2>&1 || continue
+            if _cxx_ok "$_c" c++23; then
+                _cxx="$_c"
+                break
+            fi
+        done
+    fi
+    if [ -z "$_cxx" ]; then
+        MANUAL_ITEMS+=("hypr — no C++23 compiler (g++/clang++); install: apt-get install build-essential g++-13")
+        return 1
+    fi
+    export CXX="$_cxx"
+    export CC="${CC:-gcc}"
+    command -v gcc >/dev/null 2>&1 && export CC=gcc
+    log "$(_t "Hypr C++ toolchain: " "Hypr C++ toolchain: ")$CXX (C++23 OK)"
+    HYPR_NEED_CXX23_PIN=0
+    if ! _cxx_ok "$CXX" c++26; then
+        HYPR_NEED_CXX23_PIN=1
+        log "$(_t "Compiler has no C++26 — pinning hypr* to C++23 release tags" "Compiler has no C++26 — pinning hypr* to C++23 release tags")"
+    fi
+    return 0
+}
+
+hypr_git_ref() { # $1 = component name
+    [ "${HYPR_NEED_CXX23_PIN:-0}" -eq 1 ] || { echo ""; return 0; }
+    case "$1" in
+        hyprwayland-scanner) echo "$HYPR_PIN_CXX23_SCANNER" ;;
+        hyprutils)           echo "$HYPR_PIN_CXX23_UTILS" ;;
+        hyprlang)            echo "$HYPR_PIN_CXX23_LANG" ;;
+        hyprgraphics)        echo "$HYPR_PIN_CXX23_GRAPHICS" ;;
+        hyprland-protocols)  echo "$HYPR_PIN_CXX23_PROTOCOLS" ;;
+        hypridle)            echo "$HYPR_PIN_CXX23_IDLE" ;;
+        hyprlock)            echo "$HYPR_PIN_CXX23_LOCK" ;;
+        *)                   echo "" ;;
+    esac
 }
 
 # --- Debian/Ubuntu apt mirror switch (offered when apt-get update or install fails ---
@@ -895,6 +1037,7 @@ stage_preflight() {
                     warn "$(_t "System update partially failed, continuing." "System update partially failed, continuing.")"
                 fi
                 pm_install curl tar unzip
+                ensure_debian_graphics_runtime
                 # Generate the zh_CN / en_US locales: envvars.conf sets LANG=zh_CN.UTF-8 and
                 # a missing locale triggers noisy "cannot set locale" warnings on every command.
                 if ! command -v locale-gen >/dev/null 2>&1; then
@@ -1062,21 +1205,28 @@ github_release_asset() { # $1=repo owner/name, $2=asset regex
 # Clone a GitHub repo, falling back to the CN mirror proxies when direct git fails
 # (git smart-HTTP works through ghfast.top and friends; verified with git ls-remote).
 # Bounded so a blocked GitHub never hangs the install (git has no default timeout).
-git_clone_gh() { # $1 = github repo URL, $2 = dest dir; returns 0 on success
-    local repo="$1" dest="$2" prox full
+git_clone_gh() { # $1 = github repo URL, $2 = dest dir, $3 = optional tag/branch
+    local repo="$1" dest="$2" ref="${3:-}" prox full
     [ -n "$repo" ] && [ -n "$dest" ] || return 1
-    if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
-        clone --depth 1 "$repo" "$dest" >/dev/null 2>&1; then
-        return 0
+    if [ -n "$ref" ]; then
+        git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+            clone --depth 1 --branch "$ref" "$repo" "$dest" >/dev/null 2>&1 && return 0
+        for prox in ${EILNIRI_GH_PROXY:-${GH_MIRRORS:-}}; do
+            full="${prox%/}/$repo"
+            rm -rf "$dest"
+            git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+                clone --depth 1 --branch "$ref" "$full" "$dest" >/dev/null 2>&1 && return 0
+        done
+    else
+        git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+            clone --depth 1 "$repo" "$dest" >/dev/null 2>&1 && return 0
+        for prox in ${EILNIRI_GH_PROXY:-${GH_MIRRORS:-}}; do
+            full="${prox%/}/$repo"
+            rm -rf "$dest"
+            git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+                clone --depth 1 "$full" "$dest" >/dev/null 2>&1 && return 0
+        done
     fi
-    for prox in ${EILNIRI_GH_PROXY:-${GH_MIRRORS:-}}; do
-        full="${prox%/}/$repo"
-        rm -rf "$dest"
-        if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
-            clone --depth 1 "$full" "$dest" >/dev/null 2>&1; then
-            return 0
-        fi
-    done
     return 1
 }
 
@@ -1277,6 +1427,7 @@ _repair_niri_session() {
                 [ -f "$_unit" ] || continue
                 exe install -Dm644 "$_unit" "/usr/lib/systemd/user/$(basename "$_unit")" 2>/dev/null || true
             done
+            _patch_niri_user_units
             INSTALLED_PKGS+=("niri (session file repaired from source v$ver)")
             success "$(_t "niri session file repaired" "niri session file repaired")"
             return 0
@@ -1363,7 +1514,12 @@ _pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔）
         dbus-1)            echo "libdbus-1-dev" ;;
         pango)             echo "libpango1.0-dev" ;;
         gbm)               echo "libgbm-dev" ;;
-        egl)               echo "libegl1-mesa-dev" ;;
+        egl)               echo "libegl-dev libegl1-mesa-dev" ;;
+        sdbus-c++)         echo "libsdbus-c++-dev" ;;
+        hyprlang)          echo "libhyprlang-dev" ;;
+        hyprutils)         echo "libhyprutils-dev" ;;
+        hyprland-protocols) echo "hyprland-protocols" ;;
+        wayland-protocols) echo "wayland-protocols" ;;
         liblz4)            echo "liblz4-dev" ;;
         lz4)               echo "liblz4-dev" ;;
         dav1d)             echo "libdav1d-dev" ;;
@@ -1530,6 +1686,7 @@ _ensure_niri_units() {
         done
     fi
     if [ "$_ok" -eq 1 ]; then
+        _patch_niri_user_units
         log "$(_t "niri systemd user units installed (/usr/lib/systemd/user)" "niri systemd user units installed (/usr/lib/systemd/user)")"
         return 0
     fi
@@ -1542,7 +1699,14 @@ install_niri_binary() {
         if [ -f /usr/share/wayland-sessions/niri.desktop ] || [ -f /usr/local/share/wayland-sessions/niri.desktop ]; then
             SKIPPED_PKGS+=("niri (already installed)")
             ensure_localbin_on_path
+            ensure_debian_graphics_runtime
+            install_niri_output_wrapper
             _ensure_niri_units   # 旧版脚本/手动装的 niri 可能缺 systemd units → GDM 登录循环
+            _patch_niri_user_units
+            for _desk in /usr/local/share/wayland-sessions/niri.desktop /usr/share/wayland-sessions/niri.desktop; do
+                [ -f "$_desk" ] || continue
+                sed -i 's#^Exec=.*#Exec=/usr/local/bin/eilniri-niri-session#' "$_desk"
+            done
             return 0
         fi
         log "$(_t "niri binary found but niri.desktop missing; repairing session file..." "niri binary found but niri.desktop missing; repairing session file...")"
@@ -1864,6 +2028,7 @@ install_niri_from_build() { # $1 = srcdir, $2 = logfile
             exe install -Dm644 "$_unit" "/usr/lib/systemd/user/$(basename "$_unit")" 2>/dev/null && _unit_installed=1
         done
         if [ "$_unit_installed" -eq 1 ]; then
+            _patch_niri_user_units
             log "$(_t "niri systemd user units installed (/usr/lib/systemd/user)" "niri systemd user units installed (/usr/lib/systemd/user)")"
         else
             warn "$(_t "niri systemd user units not found in source resources/ — GDM 登录可能循环; 手动创建 /usr/lib/systemd/user/niri.service 与 niri-shutdown.target" "niri systemd user units not found in source resources/ — GDM 登录可能循环; 手动创建 /usr/lib/systemd/user/niri.service 与 niri-shutdown.target")"
@@ -2368,7 +2533,7 @@ hypridle_pkgconfig_check() {
         )
     fi
     if [ ${#_hypr_pcs[@]} -eq 0 ]; then
-        _hypr_pcs=(wayland-client xkbcommon pixman-1 libdrm egl gbm sdbus++ libinput)
+        _hypr_pcs=(wayland-client wayland-protocols hyprlang hyprutils sdbus-c++ hyprland-protocols)
     fi
     for pc in "${_hypr_pcs[@]}"; do
         pkg-config --exists "$pc" 2>/dev/null || missing+=("$pc")
@@ -2702,26 +2867,28 @@ install_xwayland_satellite() {
 # in dependency order. On distros where the stack is packaged (Fedora base, Ubuntu
 # 25.10+/Debian 13+ universe) these -devel packages were already installed above and
 # this whole function is a no-op. On Rocky/Alma/CentOS Stream none of it is packaged,
-# so we compile hyprwayland-scanner -> hyprutils -> hyprlang -> hyprgraphics and
-# install each to /usr (cmake configs land in /usr/lib64/cmake/), letting each later
-# component's find_package/hyprutils-config.cmake resolve in the default search path.
-# Each component is skipped if it is already resolvable (installed as a package).
-build_hypr_stack() {
+# so we compile hyprwayland-scanner -> hyprutils -> hyprlang -> hyprland-protocols
+# (and hyprgraphics only for hyprlock). Each later component's find_package /
+# pkg-config then resolves from /usr/local. Skip a component when already packaged.
+build_hypr_stack() { # $1 = optional target (hypridle|hyprlock); default both
     [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
+    local _want="${1:-all}"
     local _log="$LOG_DIR/hypr-stack.log"
-    if [ -f "$LOG_DIR/hypr-stack.ok" ] && command -v hyprwayland-scanner >/dev/null 2>&1; then
-        return 0
+    if ! ensure_hypr_cxx_toolchain; then
+        return 1
     fi
+    prepare_debian_pkgconfig
+    prepare_hypr_cmake_paths
+
     local _work
     _work=$(mktemp -d)
     register_temp_path "$_work"
 
     local _prefix=/usr/local _libdir=lib
     [ "$DISTRO_FAMILY" != debian ] && _prefix=/usr && _libdir=lib64
-    prepare_hypr_cmake_paths
     export CMAKE_PREFIX_PATH="$_prefix:/usr:${CMAKE_PREFIX_PATH:-}"
     local _pc_dir
-    for _pc_dir in /usr/local/lib/pkgconfig /usr/local/lib64/pkgconfig /usr/lib/pkgconfig /usr/lib/*/pkgconfig; do
+    for _pc_dir in /usr/local/lib/pkgconfig /usr/local/lib64/pkgconfig /usr/lib/pkgconfig /usr/lib/*/pkgconfig /usr/share/pkgconfig /usr/local/share/pkgconfig; do
         [ -d "$_pc_dir" ] || continue
         case ":${PKG_CONFIG_PATH:-}:" in
             *":$_pc_dir:"*) ;;
@@ -2730,20 +2897,54 @@ build_hypr_stack() {
     done
     export PKG_CONFIG_PATH
 
-    # Build+install one component into a predictable prefix. Returns 0 on success.
+    _hypr_ok() { # $1 = name
+        local n="$1" d
+        case "$n" in
+            hyprwayland-scanner)
+                command -v hyprwayland-scanner >/dev/null 2>&1 && return 0
+                return 1
+                ;;
+            hyprland-protocols)
+                pkg-config --exists hyprland-protocols 2>/dev/null && return 0
+                return 1
+                ;;
+            hyprutils|hyprlang|hyprgraphics)
+                pkg-config --exists "$n" 2>/dev/null && return 0
+                for d in /usr/lib/cmake/"$n" /usr/lib64/cmake/"$n" /usr/local/lib/cmake/"$n" /usr/local/lib64/cmake/"$n"; do
+                    [ -d "$d" ] && find "$d" -maxdepth 1 -iname '*.cmake' 2>/dev/null | grep -qi . && return 0
+                done
+                return 1
+                ;;
+        esac
+        return 1
+    }
+
     _build_hypr_one() { # $1 = name
-        local n="$1" component_log="$_log-$1.log"
-        printf '\n=== %s ===\n' "$n" >>"$_log"
-        if git_clone_gh "https://github.com/hyprwm/$n" "$_work/$n" >/dev/null 2>&1 \
-           && ( cd "$_work/$n" \
+        local n="$1" component_log="$_log-$1.log" ref
+        ref=$(hypr_git_ref "$n")
+        printf '\n=== %s (ref=%s cxx=%s) ===\n' "$n" "${ref:-HEAD}" "${CXX:-}" >>"$_log"
+        rm -rf "$_work/$n"
+        if ! git_clone_gh "https://github.com/hyprwm/$n" "$_work/$n" "$ref"; then
+            warn "$(_t "Hypr clone failed: " "Hypr clone failed: ")$n"
+            echo "clone failed for $n ref=$ref" >>"$component_log"
+            cat "$component_log" >>"$_log" 2>/dev/null || true
+            return 1
+        fi
+        local _std=()
+        [ "${HYPR_NEED_CXX23_PIN:-0}" -eq 1 ] && _std=(-DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON)
+        if ( cd "$_work/$n" \
                 && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    ${CXX:+-DCMAKE_CXX_COMPILER="$CXX"} \
+                    ${CC:+-DCMAKE_C_COMPILER="$CC"} \
+                    "${_std[@]}" \
                     -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" -DCMAKE_MODULE_PATH="$CMAKE_MODULE_PATH" \
                     -DCMAKE_INSTALL_PREFIX="$_prefix" -DCMAKE_INSTALL_LIBDIR="$_libdir" \
                 && cmake --build build -j"$(nproc)" \
-                 && cmake --install build \
-                && command -v ldconfig >/dev/null 2>&1 && ldconfig || true ) >"$component_log" 2>&1; then
+                && cmake --install build \
+                && { command -v ldconfig >/dev/null 2>&1 && ldconfig || true; } ) >"$component_log" 2>&1; then
             INSTALLED_PKGS+=("hypr-$n (source build)")
             log "$(_t "Built " "Built ") hypr-$n$(_t " from source" " from source")"
+            prepare_hypr_cmake_paths
             return 0
         fi
         cat "$component_log" >>"$_log" 2>/dev/null || true
@@ -2751,30 +2952,18 @@ build_hypr_stack() {
         return 1
     }
 
-    # Skip a component when the packaged -devel is already available:
-    #   hyprwayland-scanner  -> `hyprwayland-scanner` binary on PATH
-    #   hyprutils/hyprlang/...-> its cmake config under /usr/lib{,64}/cmake/<name>/
-    _hypr_ok() { # $1 = name (also the cmake config dir basename)
-        local n="$1" d
-        case "$n" in
-            hyprwayland-scanner) command -v hyprwayland-scanner >/dev/null 2>&1 && return 0 ;;
-            *)
-                for d in /usr/lib/cmake/"$n" /usr/lib64/cmake/"$n" /usr/local/lib/cmake/"$n" /usr/local/lib64/cmake/"$n"; do
-                    [ -d "$d" ] && find "$d" -maxdepth 1 -iname '*.cmake' 2>/dev/null | grep -qi . && return 0
-                done
-                ;;
-        esac
-        return 1
-    }
-
-    # Strict dependency order. hyprcursor is not required by hyprlock/hypridle builds,
-    # so don't force it (keeps the chain shorter and less likely to fail).
-    _hypr_ok hyprwayland-scanner "hyprwayland" || _build_hypr_one hyprwayland-scanner || return 1
-    _hypr_ok hyprutils "hyprutils" || _build_hypr_one hyprutils || return 1
-    _hypr_ok hyprlang "hyprlang" || _build_hypr_one hyprlang || return 1
-    _hypr_ok hyprgraphics "hyprgraphics" || _build_hypr_one hyprgraphics || return 1
-    touch "$LOG_DIR/hypr-stack.ok"
-    return 0
+    _hypr_ok hyprwayland-scanner || _build_hypr_one hyprwayland-scanner || return 1
+    _hypr_ok hyprutils || _build_hypr_one hyprutils || return 1
+    _hypr_ok hyprlang || _build_hypr_one hyprlang || return 1
+    _hypr_ok hyprland-protocols || _build_hypr_one hyprland-protocols || return 1
+    if [ "$_want" = hyprlock ] || [ "$_want" = all ]; then
+        _hypr_ok hyprgraphics || _build_hypr_one hyprgraphics || return 1
+    fi
+    if _hypr_ok hyprwayland-scanner && _hypr_ok hyprutils && _hypr_ok hyprlang && _hypr_ok hyprland-protocols; then
+        touch "$LOG_DIR/hypr-stack.ok"
+        return 0
+    fi
+    return 1
 }
 
 # --- hyprlock / hypridle source build (fallback when no apt/dnf package) ---
@@ -2796,7 +2985,6 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         return "$DRY_RUN_RC"
     fi
 
-    # build deps (tolerant: many hypr deps are absent on older releases / Rocky/Alma)
     local _brc=0
     if [ "$DISTRO_FAMILY" = debian ]; then
         prepare_debian_pkgconfig
@@ -2807,17 +2995,23 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
                 return 0
             fi
         fi
+        if ! ensure_hypr_cxx_toolchain; then
+            MANUAL_ITEMS+=("$pkg — C++ toolchain missing (g++/cmake/ninja); install: apt-get install build-essential cmake ninja-build")
+            return 1
+        fi
         apt_install_tolerant "${HYPR_BUILD_DEPS_DEB[@]}" || _brc=$?
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+            warn "$(_t "Some $pkg build deps unavailable (continuing with source stack):" "Some $pkg build deps unavailable (continuing with source stack):") ${BDEPS_MISSING[*]}"
+        fi
+        if ! command -v g++ >/dev/null 2>&1 && ! command -v clang++ >/dev/null 2>&1; then
+            MANUAL_ITEMS+=("$pkg — C++ compiler still missing after apt; install: apt-get install build-essential g++")
+            return 1
         fi
     else
         dnf_install_tolerant "${HYPR_BUILD_DEPS_RHEL[@]}" || _brc=$?
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
             warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
         fi
-        # EL names pam-devel (not libpam-devel). Force it so hyprlock's
-        # find_library(PAM) / pkg_check_modules(PAM) succeeds.
         dnf_install_tolerant pam-devel sdbus-cpp-devel || true
         if [ ! -f /usr/include/security/pam_appl.h ] && [ ! -f /usr/include/pam/pam_appl.h ]; then
             MANUAL_ITEMS+=("$pkg — pam-devel missing (libpam not found); install: dnf install pam-devel, then rerun")
@@ -2827,15 +3021,14 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     local work
     work=$(mktemp -d)
     register_temp_path "$work"
-    log "$(_t "Cloning " "Cloning ") $pkg ($repo)..."
-    if ! git_clone_gh "$repo" "$work/$pkg"; then
+    local _ref
+    _ref=$(hypr_git_ref "$pkg")
+    log "$(_t "Cloning " "Cloning ") $pkg ($repo${_ref:+ @ $_ref})..."
+    if ! git_clone_gh "$repo" "$work/$pkg" "$_ref"; then
         MANUAL_ITEMS+=("$pkg — git clone failed (direct + CN mirrors), build manually: $repo")
         return 1
     fi
 
-    # hyprlock/hypridle migrated from Rust to C++/CMake: the repos no longer contain
-    # a Cargo.toml (only CMakeLists.txt). Detect the build system instead of blindly
-    # running `cargo build` (which used to die with "could not find Cargo.toml").
     local logf="$LOG_DIR/$pkg-build.log" _bin=""
     if [ -f "$work/$pkg/Cargo.toml" ]; then
         if ! ensure_rust; then
@@ -2846,29 +3039,35 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         ( cd "$work/$pkg" && cargo build --release ) > "$logf" 2>&1
         _bin="$work/$pkg/target/release/$pkg"
     elif [ -f "$work/$pkg/CMakeLists.txt" ]; then
-        # CMake build needs hyprwayland-scanner + hyprlang/hyprgraphics/hyprutils;
-        # build the hypr C++ stack from source iff those aren't already packaged.
-        if ! build_hypr_stack; then
-            warn "$(_t "Hypr C++ stack failed; attempting the target build with installed pkg-config components." "Hypr C++ stack failed; attempting the target build with installed pkg-config components.")"
+        if ! build_hypr_stack "$pkg"; then
+            MANUAL_ITEMS+=("$pkg — hypr C++ stack (hyprwayland-scanner/hyprutils/hyprlang/hyprland-protocols) failed; see $LOG_DIR/hypr-stack.log")
+            return 1
         fi
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
-        if [ "$pkg" = hypridle ] && ! hypridle_pkgconfig_check; then
-            warn "$(_t "Some optional hypridle pkg-config checks failed; CMake will report the exact required module." "Some optional hypridle pkg-config checks failed; CMake will report the exact required module.")"
-        fi
         prepare_debian_pkgconfig
         prepare_hypr_cmake_paths
+        if [ "$pkg" = hypridle ] && ! hypridle_pkgconfig_check "$work/$pkg/CMakeLists.txt"; then
+            warn "$(_t "hypridle pkg-config still incomplete after stack build; CMake will report the missing module." "hypridle pkg-config still incomplete after stack build; CMake will report the missing module.")"
+        fi
+        local _std=()
+        [ "${HYPR_NEED_CXX23_PIN:-0}" -eq 1 ] && _std=(-DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON)
         ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
+            ${CXX:+-DCMAKE_CXX_COMPILER="$CXX"} \
+            ${CC:+-DCMAKE_C_COMPILER="$CC"} \
+            "${_std[@]}" \
             -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
             -DCMAKE_MODULE_PATH="$CMAKE_MODULE_PATH" \
             -DPKG_CONFIG_EXECUTABLE="$(command -v pkg-config)" \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib \
-            && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
+            && cmake --build build -j"$(nproc)" \
+            && cmake --install build ) > "$logf" 2>&1
         _bin="$work/$pkg/build/$pkg"
+        [ -x "$_bin" ] || _bin=$(find "$work/$pkg/build" -type f -name "$pkg" -executable 2>/dev/null | head -1)
     else
         MANUAL_ITEMS+=("$pkg — cloned source has neither Cargo.toml nor CMakeLists.txt; build manually: $repo")
         return 1
     fi
-    if [ ! -x "$_bin" ]; then
+    if [ ! -x "$_bin" ] && [ ! -x "/usr/local/bin/$pkg" ]; then
         local tailmsg
         tailmsg=$(tail -n 6 "$logf" 2>/dev/null | tr '\n' ' ')
         MANUAL_ITEMS+=("$pkg — build failed ($tailmsg); build manually: $repo")
@@ -2876,11 +3075,12 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         return 1
     fi
 
-    exe install -Dm755 "$_bin" "/usr/local/bin/$pkg"
+    if [ -x "$_bin" ] && [ ! -x "/usr/local/bin/$pkg" ]; then
+        exe install -Dm755 "$_bin" "/usr/local/bin/$pkg"
+    fi
     INSTALLED_PKGS+=("$pkg (source build)")
     success "$(_t "$pkg built from source" "$pkg built from source")"
 
-    # hyprlock needs a PAM config to authenticate; the apt package ships one, a source build does not.
     if [ "$pkg" = hyprlock ] && [ ! -f /etc/pam.d/hyprlock ]; then
         local _pam_src="$work/$pkg/pam/hyprlock"
         mkdir -p /etc/pam.d
@@ -3688,10 +3888,10 @@ stage_configs() {
                 qemu|kvm)
                     local _cursor_env="$HOME_DIR/.config/environment.d/90-eilniri-cursor.conf"
                     mkdir -p "$(dirname "$_cursor_env")"
-                    if [ ! -f "$_cursor_env" ] || ! grep -q '^WLR_NO_HARDWARE_CURSORS=1$' "$_cursor_env" 2>/dev/null; then
-                        printf '%s\n' 'WLR_NO_HARDWARE_CURSORS=1' 'WLR_RENDERER_ALLOW_SOFTWARE=1' > "$_cursor_env"
+                    if [ ! -f "$_cursor_env" ] || ! grep -q '^LIBGL_ALWAYS_SOFTWARE=' "$_cursor_env" 2>/dev/null; then
+                        printf '%s\n' 'LIBGL_ALWAYS_SOFTWARE=1' 'GALLIUM_DRIVER=llvmpipe' > "$_cursor_env"
                         chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cursor_env" 2>/dev/null || true
-                        log "$(_t "Enabled software cursor fallback for QEMU/KVM to prevent ghosting" "Enabled software cursor fallback for QEMU/KVM to prevent ghosting")"
+                        log "$(_t "Enabled Mesa software GL fallback for QEMU/KVM (niri is not wlroots; WLR_* is ignored)" "Enabled Mesa software GL fallback for QEMU/KVM (niri is not wlroots; WLR_* is ignored)")"
                     fi
                     warn "$(_t "检测到 QEMU/KVM：已启用软件光标回退。若仍有拖影，请将虚拟显卡设为 virtio-gpu 并开启 3D 加速（gl=on），或改用 SPICE 显示协议。" "QEMU/KVM detected: software cursor fallback is enabled. If ghosting remains, use virtio-gpu with 3D acceleration (gl=on), or use the SPICE display protocol.")"
                     ;;
@@ -3760,9 +3960,32 @@ DISABLE_MANIFEST="$BASE_DIR/.system_disabled"
 
 # Older eilNiri versions masked these GDM helpers, which makes a valid niri
 # Wayland session handoff appear as an immediate black screen. Always remove
-# those stale masks on RHEL-family restores; they are never valid cleanup targets.
+# those stale masks on Debian restores too (same units as RHEL).
 unmask_gdm_wayland() {
-    return 0
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local unit
+    for unit in gdm-wayland-session.service gdm-x11-session.service gdm-launch-environment.service; do
+        systemctl unmask "$unit" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$unit" 2>/dev/null || true
+    done
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# GDM with WaylandEnable=false (or missing WaylandEnable=true) hands niri an X11
+# session that immediately black-screens. Force Wayland on for niri.
+_ensure_gdm_wayland_enabled() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _gconf
+    for _gconf in /etc/gdm/custom.conf /etc/gdm3/custom.conf; do
+        [ -f "$_gconf" ] || continue
+        if grep -qiE '^[[:space:]]*WaylandEnable[[:space:]]*=[[:space:]]*false' "$_gconf" 2>/dev/null; then
+            sed -i -E 's/^[[:space:]]*WaylandEnable[[:space:]]*=.*/WaylandEnable=true/I' "$_gconf"
+            log "$(_t "Enabled Wayland in " "Enabled Wayland in ") $_gconf"
+        elif grep -qE '^\[daemon\]' "$_gconf" 2>/dev/null && ! grep -qiE '^[[:space:]]*WaylandEnable=' "$_gconf" 2>/dev/null; then
+            sed -i '/^\[daemon\]/a WaylandEnable=true' "$_gconf"
+            log "$(_t "Set WaylandEnable=true in " "Set WaylandEnable=true in ") $_gconf"
+        fi
+    done
 }
 
 stage_disable_system() {
@@ -4002,15 +4225,15 @@ stage_hardware_adapt() {
             if [ "$in_first_output" -eq 1 ]; then
                 # skip mode lines inside the original output block
                 if echo "$line" | grep -qP '^\s*mode\s+"'; then
-                    [ -z "$mode_line" ] && echo "$line" >> "$tmp"
+                    [ -n "$mode_line" ] && echo "    $mode_line" >> "$tmp" || echo "$line" >> "$tmp"
                     continue
                 fi
                 if echo "$line" | grep -qP '^\s*\}'; then
                     in_first_output=0
-                    [ -n "$mode_line" ] && echo "}" >> "$tmp" || echo "}" >> "$tmp"
+                    echo "$line" >> "$tmp"
                     continue
                 fi
-                # skip other content inside the output block (left for the new empty block)
+                echo "$line" >> "$tmp"
                 continue
             fi
             # comment out the 2nd and later output blocks
@@ -4164,6 +4387,9 @@ do_restore() {
     # update the system first (a fresh machine has a stale package db, so installing fzf directly may fail)
     stage_preflight
     unmask_gdm_wayland
+    ensure_debian_graphics_runtime
+    install_niri_output_wrapper
+    _patch_niri_user_units
     ensure_fzf
     detect_target_user
 
@@ -4242,7 +4468,7 @@ save_diag_bundle() {
         dpkg -l 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr'
         echo
         echo "=== build logs tail ==="
-        for _f in "$LOG_DIR/niri-build.log" "$LOG_DIR/awww-build.log" "$LOG_DIR/xwayland-satellite-build.log" "$LOG_DIR/hyprlock-build.log" "$LOG_DIR/hypridle-build.log"; do
+        for _f in "$LOG_DIR/niri-build.log" "$LOG_DIR/awww-build.log" "$LOG_DIR/xwayland-satellite-build.log" "$LOG_DIR/hyprlock-build.log" "$LOG_DIR/hypridle-build.log" "$LOG_DIR/hypr-stack.log"; do
             [ -f "$_f" ] && { echo "--- $_f (tail 30) ---"; tail -n 30 "$_f" 2>/dev/null; }
         done
     } > "$_tmpdir/diag.txt" 2>/dev/null
@@ -4273,6 +4499,7 @@ ensure_gdm_session() {
         warn "$(_t "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop." "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop.")"
         return 0
     fi
+    _ensure_gdm_wayland_enabled
 
     # gdm custom.conf can override the session with DefaultSession / AutomaticLoginSession,
     # or bypass session selection entirely via AutomaticLogin (auto-login uses the default
