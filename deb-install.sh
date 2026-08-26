@@ -11,18 +11,16 @@
 #   Usage:
 #     ./deb-install.sh restore [--dry-run]     restore on new system (root)
 #     ./deb-install.sh status                  show background build progress
-#     ./deb-install.sh rollback                rollback config from backup (root)
+#     ./deb-install.sh restore-system          re-enable DE components disabled by restore (root)
 #     ./deb-install.sh --help
 #
 #   Interaction style & visual engine reference: https://github.com/SHORiN-KiWATA/shorin-arch-setup
-#   Snapshot rollback design reference:          https://github.com/ech678/NyxNiri
 # ==============================================================================
 echo "The author assumes no responsibility for any changes made to the server, computer, etc., and the author reserves the right of final interpretation."
 set -uo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_FILE="$BASE_DIR/.replicate_progress"
-BACKUP_DIR="$BASE_DIR/backups"
 
 declare -a CLEANUP_TEMP_PATHS=()
 register_temp_path() { CLEANUP_TEMP_PATHS+=("$1"); }
@@ -64,7 +62,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.27"
+SCRIPT_VERSION="1.9.28"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -679,7 +677,7 @@ fzf_multi() {
         --header="$1"
 }
 
-# fzf single-select (rollback etc.: nothing preselected, TAB/Ctrl-D meaningless)
+# fzf single-select (mirror switch etc.: nothing preselected, TAB/Ctrl-D meaningless)
 fzf_single() {
     fzf --layout=reverse --border=rounded --margin=1,2 \
         --delimiter=$'\t' --with-nth=1,2 \
@@ -3696,60 +3694,7 @@ stage_dm() {
     fi
 }
 
-# --- 4.6 config snapshot (backup before deploy) ---
-
-stage_backup() {
-    if stage_done backup; then return; fi
-    if [ "$DRY_RUN" -eq 1 ]; then
-        log "$(_t "[DRY-RUN] Skipping config backup." "[DRY-RUN] Skipping config backup.")"
-        stage_mark backup
-        return
-    fi
-
-    section "$(_t "Config Snapshot" "Config Snapshot")" "$(_t "Create rollback point before deploy" "Create rollback point before deploy")"
-    local snap_cfg="$BASE_DIR/configs"
-    if [ ! -d "$snap_cfg/.config" ]; then
-        log "$(_t "configs/ not present — skipping rollback backup." "configs/ not present — skipping rollback backup.")"
-        stage_mark backup
-        return
-    fi
-
-    local ts
-    ts=$(date +%Y%m%d-%H%M%S)
-    local tgz="$BACKUP_DIR/snapshot-$ts.tar.gz"
-    mkdir -p "$BACKUP_DIR"
-
-    # collect existing config paths that will be overwritten and packed
-    local targets=()
-    shopt -s nullglob dotglob
-    local item name
-    for item in "$snap_cfg/.config"/*; do
-        name=$(basename "$item")
-        [ -e "$HOME_DIR/.config/$name" ] && targets+=("$HOME_DIR/.config/$name")
-    done
-    for item in "$snap_cfg"/.*; do
-        name=$(basename "$item")
-        [[ "$name" = "." || "$name" = ".." || "$name" = ".config" ]] && continue
-        [ -f "$item" ] && [ -e "$HOME_DIR/$name" ] && targets+=("$HOME_DIR/$name")
-    done
-    shopt -u nullglob dotglob
-
-    if [ ${#targets[@]} -eq 0 ]; then
-        log "$(_t "No existing config to backup, skipping." "No existing config to backup, skipping.")"
-    elif confirm "$(_t "Backup current config to snapshot? [Y/n] (default Y, 15s):" "Backup current config to snapshot? [Y/n] (default Y, 15s):")" "Y" 15; then
-        if exe tar czf "$tgz" -C / "${targets[@]#/}" 2>/dev/null; then
-            success "$(_t "Snapshot saved: " "Snapshot saved: ") $tgz"
-            info_kv "$(_t "Backup Items" "Backup Items")" "${#targets[@]} items"
-        else
-            warn "$(_t "Snapshot creation failed, continuing without rollback point." "Snapshot creation failed, continuing without rollback point.")"
-        fi
-    else
-        log "$(_t "Skipping backup, continuing." "Skipping backup, continuing.")"
-    fi
-    stage_mark backup
-}
-
-# --- 4.7 config deploy ---
+# --- 4.6 config deploy ---
 
 # Install the zsh runtime that configs/.zshrc depends on (oh-my-zsh + its custom
 # plugins + starship + eza + bat).  The distro packages for zsh-autosuggestions /
@@ -4402,7 +4347,6 @@ do_restore() {
     stage_disable_system
     stage_services
     stage_dm
-    stage_backup
     stage_configs
     stage_wait_builds
     stage_hardware_adapt
@@ -4683,116 +4627,6 @@ boot_env_check() {
     fi
 }
 
-do_rollback() {
-    init_logger
-    check_root
-    detect_distro
-    detect_target_user
-
-    section "$(_t "Rollback" "Rollback")" "$(_t "Config Rollback" "Config Rollback")"
-    if [ ! -d "$BACKUP_DIR" ]; then
-        error "No snapshots found ($BACKUP_DIR does not exist)."
-        exit 1
-    fi
-
-    local snapshots=()
-    mapfile -t snapshots < <(find "$BACKUP_DIR" -maxdepth 1 -name 'snapshot-*.tar.gz' -printf '%T@ %f\n' 2>/dev/null | sort -rn | awk '{print $2}')
-    if [ ${#snapshots[@]} -eq 0 ]; then
-        error "$(_t "No snapshot files found." "No snapshot files found.")"
-        exit 1
-    fi
-
-    local lines=() s ts
-    for s in "${snapshots[@]}"; do
-        ts=$(stat -c '%Y' "$BACKUP_DIR/$s" 2>/dev/null)
-        [ -z "$ts" ] && ts=0
-        lines+=("$s"$'\t'"$(date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '???')")
-    done
-
-    ensure_fzf
-    local selected
-    selected=$(printf "%s\n" "${lines[@]}" | fzf_single " Select snapshot to restore ") || {
-        warn "$(_t "User cancelled." "User cancelled.")"
-        return
-    }
-    if [ -z "$selected" ]; then
-        warn "$(_t "No snapshot selected." "No snapshot selected.")"
-        return
-    fi
-    local snapshot
-    snapshot=$(echo "$selected" | cut -f1 -d"$(printf '\t')" | head -1)
-
-    section "$(_t "Restoring" "Restoring")" "$snapshot"
-    if ! confirm "$(_t "Confirm restore from snapshot ${snapshot}? [y/N] (default N, 15s):" "Confirm restore from snapshot ${snapshot}? [y/N] (default N, 15s):")" "N" 15; then
-        log "$(_t "Rollback cancelled." "Rollback cancelled.")"
-        return
-    fi
-
-    local tgz="$BACKUP_DIR/$snapshot"
-    local ts
-    ts=$(date +%Y%m%d-%H%M%S)
-    local workdir
-    workdir=$(mktemp -d)
-    register_temp_path "$workdir"
-
-    exe tar xzf "$tgz" -C "$workdir" || { error "$(_t "Failed to extract snapshot." "Failed to extract snapshot.")"; exit 1; }
-
-    local item name target
-    shopt -s nullglob dotglob
-    for item in "$workdir"/home/*/.config/*; do
-        name=$(basename "$item")
-        target="$HOME_DIR/.config/$name"
-        if [ -e "$target" ] || [ -L "$target" ]; then
-            exe mv "$target" "$target.bak-$ts"
-            prune_config_backups "$(dirname "$target")" "$(basename "$target").bak-*"
-        fi
-        exe cp -r "$item" "$target"
-        exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
-    done
-    # restore ~/.local/share/ (fixed niri-session etc.)
-    for item in "$workdir"/home/*/.local/share/*/*; do
-        [ -f "$item" ] && continue
-        name=$(basename "$item")
-        local parent
-        parent=$(basename "$(dirname "$item")")
-        target="$HOME_DIR/.local/share/$parent/$name"
-        mkdir -p "$(dirname "$target")"
-        if [ -e "$target" ] || [ -L "$target" ]; then
-            exe mv "$target" "$target.bak-$ts"
-            prune_config_backups "$(dirname "$target")" "$(basename "$target").bak-*"
-        fi
-        exe cp -r "$item" "$target"
-        exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
-    done 2>/dev/null
-    for item in "$workdir"/home/*/.local/share/applications/*; do
-        [ -f "$item" ] || continue
-        target="$HOME_DIR/.local/share/applications/$(basename "$item")"
-        mkdir -p "$(dirname "$target")"
-        if [ -e "$target" ] || [ -L "$target" ]; then
-            exe mv "$target" "$target.bak-$ts"
-            prune_config_backups "$(dirname "$target")" "$(basename "$target").bak-*"
-        fi
-        exe cp "$item" "$target"
-        exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
-    done 2>/dev/null
-    # home dotfiles
-    for item in "$workdir"/home/*/.*; do
-        name=$(basename "$item")
-        [[ "$name" = "." || "$name" = ".." ]] && continue
-        target="$HOME_DIR/$name"
-        [ -f "$item" ] || continue
-        if [ -e "$target" ] || [ -L "$target" ]; then
-            exe mv "$target" "$target.bak-$ts"
-            prune_config_backups "$(dirname "$target")" "$(basename "$target").bak-*"
-        fi
-        exe cp "$item" "$target"
-        exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
-    done
-    shopt -u nullglob dotglob
-
-    success "Config restored from snapshot $snapshot. Previous config backed up as .bak-$ts"
-}
-
 # --- 4.12 restore-system: re-enable system components that were disabled during restore ---
 do_restore_system() {
     init_logger
@@ -4846,7 +4680,6 @@ eilNiri deb-install.sh v$SCRIPT_VERSION — niri desktop environment replication
 Usage:
   ./deb-install.sh restore [--dry-run]      restore desktop on new system (root)
   ./deb-install.sh status                   show background build progress (run from another terminal)
-  ./deb-install.sh rollback                 rollback config from backup (root)
   ./deb-install.sh restore-system           re-enable system components disabled by restore (root)
   ./deb-install.sh --help                   show this help
 
@@ -4862,10 +4695,9 @@ Workflow:
   1. Copy this eilNiri directory to the target machine (USB / network)
   2. On the machine (Debian / Ubuntu / Mint / Pop): sudo ./deb-install.sh restore   — no prep required;
      optionally drop your own dotfiles into configs/.config/ and they get deployed
-     - niri/awww compile in background:  ./deb-install.sh status   (live progress)
-     - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
-  3. Rollback config:            sudo ./deb-install.sh rollback
-  4. Re-enable other-DE comps:   sudo ./deb-install.sh restore-system
+      - niri/awww compile in background:  ./deb-install.sh status   (live progress)
+      - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
+  3. Re-enable other-DE comps:   sudo ./deb-install.sh restore-system
 EOF
 }
 
@@ -4873,7 +4705,7 @@ main() {
     local arg
     for arg in "$@"; do
         case "$arg" in
-            restore|reatore|rollback|status|restore-system)
+            restore|reatore|status|restore-system)
                 [ "$arg" = reatore ] && arg=restore
                 MODE="$arg"
                 ;;
@@ -4886,7 +4718,6 @@ main() {
     case "$MODE" in
         restore)         do_restore ;;
         status)          do_status ;;
-        rollback)        do_rollback ;;
         restore-system)  do_restore_system ;;
         *)               usage; exit 1 ;;
     esac
