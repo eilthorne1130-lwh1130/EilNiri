@@ -62,7 +62,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.30"
+SCRIPT_VERSION="1.9.32"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -320,15 +320,16 @@ HYPR_BUILD_DEPS_DEB=(build-essential g++ cmake ninja-build pkg-config git libway
 # at the greeter because there is no DRI driver. Names vary by Ubuntu/Debian release.
 DEB_GRAPHICS_RUNTIME=(libgl1-mesa-dri mesa-libgallium mesa-vulkan-drivers
     libegl1 libegl1-mesa libgbm1 libdrm2 libglx-mesa0)
-# hyprutils master needs C++26; gcc 12 (Debian 12 / Ubuntu 22.04) cannot build it.
-# These tags stay on C++23 and still satisfy current hypridle/hyprlock cmake checks.
-HYPR_PIN_CXX23_SCANNER="v0.4.4"
-HYPR_PIN_CXX23_UTILS="v0.8.4"
-HYPR_PIN_CXX23_LANG="v0.6.3"
-HYPR_PIN_CXX23_GRAPHICS="v0.1.3"
-HYPR_PIN_CXX23_PROTOCOLS="v0.6.4"
-HYPR_PIN_CXX23_IDLE="v0.1.7"
-HYPR_PIN_CXX23_LOCK="v0.7.1"
+# Always pin hypr* to these C++23 tags. Tracking HEAD is fragile: hyprutils
+# master needs C++26, components' APIs drift, and a failed clone used to look
+# like an empty "=== name (ref=HEAD) ===" block with no error.
+HYPR_PIN_SCANNER="v0.4.4"
+HYPR_PIN_UTILS="v0.8.4"
+HYPR_PIN_LANG="v0.6.3"
+HYPR_PIN_GRAPHICS="v0.1.3"
+HYPR_PIN_PROTOCOLS="v0.6.4"
+HYPR_PIN_IDLE="v0.1.7"
+HYPR_PIN_LOCK="v0.8.2"
 FCITX5_RIME_REPO="https://github.com/fcitx/fcitx5-rime"
 LIBRIME_REPO="https://github.com/rime/librime"
 
@@ -777,7 +778,16 @@ repair_niri_blackscreen() {
         fi
         sed -i 's#polkit-gnome-authenntication-agent-1#polkit-gnome-authentication-agent-1#g' "$cfg" 2>/dev/null || true
         sed -i 's#spawn-at-startup "swww-daemon"#spawn-at-startup "awww-daemon"#' "$cfg" 2>/dev/null || true
+        if ! grep -q 'disable-cursor-plane' "$cfg" 2>/dev/null; then
+            printf '\ndebug {\n    disable-cursor-plane\n    disable-direct-scanout\n}\n' >> "$cfg"
+            log "$(_t "Enabled niri software cursor (disable-cursor-plane) to fix stuck cursor / black screen on AMD" "Enabled niri software cursor (disable-cursor-plane) to fix stuck cursor / black screen on AMD")"
+        fi
         chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$cfg" 2>/dev/null || true
+    fi
+    local _idle="$HOME_DIR/.config/hypr/hypridle.conf"
+    if [ -f "$_idle" ]; then
+        sed -i 's#lock_cmd = "hyprlock"#lock_cmd = pidof hyprlock || hyprlock#' "$_idle" 2>/dev/null || true
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_idle" 2>/dev/null || true
     fi
     local _env="$HOME_DIR/.config/environment.d/90-eilniri-cursor.conf"
     if [ -f "$_env" ]; then
@@ -857,25 +867,19 @@ ensure_hypr_cxx_toolchain() {
     export CXX="$_cxx"
     export CC="${CC:-gcc}"
     command -v gcc >/dev/null 2>&1 && export CC=gcc
-    log "$(_t "Hypr C++ toolchain: " "Hypr C++ toolchain: ")$CXX (C++23 OK)"
-    HYPR_NEED_CXX23_PIN=0
-    if ! _cxx_ok "$CXX" c++26; then
-        HYPR_NEED_CXX23_PIN=1
-        log "$(_t "Compiler has no C++26 — pinning hypr* to C++23 release tags" "Compiler has no C++26 — pinning hypr* to C++23 release tags")"
-    fi
+    log "$(_t "Hypr C++ toolchain: " "Hypr C++ toolchain: ")$CXX (C++23 OK; hypr* pinned to release tags)"
     return 0
 }
 
 hypr_git_ref() { # $1 = component name
-    [ "${HYPR_NEED_CXX23_PIN:-0}" -eq 1 ] || { echo ""; return 0; }
     case "$1" in
-        hyprwayland-scanner) echo "$HYPR_PIN_CXX23_SCANNER" ;;
-        hyprutils)           echo "$HYPR_PIN_CXX23_UTILS" ;;
-        hyprlang)            echo "$HYPR_PIN_CXX23_LANG" ;;
-        hyprgraphics)        echo "$HYPR_PIN_CXX23_GRAPHICS" ;;
-        hyprland-protocols)  echo "$HYPR_PIN_CXX23_PROTOCOLS" ;;
-        hypridle)            echo "$HYPR_PIN_CXX23_IDLE" ;;
-        hyprlock)            echo "$HYPR_PIN_CXX23_LOCK" ;;
+        hyprwayland-scanner) echo "$HYPR_PIN_SCANNER" ;;
+        hyprutils)           echo "$HYPR_PIN_UTILS" ;;
+        hyprlang)            echo "$HYPR_PIN_LANG" ;;
+        hyprgraphics)        echo "$HYPR_PIN_GRAPHICS" ;;
+        hyprland-protocols)  echo "$HYPR_PIN_PROTOCOLS" ;;
+        hypridle)            echo "$HYPR_PIN_IDLE" ;;
+        hyprlock)            echo "$HYPR_PIN_LOCK" ;;
         *)                   echo "" ;;
     esac
 }
@@ -2937,33 +2941,44 @@ build_hypr_stack() { # $1 = optional target (hypridle|hyprlock); default both
     _build_hypr_one() { # $1 = name
         local n="$1" component_log="$_log-$1.log" ref
         ref=$(hypr_git_ref "$n")
-        printf '\n=== %s (ref=%s cxx=%s) ===\n' "$n" "${ref:-HEAD}" "${CXX:-}" >>"$_log"
+        [ -n "$ref" ] || { echo "no pin for $n" >>"$_log"; return 1; }
+        printf '\n=== %s (ref=%s cxx=%s) ===\n' "$n" "$ref" "${CXX:-}" >>"$_log"
         rm -rf "$_work/$n"
         if ! git_clone_gh "https://github.com/hyprwm/$n" "$_work/$n" "$ref"; then
-            warn "$(_t "Hypr clone failed: " "Hypr clone failed: ")$n"
-            echo "clone failed for $n ref=$ref" >>"$component_log"
+            warn "$(_t "Hypr clone failed: " "Hypr clone failed: ")$n @$ref"
+            {
+                echo "clone failed for $n ref=$ref"
+                echo "repo=https://github.com/hyprwm/$n"
+            } >"$component_log"
             cat "$component_log" >>"$_log" 2>/dev/null || true
             return 1
         fi
-        local _std=()
-        [ "${HYPR_NEED_CXX23_PIN:-0}" -eq 1 ] && _std=(-DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON)
+        if [ ! -f "$_work/$n/CMakeLists.txt" ]; then
+            echo "cloned $_work/$n but CMakeLists.txt missing (empty/corrupt clone)" >"$component_log"
+            ls -la "$_work/$n" >>"$component_log" 2>&1 || true
+            cat "$component_log" >>"$_log"
+            return 1
+        fi
         if ( cd "$_work/$n" \
                 && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
                     ${CXX:+-DCMAKE_CXX_COMPILER="$CXX"} \
                     ${CC:+-DCMAKE_C_COMPILER="$CC"} \
-                    "${_std[@]}" \
+                    -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
                     -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" -DCMAKE_MODULE_PATH="$CMAKE_MODULE_PATH" \
                     -DCMAKE_INSTALL_PREFIX="$_prefix" -DCMAKE_INSTALL_LIBDIR="$_libdir" \
                 && cmake --build build -j"$(nproc)" \
                 && cmake --install build \
                 && { command -v ldconfig >/dev/null 2>&1 && ldconfig || true; } ) >"$component_log" 2>&1; then
-            INSTALLED_PKGS+=("hypr-$n (source build)")
-            log "$(_t "Built " "Built ") hypr-$n$(_t " from source" " from source")"
+            INSTALLED_PKGS+=("hypr-$n (source build $ref)")
+            log "$(_t "Built " "Built ") hypr-$n @$ref$(_t " from source" " from source")"
             prepare_hypr_cmake_paths
             return 0
         fi
-        cat "$component_log" >>"$_log" 2>/dev/null || true
-        warn "$(_t "Hypr component failed: " "Hypr component failed: ") $n (see $component_log)"
+        {
+            echo "cmake/build failed for $n ref=$ref"
+            tail -n 40 "$component_log"
+        } >>"$_log"
+        warn "$(_t "Hypr component failed: " "Hypr component failed: ") $n @$ref (see $component_log)"
         return 1
     }
 
@@ -3064,12 +3079,10 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         if [ "$pkg" = hypridle ] && ! hypridle_pkgconfig_check "$work/$pkg/CMakeLists.txt"; then
             warn "$(_t "hypridle pkg-config still incomplete after stack build; CMake will report the missing module." "hypridle pkg-config still incomplete after stack build; CMake will report the missing module.")"
         fi
-        local _std=()
-        [ "${HYPR_NEED_CXX23_PIN:-0}" -eq 1 ] && _std=(-DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON)
         ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
             ${CXX:+-DCMAKE_CXX_COMPILER="$CXX"} \
             ${CC:+-DCMAKE_C_COMPILER="$CC"} \
-            "${_std[@]}" \
+            -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
             -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
             -DCMAKE_MODULE_PATH="$CMAKE_MODULE_PATH" \
             -DPKG_CONFIG_EXECUTABLE="$(command -v pkg-config)" \
