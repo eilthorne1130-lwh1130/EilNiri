@@ -62,7 +62,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.32"
+SCRIPT_VERSION="1.9.33"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -464,8 +464,13 @@ pm_install() { # $@ = package names
 # Used to avoid attempting to install packages that simply do not exist in a
 # release (e.g. libhyprutils-dev / libhyprlang-dev on older Debian/Ubuntu) —
 # those are built from source instead.
+# LC_ALL=C: apt-cache policy is translated (候选版本) when LANG=zh_CN.UTF-8.
+# Leading whitespace: the Candidate line is indented with two spaces, so
+# '^ ?Candidate:' (0-1 space) never matches and every package looks missing.
 apt_available() { # $1 = package name
-    apt-cache policy "$1" 2>/dev/null | grep -qE '^ ?Candidate: [^ (]'
+    pkg_installed "$1" && return 0
+    LC_ALL=C apt-cache policy "$1" 2>/dev/null \
+        | grep -qE '^[[:space:]]*Candidate:[[:space:]]+[^([:space:]]'
 }
 
 # Filter a package list to only the names apt can actually install.
@@ -482,8 +487,7 @@ resolve_deb_package() {
     case "$logical" in
         polkit-gnome)
             for candidate in policykit-1-gnome polkit-gnome; do
-                if apt-cache policy "$candidate" 2>/dev/null |
-                    grep -qE '^ ?Candidate: [^ (]'; then
+                if apt_available "$candidate"; then
                     printf '%s\n' "$candidate"
                     return 0
                 fi
@@ -509,7 +513,7 @@ resolve_polkit_agent() {
         fi
     done
     for pkg in policykit-1-gnome mate-polkit lxqt-policykit polkit-kde-agent-1; do
-        if apt-cache policy "$pkg" 2>/dev/null | grep -qE '^ ?Candidate: [^ (]'; then
+        if apt_available "$pkg"; then
             case "$pkg" in
                 policykit-1-gnome) command_path=/usr/libexec/polkit-gnome-authentication-agent-1 ;;
                 mate-polkit) command_path=/usr/libexec/polkit-mate-authentication-agent-1 ;;
@@ -572,7 +576,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v41"
+PROGRESS_VERSION="v42"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -825,7 +829,7 @@ ensure_debian_graphics_runtime() {
     fi
     local _pkg _have=()
     for _pkg in "${DEB_GRAPHICS_RUNTIME[@]}"; do
-        apt-cache policy "$_pkg" 2>/dev/null | grep -qE '^ ?Candidate: [^ (]' || continue
+        apt_available "$_pkg" || continue
         pkg_installed "$_pkg" && continue
         _have+=("$_pkg")
     done
@@ -1542,6 +1546,7 @@ _pc_pkg_map() { # $1 = .pc 名; echo 候选 -dev 包名（空格分隔）
         gbm)               echo "libgbm-dev" ;;
         egl)               echo "libegl-dev libegl1-mesa-dev" ;;
         sdbus-c++)         echo "libsdbus-c++-dev" ;;
+        pugixml)           echo "libpugixml-dev" ;;
         hyprlang)          echo "libhyprlang-dev" ;;
         hyprutils)         echo "libhyprutils-dev" ;;
         hyprland-protocols) echo "hyprland-protocols" ;;
@@ -1569,7 +1574,7 @@ _pc_auto_install() { # $1 = .pc 名（Debian 系专用）
     local _cand _found=0 _try
     for _try in 1 2; do
         for _cand in $(_pc_pkg_map "$1"); do
-            if apt-cache policy "$_cand" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+            if apt_available "$_cand"; then
                 _found=1
                 log "$(_t "Auto-installing missing build dep: " "Auto-installing missing build dep: ") $_cand"
                 pm_install "$_cand" 2>>"$LOG_DIR/apt-errors.log" || true
@@ -1902,7 +1907,7 @@ EOF
         local _debian_deps=() _pkg_name _mapped
         for _pkg_name in "${NIRI_BUILD_DEPS[@]}"; do
             _mapped="${DEB_NIRI_BDEPS_MAP[$_pkg_name]:-}"
-            if [ -n "$_mapped" ] && apt-cache policy "$_mapped" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+            if [ -n "$_mapped" ] && apt_available "$_mapped"; then
                 _debian_deps+=("$_mapped")
             else
                 _debian_deps+=("$_pkg_name")
@@ -2359,11 +2364,46 @@ EOF
     fi
 }
 
+_waypaper_pip_index() {
+    if [ -n "${EILNIRI_PIP_INDEX_URL:-}" ]; then
+        echo "$EILNIRI_PIP_INDEX_URL"
+        return
+    fi
+    local tz
+    tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+    if [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]]; then
+        echo "https://pypi.tuna.tsinghua.edu.cn/simple"
+    else
+        echo "https://pypi.org/simple"
+    fi
+}
+
+_waypaper_ok() {
+    command -v waypaper >/dev/null 2>&1 || [ -x "$HOME_DIR/.local/bin/waypaper" ]
+}
+
+_waypaper_gtk_runtime() {
+    apt_install_tolerant python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
+        gir1.2-gdkpixbuf-2.0 python3-pil python3-platformdirs python3-imageio \
+        python3-screeninfo || true
+}
+
+_waypaper_write_wrapper() { # $1 = real binary
+    local wrapper="$HOME_DIR/.local/bin/waypaper" real="$1"
+    mkdir -p "$HOME_DIR/.local/bin"
+    cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+exec "$real" "\$@"
+EOF
+    chmod 755 "$wrapper"
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$wrapper"
+}
+
 install_waypaper_venv() {
     local venv="$HOME_DIR/.local/share/eilniri/waypaper-venv"
-    local wrapper="$HOME_DIR/.local/bin/waypaper"
     local venv_log="$LOG_DIR/waypaper-venv.log"
-    local pip_index="${EILNIRI_PIP_INDEX_URL:-https://pypi.org/simple}"
+    local pip_index
+    pip_index=$(_waypaper_pip_index)
     if [ "$DRY_RUN" -eq 1 ]; then
         DRY_PKGS+=("waypaper (python venv)")
         return "$DRY_RUN_RC"
@@ -2375,57 +2415,75 @@ install_waypaper_venv() {
     pm_install "$pyvenv_pkg" python3-pip >>"$LOG_DIR/apt-errors.log" 2>&1 ||
         pm_install python3-venv python3-pip >>"$LOG_DIR/apt-errors.log" 2>&1 || true
     if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
-        MANUAL_ITEMS+=("waypaper — python3-venv is unavailable; install python3-venv and python3-pip; see $LOG_DIR/apt-errors.log")
         return 1
     fi
     mkdir -p "$(dirname "$venv")" "$HOME_DIR/.local/bin"
     chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
         "$(dirname "$venv")" "$HOME_DIR/.local/bin" 2>/dev/null || true
-    if [ -e "$venv" ] && [ ! -x "$venv/bin/python" ]; then
-        rm -rf "$venv"
+    if [ -e "$venv" ]; then
+        if [ ! -x "$venv/bin/python" ] ||
+           ! grep -q '^include-system-site-packages[[:space:]]*=[[:space:]]*true' "$venv/pyvenv.cfg" 2>/dev/null; then
+            rm -rf "$venv"
+        fi
     fi
+    # --system-site-packages so apt-installed PyGObject/GTK bindings are visible
+    # inside the venv (pip cannot install gi on Debian without libgirepository).
     if ! as_user env HOME="$HOME_DIR" USER="$TARGET_USER" \
-        PATH="/usr/local/bin:/usr/bin:/bin" python3 -m venv "$venv" >"$venv_log" 2>&1 ||
+        PATH="/usr/local/bin:/usr/bin:/bin" python3 -m venv --system-site-packages "$venv" >"$venv_log" 2>&1 ||
        ! as_user test -x "$venv/bin/python" || ! as_user test -x "$venv/bin/pip"; then
-        MANUAL_ITEMS+=("waypaper — venv creation failed; see $venv_log")
         return 1
     fi
     if ! as_user env HOME="$HOME_DIR" \
        "$venv/bin/python" -m pip install --disable-pip-version-check --no-input \
            --index-url "$pip_index" --upgrade pip waypaper \
            >"$LOG_DIR/waypaper-pip.log" 2>&1; then
-        MANUAL_ITEMS+=("waypaper — venv installation failed; see $LOG_DIR/waypaper-pip.log")
         return 1
     fi
-    cat > "$wrapper" <<EOF
-#!/usr/bin/env bash
-exec "$venv/bin/waypaper" "\$@"
-EOF
-    chmod 755 "$wrapper"
-    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$wrapper"
+    if [ ! -x "$venv/bin/waypaper" ]; then
+        return 1
+    fi
+    _waypaper_write_wrapper "$venv/bin/waypaper"
+    if ! as_user env HOME="$HOME_DIR" PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+            waypaper --help >/dev/null 2>&1; then
+        return 1
+    fi
     INSTALLED_PKGS+=("waypaper (python venv)")
     return 0
 }
 
-# waypaper's Python dependency graph is increasingly incompatible with the
-# externally-managed Python policy and incomplete python3-venv packages found
-# on older Debian/Ubuntu releases. Build the application from its source tree
-# and install its launcher and desktop file without touching system site-packages.
+# waypaper: GTK GUI needs PyGObject from apt (pip cannot build gi without
+# libgirepository). Prefer a venv with --system-site-packages, then pipx,
+# then pip --user from the cloned source. Never report success unless a
+# launcher exists and `waypaper --help` runs.
 install_waypaper_source() {
-    local work logf src launcher install_root target_group
+    local work logf src launcher install_root target_group pip_index
     if [ "$DRY_RUN" -eq 1 ]; then
-        DRY_PKGS+=("waypaper (source build)")
+        DRY_PKGS+=("waypaper (python)")
         return "$DRY_RUN_RC"
     fi
-    if command -v waypaper >/dev/null 2>&1 || [ -x "$HOME_DIR/.local/bin/waypaper" ]; then
+    if _waypaper_ok && as_user env HOME="$HOME_DIR" PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+            waypaper --help >/dev/null 2>&1; then
         SKIPPED_PKGS+=("waypaper (already installed)")
         return 0
     fi
+    _waypaper_gtk_runtime
+    pip_index=$(_waypaper_pip_index)
+
+    if install_waypaper_venv; then
+        success "$(_t "waypaper installed (python venv)" "waypaper installed (python venv)")"
+        return 0
+    fi
+    log "$(_t "waypaper venv failed, trying pipx..." "waypaper venv failed, trying pipx...")"
+    if install_waypaper_pipx; then
+        success "$(_t "waypaper installed (pipx)" "waypaper installed (pipx)")"
+        return 0
+    fi
+
     if ! command -v git >/dev/null 2>&1; then
-        pm_install git || return 1
+        pm_install git || true
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        pm_install python3 || return 1
+        pm_install python3 || true
     fi
     install_root="$HOME_DIR/.local/share/eilniri/waypaper-src"
     work=$(mktemp -d)
@@ -2454,8 +2512,6 @@ install_waypaper_source() {
     mkdir -p "$HOME_DIR/.local/bin" "$HOME_DIR/.local/share/applications"
     target_group=$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")
     mkdir -p "$HOME_DIR/.local" "$HOME_DIR/.local/bin" "$HOME_DIR/.local/lib" "$HOME_DIR/.cache/pip"
-    # Previous runs may have created ~/.local/bin and pip entry points as root.
-    # Repair ownership before pip creates f2py/waypaper and other console scripts.
     chown -R "$TARGET_USER:$target_group" "$HOME_DIR/.local" "$HOME_DIR/.cache/pip" 2>/dev/null || true
     chown -R "$TARGET_USER:$target_group" "$install_root" 2>/dev/null || true
     if [ -f "$src/pyproject.toml" ] || [ -f "$src/setup.py" ]; then
@@ -2467,16 +2523,16 @@ install_waypaper_source() {
         fi
         if ! as_user env HOME="$HOME_DIR" USER="$TARGET_USER" \
             PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-            python3 -m pip install --user --break-system-packages "$src" >"$LOG_DIR/waypaper-pip.log" 2>&1; then
+            python3 -m pip install --user --break-system-packages --index-url "$pip_index" "$src" \
+            >"$LOG_DIR/waypaper-pip.log" 2>&1; then
             MANUAL_ITEMS+=("waypaper — source package installation failed; see $LOG_DIR/waypaper-pip.log")
             return 1
         fi
-        if [ -x "$HOME_DIR/.local/bin/waypaper" ]; then
-            launcher="$HOME_DIR/.local/bin/waypaper"
-        else
+        if [ ! -x "$HOME_DIR/.local/bin/waypaper" ]; then
             MANUAL_ITEMS+=("waypaper — source installed but no launcher was produced; see $LOG_DIR/waypaper-pip.log")
             return 1
         fi
+        launcher="$HOME_DIR/.local/bin/waypaper"
     elif [ -f "$src/waypaper" ]; then
         exe install -Dm755 "$src/waypaper" "$launcher"
     elif [ -f "$src/waypaper/__main__.py" ]; then
@@ -2494,6 +2550,11 @@ EOF
     fi
     chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
         "$HOME_DIR/.local/bin" "$HOME_DIR/.local/share/applications" 2>/dev/null || true
+    if ! as_user env HOME="$HOME_DIR" PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+            waypaper --help >/dev/null 2>&1; then
+        MANUAL_ITEMS+=("waypaper — launcher exists but waypaper --help failed; install python3-gi gir1.2-gtk-3.0")
+        return 1
+    fi
     INSTALLED_PKGS+=("waypaper (source build)")
     success "$(_t "waypaper built from source" "waypaper built from source")"
     return 0
@@ -2557,6 +2618,7 @@ declare -A HYPR_PC_DEB=(
     [wayland-client]=libwayland-dev
     [wayland-protocols]=wayland-protocols
     [xkbcommon]=libxkbcommon-dev
+    [pugixml]=libpugixml-dev
 )
 
 # Ensure the given pkg-config modules resolve; auto-install the mapped -dev
@@ -2678,13 +2740,17 @@ hypridle_pkgconfig_check() {
 }
 
 install_waypaper_pipx() {
-    local bin="$HOME_DIR/.local/bin/waypaper"
+    local bin="$HOME_DIR/.local/bin/waypaper" pip_index
+    pip_index=$(_waypaper_pip_index)
     if ! command -v pipx >/dev/null 2>&1; then
         pm_install pipx python3-venv python3-full >/dev/null 2>&1 || return 1
     fi
     as_user env HOME="$HOME_DIR" PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-        pipx install --force waypaper >"$LOG_DIR/waypaper-pipx.log" 2>&1 || return 1
+        PIP_INDEX_URL="$pip_index" \
+        pipx install --force --system-site-packages waypaper >"$LOG_DIR/waypaper-pipx.log" 2>&1 || return 1
     [ -x "$bin" ] || return 1
+    as_user env HOME="$HOME_DIR" PATH="$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        waypaper --help >/dev/null 2>&1 || return 1
     INSTALLED_PKGS+=("waypaper (pipx)")
     return 0
 }
@@ -3076,8 +3142,15 @@ build_hypr_stack() { # $1 = optional target (hypridle|hyprlock); default both
             return 1
         fi
         # Ensure this component's system pkg-config modules resolve before building
-        # (hyprgraphics needs spng/pixman/cairo/libjpeg/libwebp/libmagic + hyprutils).
+        # (hyprwayland-scanner needs pugixml; hyprgraphics needs spng/pixman/cairo/...).
         case "$n" in
+            hyprwayland-scanner)
+                if ! _hypr_pc_ensure pugixml; then
+                    echo "pugixml.pc missing after apt; install libpugixml-dev" >"$component_log"
+                    cat "$component_log" >>"$_log"
+                    return 1
+                fi
+                ;;
             hyprgraphics)
                 _hypr_pc_ensure pixman-1 cairo hyprutils libjpeg libwebp libmagic spng || true
                 ;;
@@ -3213,7 +3286,7 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     if [ "$DISTRO_FAMILY" = debian ]; then
         prepare_debian_pkgconfig
         local apt_hypr="$pkg"
-        if apt-cache policy "$apt_hypr" 2>/dev/null | grep -qE '^ ?Candidate: [^ (]'; then
+        if apt_available "$apt_hypr"; then
             if pm_install "$apt_hypr" && command -v "$pkg" >/dev/null 2>&1; then
                 INSTALLED_PKGS+=("$pkg (apt)")
                 return 0
@@ -3778,13 +3851,15 @@ stage_services() {
 }
 
 # --- 4.5 display manager ---
-# Keep an existing display manager exactly as it is. Only systems without a configured
-# display manager receive a lightweight fallback (SDDM on Debian, GDM elsewhere).
+# After reboot the machine should boot into niri. Debian uses SDDM (Wayland
+# sessions, no KDE Plasma pulled in). An existing DM (LightDM/GDM/...) is
+# DISABLED and replaced. Safety: install the replacement FIRST, then disable
+# the old one. Escape hatch: EILNIRI_KEEP_DM=1 keeps the existing DM as-is.
 
 stage_dm() {
     if stage_done dm; then return; fi
 
-    section "$(_t "Display Manager" "Display Manager")" "$(_t "keep existing; install only when missing" "keep existing; install only when missing")"
+    section "$(_t "Display Manager" "Display Manager")" "$(_t "auto (sddm, replaces existing)" "auto (sddm, replaces existing)")"
 
     # A DM only ever starts under graphical.target. If the system default target is not
     # graphical (Ubuntu Server / previously switched to multi-user), the machine boots to a
@@ -3801,19 +3876,12 @@ stage_dm() {
     fi
 
     local known_dms=(gdm3 gdm sddm lightdm lxdm ly greetd plasma-login-manager lemurs)
-    local dm_pkgs dm_unit
-    # SDDM is used only as the Debian fallback. It does not require installing KDE Plasma.
-    if [ "$DISTRO_FAMILY" = debian ]; then
-        dm_pkgs="sddm"; dm_unit="sddm"
-    else
-        dm_pkgs="gdm"; dm_unit="gdm"
-    fi
+    local dm_pkgs="sddm" dm_unit="sddm"
 
-    # Detect the DM that actually owns the system display-manager symlink first.
     local current=""
     if [ -e /etc/systemd/system/display-manager.service ]; then
         current=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "display-manager.service")
-        current=$(basename "$current" .service)   # strip the .service suffix for unit comparison
+        current=$(basename "$current" .service)
     fi
     if [ -z "$current" ]; then
         local dm
@@ -3822,35 +3890,33 @@ stage_dm() {
         done
     fi
 
-    # An existing DM is user-owned configuration. Do not install, disable, enable,
-    # relink, or otherwise rewrite it. This also makes reruns safe on desktop systems.
-    if [ -n "$current" ]; then
-        info_kv "$(_t "DM" "DM")" "$current" "existing DM kept unchanged"
+    # keep the existing DM on request, or when it already is the chosen one
+    if [ -n "$current" ] && { [ "${EILNIRI_KEEP_DM:-0}" = "1" ] || [ "$current" = "$dm_unit" ]; }; then
+        local reason="already the chosen DM"
+        [ "${EILNIRI_KEEP_DM:-0}" = "1" ] && reason="EILNIRI_KEEP_DM=1, keep"
+        info_kv "$(_t "DM" "DM")" "$current" "$reason"
         if [ "$DRY_RUN" -eq 0 ]; then
             systemctl set-default graphical.target 2>/dev/null || true
         fi
         stage_mark dm
         return
     fi
-
-    info_kv "$(_t "DM" "DM")" "none" "installing lightweight fallback: $dm_pkgs"
+    [ -n "$current" ] && info_kv "$(_t "DM" "DM")" "$current" "will be replaced by $dm_pkgs"
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "$(_t "[DRY-RUN] would install & enable: " "[DRY-RUN] would install & enable: ") $dm_pkgs"
+        log "$(_t "[DRY-RUN] would install & enable: " "[DRY-RUN] would install & enable: ") $dm_pkgs${current:+ ($(_t "disabling " "disabling ") $current)}"
         DRY_PKGS+=("$dm_pkgs")
         DRY_SVCS+=("$dm_unit")
         stage_mark dm
         return
     fi
 
-    # No DM exists, so install only the fallback package. SDDM itself does not pull
-    # the full KDE Plasma desktop; avoid adding desktop-environment meta-packages.
+    # --- install the chosen DM first; never disable the current one before the replacement is in place ---
     local ok=0
-    local dm_candidates=("$dm_pkgs|$dm_unit")
-    [ "$DISTRO_FAMILY" = debian ] && dm_candidates+=("gdm3|gdm")
-    [ "$DISTRO_FAMILY" != debian ] && dm_candidates+=("gdm|gdm")
+    local dm_candidates=("$dm_pkgs|$dm_unit" "gdm3|gdm3" "gdm|gdm")
+    local tried tpkg tunit
     for tried in "${dm_candidates[@]}"; do
-        local tpkg="${tried%%|*}" tunit="${tried##*|}"
+        tpkg="${tried%%|*}" tunit="${tried##*|}"
         if pm_install "$tpkg"; then
             dm_pkgs="$tpkg"; dm_unit="$tunit"; ok=1
             break
@@ -3860,17 +3926,13 @@ stage_dm() {
     if [ "$ok" -eq 0 ]; then
         FAILED_PKGS+=("dm:$dm_unit")
         warn "$(_t "No display manager could be installed; keeping the existing one (") $current$(_t ") unchanged — run niri-session from tty after reboot." ") unchanged — run niri-session from tty after reboot.")"
-        return   # not marked: rerun retries
+        return
     fi
 
-    # Enable and validate the replacement before touching the existing DM.
     local dm_service=""
     for dm_service in "/lib/systemd/system/${dm_unit}.service" "/usr/lib/systemd/system/${dm_unit}.service"; do
         [ -e "$dm_service" ] && break
     done
-    # Debian's gdm3 package may expose the unit as gdm.service, while the
-    # package/configuration command still uses gdm3. Resolve the real unit
-    # before enabling or creating the display-manager symlink.
     if [ "$dm_unit" = gdm3 ] && [ ! -e "$dm_service" ]; then
         for dm_service in /lib/systemd/system/gdm.service /usr/lib/systemd/system/gdm.service; do
             [ -e "$dm_service" ] && { dm_unit=gdm; break; }
@@ -3881,41 +3943,44 @@ stage_dm() {
         warn "$(_t "Installed DM has no systemd unit: " "Installed DM has no systemd unit: ")$dm_unit"
         return
     fi
+
+    # --- disable every known DM, then enable the chosen one ---
+    local dm
+    for dm in "${known_dms[@]}"; do
+        [ "$dm" = "$dm_unit" ] && continue
+        exe systemctl disable "$dm" 2>/dev/null || true
+    done
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        exe systemctl disable display-manager.service 2>/dev/null || rm -f /etc/systemd/system/display-manager.service
+    fi
+
     if exe systemctl enable "$dm_unit" &&
        ln -sfn "$dm_service" /etc/systemd/system/display-manager.service &&
        systemctl set-default graphical.target 2>/dev/null &&
        exe systemctl daemon-reload &&
        true; then
-        # verify: the unit must be enabled, and (except ly, which runs on tty1 directly)
-        # display-manager.service must point at the new DM
         local _verify_ok=1
         if ! systemctl is-enabled --quiet "$dm_unit" 2>/dev/null; then
             _verify_ok=0
             warn "$(_t "Verification failed: " "Verification failed: ") $dm_unit $(_t "is not enabled." "is not enabled.")"
         fi
         local _dm_link
-         _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
+        _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
         if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
             _verify_ok=0
             warn "$(_t "display-manager.service is not linked to " "display-manager.service is not linked to ")$dm_unit"
         fi
         if [ "$_verify_ok" -eq 1 ]; then
-            if [ ! -e /etc/systemd/system/display-manager.service ] || [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
-                ln -sfn "$dm_service" /etc/systemd/system/display-manager.service
-                systemctl daemon-reload 2>/dev/null || true
-            fi
             ENABLED_SVCS+=("$dm_unit")
             success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
             stage_mark dm
         else
             FAILED_PKGS+=("dm:$dm_unit")
             warn "$(_t "Display manager enable verification failed; run niri-session from tty after reboot." "Display manager enable verification failed; run niri-session from tty after reboot.")"
-            # not marked: rerun retries
         fi
     else
         FAILED_PKGS+=("dm:$dm_unit")
         warn "$(_t "Display manager enable failed; run niri-session from tty after reboot." "Display manager enable failed; run niri-session from tty after reboot.")"
-        # not marked: rerun retries
     fi
 }
 
@@ -4027,14 +4092,14 @@ stage_configs() {
                 [ -x "$_exe" ] && continue          # 路径存在就不用改
                 _base=$(basename "$_exe")
                 _new=""
-        for _cand in /usr/bin/$_base /usr/local/bin/$_base "$HOME_DIR/.local/bin/$_base" "$HOME_DIR/.local/share/eilniri/waypaper-venv/bin/$_base"; do
+                for _cand in /usr/bin/$_base /usr/local/bin/$_base "$HOME_DIR/.local/bin/$_base" "$HOME_DIR/.local/share/eilniri/waypaper-venv/bin/$_base"; do
                     [ -x "$_cand" ] && { _new="$_cand"; break; }
                 done
                 if [ -n "$_new" ]; then
                     log "$(_t "fix ExecStart in " "fix ExecStart in ") $(basename "$_sf")$(_t ": " ": ") $_exe -> $_new"
-                    sed -i "s#^ExecStart=$_exe#ExecStart=$_new#" "$_sf" 2>/dev/null || true
+                    sed -i "s#^[[:space:]]*ExecStart=$_exe#ExecStart=$_new#" "$_sf" 2>/dev/null || true
                 fi
-            done < <(sed -n 's/^ExecStart=//p' "$_sf" 2>/dev/null)
+            done < <(sed -n 's/^[[:space:]]*ExecStart=//p' "$_sf" 2>/dev/null)
         done
 
         if [ -f "$HOME_DIR/.config/niri/config.kdl" ]; then
