@@ -151,12 +151,6 @@ exe() {
         write_log "DRYRUN" "$full_command"
         return "$DRY_RUN_RC"
     fi
-    if [ "$DISTRO_FAMILY" = debian ] && command -v systemctl >/dev/null 2>&1; then
-        if ! systemctl is-enabled --quiet sddm.service 2>/dev/null; then
-            systemctl enable sddm.service 2>/dev/null || true
-        fi
-        systemctl set-default graphical.target 2>/dev/null || true
-    fi
     echo -e "   ${H_GRAY}┌──[ ${H_MAGENTA}EXEC${H_GRAY} ]────────────────────────────────────────────────────${NC}"
     echo -e "   ${H_GRAY}│${NC} ${H_CYAN}$ ${NC}${BOLD}$full_command${NC}"
     write_log "EXEC" "$full_command"
@@ -2186,13 +2180,18 @@ install_awww_from_build() { # $1 = srcdir, $2 = logfile
 # 修正 waypaper config.ini 与 hyprlock.conf（锁屏壁纸）里指向参考机的绝对路径。
 _ensure_wallpaper() {
     [ "$DRY_RUN" -eq 1 ] && return 0
-    command -v awww >/dev/null 2>&1 || return 0   # awww 缺失由 install_awww 处理
+    local _awww_bin=""
+    for _awww_bin in /usr/local/bin/awww /usr/bin/awww "$HOME_DIR/.local/bin/awww"; do
+        [ -x "$_awww_bin" ] && break
+        _awww_bin=""
+    done
+    [ -n "$_awww_bin" ] || return 0   # awww 缺失由 install_awww 处理
 
     local _img="" _cand _ext=""
     # 1) 仓库根目录那张图（QQ图片....jpeg / wallpaper.*）统一部署为
     #    ~/.local/share/backgrounds/wallpaper.jpg，hyprlock 与 waypaper 都指向它。
     mkdir -p "$HOME_DIR/.local/share/backgrounds"
-    for _cand in "$BASE_DIR"/QQ图片*.jpeg "$BASE_DIR"/QQ图片*.jpg "$BASE_DIR"/*.jpg "$BASE_DIR"/*.jpeg "$BASE_DIR"/*.png "$BASE_DIR"/*.webp; do
+    for _cand in "$BASE_DIR/QQ图片20260713144149.jpeg" "$BASE_DIR"/QQ图片*.jpeg "$BASE_DIR"/QQ图片*.jpg "$BASE_DIR"/*.jpg "$BASE_DIR"/*.jpeg "$BASE_DIR"/*.png "$BASE_DIR"/*.webp; do
         [ -f "$_cand" ] || continue
         _img="$HOME_DIR/.local/share/backgrounds/wallpaper.jpg"
         if [ ! -f "$_img" ] || ! cmp -s "$_cand" "$_img" 2>/dev/null; then
@@ -2276,12 +2275,46 @@ PYEOF
         fi
         # 主动 set：只写状态文件不够——显式让 awww-daemon 应用这张壁纸（daemon 若已响应
         # 自己读状态文件并应用；此处再主动调用一次确保生效，失败不影响已写状态）。
-        if [ -x /usr/local/bin/awww-daemon ] && command -v as_user >/dev/null 2>&1; then
-            exe as_user awww-daemon set-wallpaper "$_img" 2>>"$LOG_DIR/awww-set.log" || \
-                exe as_user awww set-wallpaper "$_img" 2>>"$LOG_DIR/awww-set.log" || true
-            log "$(_t "awww set-wallpaper invoked: " "awww set-wallpaper invoked: ") $_img"
+        if command -v as_user >/dev/null 2>&1; then
+            local _awww_cmd="$_awww_bin"
+            if ! pgrep -u "$TARGET_USER" -x awww-daemon >/dev/null 2>&1; then
+                as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
+                    nohup /usr/local/bin/awww-daemon >/dev/null 2>>"$LOG_DIR/awww-daemon.log" &
+                sleep 1
+            fi
+            exe as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
+                "$_awww_cmd" img "$_img" 2>>"$LOG_DIR/awww-set.log" || \
+                exe as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
+                "$_awww_cmd" set "$_img" 2>>"$LOG_DIR/awww-set.log" || true
+            log "$(_t "awww default wallpaper applied: " "awww default wallpaper applied: ") $_img"
         fi
     fi
+}
+
+_ensure_waybar_config() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _cfg="$HOME_DIR/.config/waybar/config"
+    [ -f "$_cfg" ] || return 0
+
+    # Hardware-specific ignored-sinks entries make Waybar fail on machines whose
+    # PulseAudio sink names differ. Remove that optional key when the config cannot
+    # be parsed, then validate with Waybar itself when available.
+    local _valid=1
+    if command -v waybar >/dev/null 2>&1; then
+        waybar -c "$_cfg" -s /dev/null >/dev/null 2>"$LOG_DIR/waybar-config.log" &
+        local _pid=$!
+        sleep 1
+        kill "$_pid" 2>/dev/null || true
+        wait "$_pid" 2>/dev/null && _valid=0 || true
+        grep -q "error parsing JSON" "$LOG_DIR/waybar-config.log" 2>/dev/null && _valid=1
+    else
+        command -v jq >/dev/null 2>&1 && jq empty "$_cfg" >/dev/null 2>"$LOG_DIR/waybar-config.log" || _valid=0
+    fi
+    if [ "$_valid" -ne 0 ]; then
+        sed -i '/^[[:space:]]*"ignored-sinks"[[:space:]]*:/d' "$_cfg"
+        log "$(_t "Removed incompatible Waybar ignored-sinks entry; config repaired." "Removed incompatible Waybar ignored-sinks entry; config repaired.")"
+    fi
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg" 2>/dev/null || true
 }
 
 # pip --user 装的 waypaper 没有 .desktop 入口 → fuzzel 启动器里不显示/无图标。
@@ -3561,19 +3594,14 @@ stage_services() {
     fi
 }
 
-# --- 4.5 display manager (automatic, all families) ---
-# One-script goal: after reboot the machine boots straight into the niri desktop.
-#   Arch  : ly (lightweight, fits niri)
-#   Debian: sddm, RHEL: gdm
-# An existing display manager (e.g. gdm3 preinstalled on Ubuntu Desktop) is DISABLED and
-# replaced by the chosen one. Safety: the replacement is installed FIRST and only then is
-# the old DM disabled — if the install fails the current DM stays untouched.
-# Escape hatch: EILNIRI_KEEP_DM=1 keeps the existing DM as-is.
+# --- 4.5 display manager ---
+# Keep an existing display manager exactly as it is. Only systems without a configured
+# display manager receive a lightweight fallback (SDDM on Debian, GDM elsewhere).
 
 stage_dm() {
     if stage_done dm; then return; fi
 
-    section "$(_t "Display Manager" "Display Manager")" "$(_t "auto (ly / gdm, replaces existing)" "auto (ly / gdm, replaces existing)")"
+    section "$(_t "Display Manager" "Display Manager")" "$(_t "keep existing; install only when missing" "keep existing; install only when missing")"
 
     # A DM only ever starts under graphical.target. If the system default target is not
     # graphical (Ubuntu Server / previously switched to multi-user), the machine boots to a
@@ -3589,16 +3617,16 @@ stage_dm() {
         fi
     fi
 
-    local known_dms=(gdm3 gdm sddm lxdm ly greetd plasma-login-manager lemurs)
+    local known_dms=(gdm3 gdm sddm lightdm lxdm ly greetd plasma-login-manager lemurs)
     local dm_pkgs dm_unit
-    # Debian uses SDDM for this Niri setup; RHEL/Fedora use GDM.
+    # SDDM is used only as the Debian fallback. It does not require installing KDE Plasma.
     if [ "$DISTRO_FAMILY" = debian ]; then
         dm_pkgs="sddm"; dm_unit="sddm"
     else
         dm_pkgs="gdm"; dm_unit="gdm"
     fi
 
-    # what is currently configured/installed?
+    # Detect the DM that actually owns the system display-manager symlink first.
     local current=""
     if [ -e /etc/systemd/system/display-manager.service ]; then
         current=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "display-manager.service")
@@ -3610,33 +3638,34 @@ stage_dm() {
             if pkg_installed "$dm"; then current="$dm"; break; fi
         done
     fi
-    local old_dm="$current"
 
-    # Keep the existing DM only when explicitly requested. Even an already
-    # installed GDM must pass through the switch path so a stale SDDM/GDM
-    # enablement and display-manager symlink are corrected.
-    if [ "${EILNIRI_KEEP_DM:-0}" = "1" ]; then
-        local reason="already the chosen DM"
-        reason="EILNIRI_KEEP_DM=1, keep"
-        info_kv "$(_t "DM" "DM")" "${current:-none}" "$reason"
+    # An existing DM is user-owned configuration. Do not install, disable, enable,
+    # relink, or otherwise rewrite it. This also makes reruns safe on desktop systems.
+    if [ -n "$current" ]; then
+        info_kv "$(_t "DM" "DM")" "$current" "existing DM kept unchanged"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            systemctl set-default graphical.target 2>/dev/null || true
+        fi
         stage_mark dm
         return
     fi
-    [ -n "$current" ] && info_kv "$(_t "DM" "DM")" "$current" "will be replaced by $dm_pkgs"
+
+    info_kv "$(_t "DM" "DM")" "none" "installing lightweight fallback: $dm_pkgs"
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "$(_t "[DRY-RUN] would install & enable: " "[DRY-RUN] would install & enable: ") $dm_pkgs${current:+ ($(_t "disabling " "disabling ") $current)}"
+        log "$(_t "[DRY-RUN] would install & enable: " "[DRY-RUN] would install & enable: ") $dm_pkgs"
         DRY_PKGS+=("$dm_pkgs")
         DRY_SVCS+=("$dm_unit")
         stage_mark dm
         return
     fi
 
-    # --- install the chosen DM first; never disable the current one before the replacement is in place ---
+    # No DM exists, so install only the fallback package. SDDM itself does not pull
+    # the full KDE Plasma desktop; avoid adding desktop-environment meta-packages.
     local ok=0
     local dm_candidates=("$dm_pkgs|$dm_unit")
-    [ "$DISTRO_FAMILY" = debian ] && dm_candidates+=("gdm3|gdm3" "gdm|gdm")
-    [ "$DISTRO_FAMILY" != debian ] && dm_candidates+=("gdm3|gdm3" "sddm|sddm")
+    [ "$DISTRO_FAMILY" = debian ] && dm_candidates+=("gdm3|gdm")
+    [ "$DISTRO_FAMILY" != debian ] && dm_candidates+=("gdm|gdm")
     for tried in "${dm_candidates[@]}"; do
         local tpkg="${tried%%|*}" tunit="${tried##*|}"
         if pm_install "$tpkg"; then
@@ -3692,33 +3721,16 @@ stage_dm() {
                 ln -sfn "$dm_service" /etc/systemd/system/display-manager.service
                 systemctl daemon-reload 2>/dev/null || true
             fi
-            local dm
-            for dm in "${known_dms[@]}"; do
-                [ "$dm" = "$dm_unit" ] || exe systemctl disable --now "$dm.service" 2>/dev/null || true
-            done
             ENABLED_SVCS+=("$dm_unit")
             success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
             stage_mark dm
         else
             FAILED_PKGS+=("dm:$dm_unit")
-            if [ -n "$old_dm" ] && [ "$old_dm" != "$dm_unit" ]; then
-                systemctl enable "$old_dm" >/dev/null 2>&1 || true
-                local old_service="/lib/systemd/system/${old_dm}.service"
-                [ -e "$old_service" ] || old_service="/usr/lib/systemd/system/${old_dm}.service"
-                ln -sfn "$old_service" /etc/systemd/system/display-manager.service 2>/dev/null || true
-                warn "$(_t "Restored previous display manager after GDM verification failed: " "Restored previous display manager after GDM verification failed: ")$old_dm"
-            fi
             warn "$(_t "Display manager enable verification failed; run niri-session from tty after reboot." "Display manager enable verification failed; run niri-session from tty after reboot.")"
             # not marked: rerun retries
         fi
     else
         FAILED_PKGS+=("dm:$dm_unit")
-        if [ -n "$old_dm" ]; then
-            systemctl enable "$old_dm" >/dev/null 2>&1 || true
-            local old_service="/lib/systemd/system/${old_dm}.service"
-            [ -e "$old_service" ] || old_service="/usr/lib/systemd/system/${old_dm}.service"
-            ln -sfn "$old_service" /etc/systemd/system/display-manager.service 2>/dev/null || true
-        fi
         warn "$(_t "Display manager enable failed; run niri-session from tty after reboot." "Display manager enable failed; run niri-session from tty after reboot.")"
         # not marked: rerun retries
     fi
@@ -3853,6 +3865,8 @@ stage_configs() {
             sed -i 's#spawn-at-startup "swww-daemon"#spawn-at-startup "awww-daemon"#' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
             chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
         fi
+
+        _ensure_waybar_config
 
         # 光标拖影：QEMU/KVM 虚拟机常因虚拟硬件 cursor plane 与 Niri 不兼容。
         # Keep the environment file for user services, and export the same
@@ -4210,13 +4224,8 @@ stage_hardware_adapt() {
         success "$(_t "niri output adapted" "niri output adapted")"
     fi
 
-    # --- 3) fix the hardware sink in waybar config ---
-    if [ -f "$waybar_cfg" ]; then
-        if grep -q 'ignored-sinks' "$waybar_cfg" 2>/dev/null; then
-            sed -i 's/^\(\s*"ignored-sinks":[^]]*\]\)/\/* \1 *\//' "$waybar_cfg"
-            log "$(_t "waybar ignored-sinks commented" "waybar ignored-sinks commented")"
-        fi
-    fi
+    # --- 3) validate the Waybar config after hardware adaptation ---
+    _ensure_waybar_config
 
     # --- 4) polkit agent path per family (Arch: /usr/lib; Debian/RHEL: /usr/libexec) ---
     if [ -f "$niri_cfg" ] && grep -qE 'polkit-(gnome|mate|kde)|lxqt-policykit' "$niri_cfg" 2>/dev/null; then
