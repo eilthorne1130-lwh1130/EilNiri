@@ -62,7 +62,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.33"
+SCRIPT_VERSION="1.9.34"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -469,8 +469,10 @@ pm_install() { # $@ = package names
 # '^ ?Candidate:' (0-1 space) never matches and every package looks missing.
 apt_available() { # $1 = package name
     pkg_installed "$1" && return 0
-    LC_ALL=C apt-cache policy "$1" 2>/dev/null \
-        | grep -qE '^[[:space:]]*Candidate:[[:space:]]+[^([:space:]]'
+    local pol
+    pol=$(LC_ALL=C apt-cache policy "$1" 2>/dev/null) || return 1
+    echo "$pol" | grep -qE '^[[:space:]]*Candidate:[[:space:]]+\(none\)' && return 1
+    echo "$pol" | grep -qE '^[[:space:]]*Candidate:[[:space:]]+'
 }
 
 # Filter a package list to only the names apt can actually install.
@@ -576,7 +578,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v42"
+PROGRESS_VERSION="v43"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -2637,15 +2639,8 @@ _hypr_pc_ensure() { # $@ = pkg-config module names
         # Only install the mapped -dev packages that exist in this release; the
         # rest (e.g. libhyprutils-dev / libsdbus-c++-dev when absent) are supplied
         # by build_hypr_stack() from source.
-        local _avail=() _w
-        for _w in "${want[@]}"; do
-            apt_available "$_w" && _avail+=("$_w")
-        done
-        if [ ${#_avail[@]} -gt 0 ]; then
-            log "$(_t "Installing pkg-config modules for hypr build: " "Installing pkg-config modules for hypr build: ") ${missing[*]}"
-            pm_install "${_avail[@]}" 2>>"$LOG_DIR/apt-errors.log" || \
-                apt_install_tolerant "${_avail[@]}" >/dev/null 2>&1 || true
-        fi
+        log "$(_t "Installing pkg-config modules for hypr build: " "Installing pkg-config modules for hypr build: ") ${missing[*]}"
+        apt_install_tolerant "${want[@]}" || true
     fi
     local still=()
     for m in "${missing[@]}"; do
@@ -3145,8 +3140,9 @@ build_hypr_stack() { # $1 = optional target (hypridle|hyprlock); default both
         # (hyprwayland-scanner needs pugixml; hyprgraphics needs spng/pixman/cairo/...).
         case "$n" in
             hyprwayland-scanner)
-                if ! _hypr_pc_ensure pugixml; then
-                    echo "pugixml.pc missing after apt; install libpugixml-dev" >"$component_log"
+                _hypr_pc_ensure pugixml || true
+                if ! pkg-config --exists pugixml 2>/dev/null; then
+                    echo "pugixml.pc still missing; _build_pugixml should have run first" >"$component_log"
                     cat "$component_log" >>"$_log"
                     return 1
                 fi
@@ -3245,6 +3241,43 @@ build_hypr_stack() { # $1 = optional target (hypridle|hyprlock); default both
         return 1
     }
 
+    # pugixml is required by hyprwayland-scanner. Distro package first; if the
+    # apt index is stale / the package is absent, compile a small CMake release.
+    _build_pugixml() {
+        local ref="v1.14" pugixml_log="$_log-pugixml.log" _w="$_work/pugixml"
+        printf '\n=== pugixml (ref=%s cxx=%s) ===\n' "$ref" "${CXX:-}" >>"$_log"
+        rm -rf "$_w"
+        if ! git_clone_gh "https://github.com/zeux/pugixml" "$_w" "$ref"; then
+            echo "clone failed for pugixml ref=$ref" >"$pugixml_log"
+            cat "$pugixml_log" >>"$_log"
+            return 1
+        fi
+        if ( cd "$_w" \
+                && cmake -S . -B build -G Ninja \
+                    ${CXX:+-DCMAKE_CXX_COMPILER="$CXX"} \
+                    -DCMAKE_BUILD_TYPE=Release \
+                    -DBUILD_SHARED_LIBS=ON \
+                    -DCMAKE_INSTALL_PREFIX="$_prefix" -DCMAKE_INSTALL_LIBDIR="$_libdir" \
+                && cmake --build build -j"$(nproc)" \
+                && cmake --install build \
+                && { command -v ldconfig >/dev/null 2>&1 && ldconfig || true; } ) >"$pugixml_log" 2>&1; then
+            INSTALLED_PKGS+=("hypr-pugixml (source build $ref)")
+            log "$(_t "Built " "Built ") pugixml @$ref$(_t " from source" " from source")"
+            prepare_hypr_cmake_paths
+            return 0
+        fi
+        {
+            echo "cmake build failed for pugixml ref=$ref"
+            tail -n 40 "$pugixml_log"
+        } >>"$_log"
+        warn "$(_t "Hypr component failed: " "Hypr component failed: ") pugixml @$ref (see $pugixml_log)"
+        return 1
+    }
+
+    if ! pkg-config --exists pugixml 2>/dev/null; then
+        apt_install_tolerant libpugixml-dev || true
+        pkg-config --exists pugixml 2>/dev/null || _build_pugixml || return 1
+    fi
     _hypr_ok hyprwayland-scanner || _build_hypr_one hyprwayland-scanner || return 1
     _hypr_ok hyprutils || _build_hypr_one hyprutils || return 1
     _hypr_ok hyprlang || _build_hypr_one hyprlang || return 1
@@ -3296,26 +3329,14 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
             MANUAL_ITEMS+=("$pkg — C++ toolchain missing (g++/cmake/ninja); install: apt-get install build-essential cmake ninja-build")
             return 1
         fi
-        # Only install hypr build deps that actually exist in this release's repos.
-        # The hypr C++ stack dev packages (libhyprutils-dev / libhyprlang-dev /
-        # libhyprgraphics-dev / libhyprcursor-dev / hyprland-protocols / hyprwayland-
-        # scanner / libsdbus-c++-dev) are absent on many Debian/Ubuntu versions —
-        # skipping them here is intentional: build_hypr_stack() compiles the missing
-        # components from source. Attempting to install them only produces FAIL noise.
-        local _hypr_avail=() _p
-        _hypr_avail=( $(apt_filter_available "${HYPR_BUILD_DEPS_DEB[@]}") )
-        local _hypr_miss=()
-        for _p in "${HYPR_BUILD_DEPS_DEB[@]}"; do
-            apt_available "$_p" || _hypr_miss+=("$_p")
-        done
-        if [ ${#_hypr_miss[@]} -gt 0 ]; then
-            log "$(_t "Not in apt repos, will build from source: " "Not in apt repos, will build from source: ") ${_hypr_miss[*]}"
-        fi
-        if [ ${#_hypr_avail[@]} -gt 0 ]; then
-            apt_install_tolerant "${_hypr_avail[@]}" || _brc=$?
-        fi
+        # Always try the full hypr dep list via apt_install_tolerant (one-by-one
+        # retry). apt_available is unreliable after a failed apt-get update
+        # (stale/empty policy → every name looks missing, including libpugixml-dev).
+        # Names that really are not packaged (libhyprutils-dev, hyprwayland-scanner, ...)
+        # land in BDEPS_MISSING and are built from source by build_hypr_stack().
+        apt_install_tolerant "${HYPR_BUILD_DEPS_DEB[@]}" || _brc=$?
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some $pkg build deps unavailable (continuing with source stack):" "Some $pkg build deps unavailable (continuing with source stack):") ${BDEPS_MISSING[*]}"
+            log "$(_t "Not in apt repos, will build from source: " "Not in apt repos, will build from source: ") ${BDEPS_MISSING[*]}"
         fi
         if ! command -v g++ >/dev/null 2>&1 && ! command -v clang++ >/dev/null 2>&1; then
             MANUAL_ITEMS+=("$pkg — C++ compiler still missing after apt; install: apt-get install build-essential g++")
@@ -4036,6 +4057,8 @@ stage_configs() {
     # ~/.config/<name>
     for item in "$snap/.config"/*; do
         name=$(basename "$item")
+        # Stock fcitx5+rime only: do not overlay a custom fcitx5 profile/theme.
+        case "$name" in fcitx5|fcitx) continue ;; esac
         deploy_one "$item" "$HOME_DIR/.config/$name" "$ts"
     done
     # ~/.local/share/<name> (fixed niri-session etc.)
@@ -4160,31 +4183,6 @@ stage_configs() {
         _ensure_waypaper_desktop   # pip 装的 waypaper 无 .desktop → fuzzel 无图标
     fi
 
-    # fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
-    # Debian 12+ / Ubuntu 22.04+ (pam_env user_readenv removed), so the IME vars shipped
-    # there never load on modern systems. Write them to environment.d (systemd reads it)
-    # as a fallback when fcitx5 was selected and no ime.conf is already present.
-    if [ "$DRY_RUN" -eq 0 ]; then
-        local _has_ime=0
-        for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
-            case "$_p" in fcitx5|fcitx5-*) _has_ime=1; break ;; esac
-        done
-        if [ "$_has_ime" -eq 1 ] && [ -n "$TARGET_USER" ]; then
-            local _imed="$HOME_DIR/.config/environment.d"
-            mkdir -p "$_imed"
-            if [ ! -f "$_imed/ime.conf" ]; then
-                cat > "$_imed/ime.conf" <<'IMEEOF'
-GTK_IM_MODULE=fcitx5
-QT_IM_MODULE=fcitx5
-XMODIFIERS=@im=fcitx5
-SDL_IM_MODULE=fcitx5
-GLFW_IM_MODULE=fcitx5
-IMEEOF
-                chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_imed/ime.conf" 2>/dev/null || true
-                log "$(_t "Wrote ~/.config/environment.d/ime.conf (fcitx5 IME vars; .pam_environment is ignored on Debian 12+/Ubuntu 22.04+)" "Wrote ~/.config/environment.d/ime.conf (fcitx5 IME vars; .pam_environment is ignored on Debian 12+/Ubuntu 22.04+)")"
-            fi
-        fi
-    fi
     success "$(_t "Config deploy complete." "Config deploy complete.")"
     stage_mark configs
 }
