@@ -304,7 +304,7 @@ WAYPAPER_REPO="https://github.com/anufrievroman/waypaper"
 # absent and build_hypr_stack() compiles them from source in dependency order first.
 # Missing entries are tolerated (apt_install_tolerant / dnf_install_tolerant), so a
 # package absent on an older release never aborts the whole build-deps step.
-HYPR_BUILD_DEPS_DEB=(build-essential g++ cmake ninja-build pkg-config git libwayland-dev wayland-protocols hyprland-protocols
+HYPR_BUILD_DEPS_DEB=(build-essential g++ cmake ninja-build meson pkg-config git libwayland-dev wayland-protocols hyprland-protocols
     libpango1.0-dev libgbm-dev libdrm-dev libxkbcommon-dev libxcb1-dev libinput-dev
     libcairo2-dev libpam0g-dev libpixman-1-dev libjpeg-dev libwebp-dev
     librsvg2-dev libmagic-dev libpng-dev libpugixml-dev
@@ -819,7 +819,7 @@ ensure_debian_graphics_runtime() {
 
 ensure_hypr_cxx_toolchain() {
     [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
-    local _need=(build-essential g++ cmake ninja-build pkg-config git)
+    local _need=(build-essential g++ cmake ninja-build meson pkg-config git)
     local _p _missing=()
     for _p in "${_need[@]}"; do
         pkg_installed "$_p" || _missing+=("$_p")
@@ -2986,13 +2986,20 @@ build_hypr_stack() { # $1 = optional target (hypridle|hyprlock); default both
             cat "$component_log" >>"$_log" 2>/dev/null || true
             return 1
         fi
-        if [ ! -f "$_work/$n/CMakeLists.txt" ]; then
-            echo "cloned $_work/$n but CMakeLists.txt missing (empty/corrupt clone)" >"$component_log"
+        # hyprland-protocols is a Meson project (ships meson.build, no CMakeLists.txt);
+        # every other component in the stack uses CMake. Detect the build system first.
+        local _sys=cmake
+        if [ ! -f "$_work/$n/CMakeLists.txt" ] && [ -f "$_work/$n/meson.build" ]; then
+            _sys=meson
+        elif [ ! -f "$_work/$n/CMakeLists.txt" ]; then
+            echo "cloned $_work/$n but neither CMakeLists.txt nor meson.build found (empty/corrupt clone)" >"$component_log"
             ls -la "$_work/$n" >>"$component_log" 2>&1 || true
             cat "$component_log" >>"$_log"
             return 1
         fi
-        if ( cd "$_work/$n" \
+        local _rc=0
+        if [ "$_sys" = cmake ]; then
+            ( cd "$_work/$n" \
                 && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
                     ${CXX:+-DCMAKE_CXX_COMPILER="$CXX"} \
                     ${CC:+-DCMAKE_C_COMPILER="$CC"} \
@@ -3001,14 +3008,37 @@ build_hypr_stack() { # $1 = optional target (hypridle|hyprlock); default both
                     -DCMAKE_INSTALL_PREFIX="$_prefix" -DCMAKE_INSTALL_LIBDIR="$_libdir" \
                 && cmake --build build -j"$(nproc)" \
                 && cmake --install build \
-                && { command -v ldconfig >/dev/null 2>&1 && ldconfig || true; } ) >"$component_log" 2>&1; then
+                && { command -v ldconfig >/dev/null 2>&1 && ldconfig || true; } ) >"$component_log" 2>&1 || _rc=1
+        else
+            # Meson project (hyprland-protocols): install meson if missing, then
+            # setup + compile + install. It generates hyprland-protocols.pc under
+            # $_prefix/$_libdir/pkgconfig, which prepare_hypr_cmake_paths already exposes.
+            if ! command -v meson >/dev/null 2>&1; then
+                pm_install meson ninja-build 2>/dev/null || \
+                    apt_install_tolerant meson ninja-build >/dev/null 2>&1 || true
+            fi
+            if ! command -v meson >/dev/null 2>&1; then
+                {
+                    echo "meson missing for $n ref=$ref"
+                    echo "install: apt-get install meson ninja-build"
+                } >"$component_log"
+                cat "$component_log" >>"$_log"
+                return 1
+            fi
+            ( cd "$_work/$n" \
+                && meson setup build --prefix "$_prefix" --libdir "$_libdir" --buildtype release \
+                && meson compile -C build \
+                && meson install -C build \
+                && { command -v ldconfig >/dev/null 2>&1 && ldconfig || true; } ) >"$component_log" 2>&1 || _rc=1
+        fi
+        if [ "$_rc" -eq 0 ]; then
             INSTALLED_PKGS+=("hypr-$n (source build $ref)")
             log "$(_t "Built " "Built ") hypr-$n @$ref$(_t " from source" " from source")"
             prepare_hypr_cmake_paths
             return 0
         fi
         {
-            echo "cmake/build failed for $n ref=$ref"
+            echo "$_sys build failed for $n ref=$ref"
             tail -n 40 "$component_log"
         } >>"$_log"
         warn "$(_t "Hypr component failed: " "Hypr component failed: ") $n @$ref (see $component_log)"
