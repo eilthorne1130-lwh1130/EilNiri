@@ -460,6 +460,22 @@ pm_install() { # $@ = package names
     exe apt-get install -y "$@"
 }
 
+# True when apt has an installable candidate for $1 in the current repos.
+# Used to avoid attempting to install packages that simply do not exist in a
+# release (e.g. libhyprutils-dev / libhyprlang-dev on older Debian/Ubuntu) —
+# those are built from source instead.
+apt_available() { # $1 = package name
+    apt-cache policy "$1" 2>/dev/null | grep -qE '^ ?Candidate: [^ (]'
+}
+
+# Filter a package list to only the names apt can actually install.
+apt_filter_available() { # $@ = package names; echoes available ones
+    local _p
+    for _p in "$@"; do
+        apt_available "$_p" && echo "$_p"
+    done
+}
+
 # Resolve release-specific Debian package names against the current apt index.
 resolve_deb_package() {
     local logical="$1" candidate
@@ -2556,9 +2572,18 @@ _hypr_pc_ensure() { # $@ = pkg-config module names
     done
     [ ${#missing[@]} -eq 0 ] && return 0
     if [ ${#want[@]} -gt 0 ]; then
-        log "$(_t "Installing pkg-config modules for hypr build: " "Installing pkg-config modules for hypr build: ") ${missing[*]}"
-        pm_install "${want[@]}" 2>>"$LOG_DIR/apt-errors.log" || \
-            apt_install_tolerant "${want[@]}" >/dev/null 2>&1 || true
+        # Only install the mapped -dev packages that exist in this release; the
+        # rest (e.g. libhyprutils-dev / libsdbus-c++-dev when absent) are supplied
+        # by build_hypr_stack() from source.
+        local _avail=() _w
+        for _w in "${want[@]}"; do
+            apt_available "$_w" && _avail+=("$_w")
+        done
+        if [ ${#_avail[@]} -gt 0 ]; then
+            log "$(_t "Installing pkg-config modules for hypr build: " "Installing pkg-config modules for hypr build: ") ${missing[*]}"
+            pm_install "${_avail[@]}" 2>>"$LOG_DIR/apt-errors.log" || \
+                apt_install_tolerant "${_avail[@]}" >/dev/null 2>&1 || true
+        fi
     fi
     local still=()
     for m in "${missing[@]}"; do
@@ -3198,7 +3223,24 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
             MANUAL_ITEMS+=("$pkg — C++ toolchain missing (g++/cmake/ninja); install: apt-get install build-essential cmake ninja-build")
             return 1
         fi
-        apt_install_tolerant "${HYPR_BUILD_DEPS_DEB[@]}" || _brc=$?
+        # Only install hypr build deps that actually exist in this release's repos.
+        # The hypr C++ stack dev packages (libhyprutils-dev / libhyprlang-dev /
+        # libhyprgraphics-dev / libhyprcursor-dev / hyprland-protocols / hyprwayland-
+        # scanner / libsdbus-c++-dev) are absent on many Debian/Ubuntu versions —
+        # skipping them here is intentional: build_hypr_stack() compiles the missing
+        # components from source. Attempting to install them only produces FAIL noise.
+        local _hypr_avail=() _p
+        _hypr_avail=( $(apt_filter_available "${HYPR_BUILD_DEPS_DEB[@]}") )
+        local _hypr_miss=()
+        for _p in "${HYPR_BUILD_DEPS_DEB[@]}"; do
+            apt_available "$_p" || _hypr_miss+=("$_p")
+        done
+        if [ ${#_hypr_miss[@]} -gt 0 ]; then
+            log "$(_t "Not in apt repos, will build from source: " "Not in apt repos, will build from source: ") ${_hypr_miss[*]}"
+        fi
+        if [ ${#_hypr_avail[@]} -gt 0 ]; then
+            apt_install_tolerant "${_hypr_avail[@]}" || _brc=$?
+        fi
         if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
             warn "$(_t "Some $pkg build deps unavailable (continuing with source stack):" "Some $pkg build deps unavailable (continuing with source stack):") ${BDEPS_MISSING[*]}"
         fi
