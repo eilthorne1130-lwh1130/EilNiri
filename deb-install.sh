@@ -307,7 +307,8 @@ WAYPAPER_REPO="https://github.com/anufrievroman/waypaper"
 HYPR_BUILD_DEPS_DEB=(build-essential g++ cmake ninja-build meson pkg-config git libwayland-dev wayland-protocols hyprland-protocols
     libpango1.0-dev libgbm-dev libdrm-dev libxkbcommon-dev libxcb1-dev libinput-dev
     libcairo2-dev libpam0g-dev libpixman-1-dev libjpeg-dev libwebp-dev
-    librsvg2-dev libmagic-dev libpng-dev libpugixml-dev
+    librsvg2-dev libmagic-dev libpng-dev libspng-dev libpugixml-dev
+    libegl-dev libgles-dev libsystemd-dev
     libhyprutils-dev libhyprlang-dev libhyprgraphics-dev libhyprcursor-dev
     libsdbus-c++-dev hyprwayland-scanner)
 # Mesa/DRM runtime (not -dev). Server/cloud images can compile niri then black-screen
@@ -2517,6 +2518,58 @@ prepare_hypr_cmake_paths() {
     export CMAKE_PREFIX_PATH CMAKE_MODULE_PATH PKG_CONFIG_PATH
 }
 
+# pkg-config module -> Debian package (for the hypr C++ stack's system deps).
+# Missing names are tolerated: only modules with a mapping are auto-installed.
+declare -A HYPR_PC_DEB=(
+    [spng]=libspng-dev
+    [egl]=libegl-dev
+    [wayland-egl]=libegl-dev
+    [glesv2]=libgles-dev
+    [libjxl]=libjxl-dev
+    [libjxl_cms]=libjxl-dev
+    [libjxl_threads]=libjxl-dev
+    [pixman-1]=libpixman-1-dev
+    [cairo]=libcairo2-dev
+    [libjpeg]=libjpeg-dev
+    [libwebp]=libwebp-dev
+    [libmagic]=libmagic-dev
+    [pangocairo]=libpango1.0-dev
+    [libdrm]=libdrm-dev
+    [gbm]=libgbm-dev
+    [libsystemd]=libsystemd-dev
+    [sdbus-c++]=libsdbus-c++-dev
+    [wayland-client]=libwayland-dev
+    [wayland-protocols]=wayland-protocols
+    [xkbcommon]=libxkbcommon-dev
+)
+
+# Ensure the given pkg-config modules resolve; auto-install the mapped -dev
+# packages when one is missing (hyprgraphics needs spng; hyprlock needs
+# egl/wayland-egl/glesv2/pangocairo, etc.). Returns 0 only when everything is
+# present after the install attempt.
+_hypr_pc_ensure() { # $@ = pkg-config module names
+    local m missing=() want=()
+    for m in "$@"; do
+        pkg-config --exists "$m" 2>/dev/null && continue
+        missing+=("$m")
+        [ -n "${HYPR_PC_DEB[$m]:-}" ] && want+=("${HYPR_PC_DEB[$m]}")
+    done
+    [ ${#missing[@]} -eq 0 ] && return 0
+    if [ ${#want[@]} -gt 0 ]; then
+        log "$(_t "Installing pkg-config modules for hypr build: " "Installing pkg-config modules for hypr build: ") ${missing[*]}"
+        pm_install "${want[@]}" 2>>"$LOG_DIR/apt-errors.log" || \
+            apt_install_tolerant "${want[@]}" >/dev/null 2>&1 || true
+    fi
+    local still=()
+    for m in "${missing[@]}"; do
+        pkg-config --exists "$m" 2>/dev/null || still+=("$m")
+    done
+    [ ${#still[@]} -eq 0 ] && return 0
+    warn "$(_t "hypr build missing pkg-config modules: " "hypr build missing pkg-config modules: ") ${still[*]}"
+    return 1
+}
+
+
 ensure_wayland_protocols_pkgconfig() {
     local protocol_dir pc_dir pc_file version
     prepare_debian_pkgconfig
@@ -2997,6 +3050,18 @@ build_hypr_stack() { # $1 = optional target (hypridle|hyprlock); default both
             cat "$component_log" >>"$_log"
             return 1
         fi
+        # Ensure this component's system pkg-config modules resolve before building
+        # (hyprgraphics needs spng/pixman/cairo/libjpeg/libwebp/libmagic + hyprutils).
+        case "$n" in
+            hyprgraphics)
+                _hypr_pc_ensure pixman-1 cairo hyprutils libjpeg libwebp libmagic spng || true
+                ;;
+            hyprlock|hypridle)
+                _hypr_pc_ensure wayland-client wayland-protocols wayland-egl egl glesv2 \
+                    hyprlang xkbcommon libjpeg libwebp libmagic cairo pangocairo \
+                    libdrm gbm hyprutils hyprgraphics sdbus-c++ || true
+                ;;
+        esac
         local _rc=0
         if [ "$_sys" = cmake ]; then
             ( cd "$_work/$n" \
@@ -3045,12 +3110,53 @@ build_hypr_stack() { # $1 = optional target (hypridle|hyprlock); default both
         return 1
     }
 
+    # sdbus-c++ is required by hyprlock/hypridle but is NOT part of the hyprwm stack.
+    # Prefer the distro package; build from source only when libsdbus-c++-dev is
+    # unavailable on this release (v2.1.0, needs libsystemd.pc from libsystemd-dev).
+    _build_sdbus_cpp() {
+        local ref="v2.1.0" sdbus_log="$_log-sdbus-c++.log" _w="$_work/sdbus-cpp"
+        _hypr_pc_ensure libsystemd >/dev/null 2>&1 || true
+        printf '\n=== sdbus-c++ (ref=%s cxx=%s) ===\n' "$ref" "${CXX:-}" >>"$_log"
+        rm -rf "$_w"
+        if ! git_clone_gh "https://github.com/Kistler-Group/sdbus-cpp" "$_w" "$ref"; then
+            echo "clone failed for sdbus-c++ ref=$ref" >"$sdbus_log"
+            cat "$sdbus_log" >>"$_log"
+            return 1
+        fi
+        if ( cd "$_w" \
+                && cmake -S . -B build -G Ninja \
+                    ${CXX:+-DCMAKE_CXX_COMPILER="$CXX"} \
+                    -DCMAKE_BUILD_TYPE=Release \
+                    -DSDBUSCPP_BUILD_TESTS=OFF -DSDBUSCPP_BUILD_EXAMPLES=OFF \
+                    -DSDBUSCPP_BUILD_DOCS=OFF -DSDBUSCPP_BUILD_CODEGEN=OFF \
+                    -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" -DCMAKE_MODULE_PATH="$CMAKE_MODULE_PATH" \
+                    -DCMAKE_INSTALL_PREFIX="$_prefix" -DCMAKE_INSTALL_LIBDIR="$_libdir" \
+                && cmake --build build -j"$(nproc)" \
+                && cmake --install build \
+                && { command -v ldconfig >/dev/null 2>&1 && ldconfig || true; } ) >"$sdbus_log" 2>&1; then
+            INSTALLED_PKGS+=("hypr-sdbus-c++ (source build $ref)")
+            log "$(_t "Built " "Built ") sdbus-c++ @$ref$(_t " from source" " from source")"
+            prepare_hypr_cmake_paths
+            return 0
+        fi
+        {
+            echo "cmake build failed for sdbus-c++ ref=$ref"
+            tail -n 40 "$sdbus_log"
+        } >>"$_log"
+        warn "$(_t "Hypr component failed: " "Hypr component failed: ") sdbus-c++ @$ref (see $sdbus_log)"
+        return 1
+    }
+
     _hypr_ok hyprwayland-scanner || _build_hypr_one hyprwayland-scanner || return 1
     _hypr_ok hyprutils || _build_hypr_one hyprutils || return 1
     _hypr_ok hyprlang || _build_hypr_one hyprlang || return 1
     _hypr_ok hyprland-protocols || _build_hypr_one hyprland-protocols || return 1
     if [ "$_want" = hyprlock ] || [ "$_want" = all ]; then
         _hypr_ok hyprgraphics || _build_hypr_one hyprgraphics || return 1
+    fi
+    # sdbus-c++ must be present before hyprlock/hypridle configure.
+    if ! pkg-config --exists sdbus-c++ 2>/dev/null; then
+        _build_sdbus_cpp || return 1
     fi
     if _hypr_ok hyprwayland-scanner && _hypr_ok hyprutils && _hypr_ok hyprlang && _hypr_ok hyprland-protocols; then
         touch "$LOG_DIR/hypr-stack.ok"
@@ -3139,8 +3245,13 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
         prepare_debian_pkgconfig
         prepare_hypr_cmake_paths
-        if [ "$pkg" = hypridle ] && ! hypridle_pkgconfig_check "$work/$pkg/CMakeLists.txt"; then
-            warn "$(_t "hypridle pkg-config still incomplete after stack build; CMake will report the missing module." "hypridle pkg-config still incomplete after stack build; CMake will report the missing module.")"
+        # Self-heal system pkg-config modules the target links against
+        # (egl/wayland-egl/glesv2/pangocairo/libdrm/gbm/sdbus-c++ ...).
+        _hypr_pc_ensure wayland-client wayland-protocols wayland-egl egl glesv2 \
+            hyprlang xkbcommon libjpeg libwebp libmagic cairo pangocairo \
+            libdrm gbm hyprutils hyprgraphics sdbus-c++ || true
+        if { [ "$pkg" = hypridle ] || [ "$pkg" = hyprlock ]; } && ! hypridle_pkgconfig_check "$work/$pkg/CMakeLists.txt"; then
+            warn "$(_t "$pkg pkg-config still incomplete after stack build; CMake will report the missing module." "$pkg pkg-config still incomplete after stack build; CMake will report the missing module.")"
         fi
         ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
             ${CXX:+-DCMAKE_CXX_COMPILER="$CXX"} \
