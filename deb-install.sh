@@ -423,32 +423,46 @@ check_root() {
 }
 
 detect_distro() {
-    local id_like="" id=""
+    local id_like="" id="" debver=""
     if [ -f /etc/os-release ]; then
         id=$(. /etc/os-release; echo "${ID:-}")
         id_like=$(. /etc/os-release; echo "${ID_LIKE:-}")
     fi
+    # /etc/debian_version is the marker every true Debian derivative ships
+    # (deepin/UOS/Kali/MX/Parrot/麒麟…, and Ubuntu too). Derivatives often have an
+    # os-release ID/ID_LIKE that does not mention debian/ubuntu at all, so the file
+    # check is what makes "any Debian-based distro" work.
+    [ -f /etc/debian_version ] && debver=$(head -n1 /etc/debian_version 2>/dev/null)
     DISTRO_ID="$id"
     DISTRO_ID_LIKE="$id_like"
     case " $id $id_like " in
-        *debian*|*ubuntu*|*mint*|*pop*) DISTRO_FAMILY=debian ;;
+        *debian*|*ubuntu*) DISTRO_FAMILY=debian ;;
         *)
-            error "This script is for Debian / Ubuntu / Mint / Pop (ID=$id ID_LIKE=$id_like). Use ./arch-install.sh or ./RHEL-install.sh instead."
-            exit 1
+            if [ -n "$debver" ]; then
+                DISTRO_FAMILY=debian
+            else
+                error "This script is for Debian and any Debian-based distro (ID=$id ID_LIKE=$id_like, no /etc/debian_version found). Use ./arch-install.sh or ./RHEL-install.sh instead."
+                exit 1
+            fi
             ;;
     esac
-    # Ubuntu version (numeric, e.g. 24.04 -> 2404); used for release-aware hints
-    if [ "$id" = ubuntu ]; then
-        local ver maj min
-        ver=$(. /etc/os-release; echo "${VERSION_ID:-}")
-        maj=$(printf '%s' "$ver" | cut -d. -f1)
-        min=$(printf '%s' "$ver" | cut -d. -f2)
-        [[ "$maj" =~ ^[0-9]+$ ]] && UBUNTU_VER_NUM=$(( maj * 100 + 10#${min:-0} ))
-    fi
+    # Ubuntu-family version (numeric, e.g. 24.04 -> 2404); used for release-aware hints.
+    # Mint/Pop also carry a compatible VERSION_ID.
+    case "$id" in
+        ubuntu|linuxmint|pop)
+            local ver maj min
+            ver=$(. /etc/os-release; echo "${VERSION_ID:-}")
+            maj=$(printf '%s' "$ver" | cut -d. -f1)
+            min=$(printf '%s' "$ver" | cut -d. -f2)
+            [[ "$maj" =~ ^[0-9]+$ ]] && UBUNTU_VER_NUM=$(( maj * 100 + 10#${min:-0} ))
+            ;;
+    esac
     export DEBIAN_FRONTEND=noninteractive
     local uver=""
     [ "$UBUNTU_VER_NUM" -gt 0 ] && uver=" UBUNTU $UBUNTU_VER_NUM"
-    info_kv "$(_t "Distro" "Distro")" "$DISTRO_FAMILY" "(ID=$id$uver)"
+    local dver=""
+    [ -n "$debver" ] && dver=" debian $debver"
+    info_kv "$(_t "Distro" "Distro")" "$DISTRO_FAMILY" "(ID=$id$dver$uver)"
 }
 
 pkg_installed() { # $1 = package name
@@ -720,29 +734,69 @@ export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:${PATH
 cfg="${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl"
 tmp="${cfg}.eilniri-output.$$"
 
-out=""
+# Collect EVERY connected DRM connector (strip the cardN- prefix; cardN can be
+# multi-digit). Install-time detection may see a different set than the login
+# session (esp. on VMs / hybrid GPUs), so this re-runs at every session start.
+outs=()
 for status in /sys/class/drm/card*-*/status; do
     [ -f "$status" ] || continue
     [ "$(<"$status")" = connected ] || continue
-    dir=${status%/status}
-    candidate=${dir##*/}
-    candidate=${candidate#card[0-9]-}
-    [ -n "$candidate" ] || continue
-    out="$candidate"; break
+    cand=${status%/status}
+    cand=${cand##*/}
+    cand=$(printf '%s' "$cand" | sed -E 's/^card[0-9]+-//')
+    [ -n "$cand" ] || continue
+    case " ${outs[*]:-} " in
+        *" $cand "*) ;;          # same connector name on two cards — keep once
+        *) outs+=("$cand") ;;
+    esac
 done
 
-# Rename the first output block to the live connector. Never rewrite mode:
-# a hardcoded @60 (or preferred-mode @60) that the panel cannot do leaves
-# niri with "display output is not active" → black screen after login.
-if [ -n "$out" ] && [ -f "$cfg" ]; then
-    awk -v output="$out" '
-        BEGIN { replaced=0 }
-        !replaced && $0 ~ /^[[:space:]]*output[[:space:]]+"/ {
-            print "output \"" output "\" {"
-            replaced=1; next
-        }
-        { print }
-    ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+# Rewrite the ACTIVE output blocks: one clean block per connected output, the
+# first gets focus-at-startup. Never write mode/scale/position: niri picks the
+# connector's preferred mode, and a hardcoded @60 (or a stale scale/position
+# from another machine) black-screens or misplaces the desktop. /-commented
+# blocks are documentation and are left untouched.
+if [ "${#outs[@]}" -gt 0 ] && [ -f "$cfg" ]; then
+    tmp2="${cfg}.eilniri-new.$$"
+    trap 'rm -f "$tmp2"' EXIT
+    : > "$tmp2"
+    depth=0 replaced=0 inblock=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$replaced" -eq 0 ] && printf '%s' "$line" | grep -qE '^[[:space:]]*output[[:space:]]+"'; then
+            i=0
+            for o in "${outs[@]}"; do
+                if [ "$i" -eq 0 ]; then
+                    printf 'output "%s" {\n    focus-at-startup\n}\n' "$o" >> "$tmp2"
+                else
+                    printf 'output "%s" {\n}\n' "$o" >> "$tmp2"
+                fi
+                i=$((i + 1))
+            done
+            replaced=1
+            inblock=1
+            depth=$(printf '%s' "$line" | grep -o '{' | wc -l)
+            depth=$((depth - $(printf '%s' "$line" | grep -o '}' | wc -l)))
+            [ "$depth" -le 0 ] && inblock=0
+            continue
+        fi
+        if [ "$inblock" -eq 1 ]; then
+            # consume the old block (brace-depth tracking; blocks are flat but
+            # stay safe if a future niri adds nested syntax)
+            o=$(printf '%s' "$line" | grep -o '{' | wc -l)
+            c=$(printf '%s' "$line" | grep -o '}' | wc -l)
+            depth=$((depth + o - c))
+            [ "$depth" -le 0 ] && inblock=0
+            continue
+        fi
+        printf '%s\n' "$line" >> "$tmp2"
+    done < "$cfg"
+    if [ "$replaced" -eq 1 ] && [ -s "$tmp2" ]; then
+        if command -v niri >/dev/null 2>&1 && ! niri validate -c "$tmp2" >/dev/null 2>&1; then
+            echo "eilNiri: output rewrite failed validation — keeping existing config" >&2
+        else
+            mv "$tmp2" "$cfg"
+        fi
+    fi
 fi
 
 if [ -x /usr/local/bin/niri-session.real ]; then
@@ -2204,14 +2258,18 @@ install_awww_from_build() { # $1 = srcdir, $2 = logfile
 # 修正 waypaper config.ini 与 hyprlock.conf（锁屏壁纸）里指向参考机的绝对路径。
 _ensure_wallpaper() {
     [ "$DRY_RUN" -eq 1 ] && return 0
+    # awww（swww 的后继，发行版无包 → cargo 源码后台编译）只是“即时应用壁纸”的载体。
+    # 它在本 stage 运行时通常还没装上（stage_wait_builds 在 stage_configs 之后才安装
+    # 编译产物，编译失败时更是永远装不上）——绝不能因为它缺席就跳过壁纸部署。
+    # 壁纸文件与 waypaper/hyprlock 配置无条件就位：登录后 waypaper.service --restore
+    # 即可恢复默认壁纸；awww 存在时再额外主动应用一次。
     local _awww_bin=""
     for _awww_bin in /usr/local/bin/awww /usr/bin/awww "$HOME_DIR/.local/bin/awww"; do
         [ -x "$_awww_bin" ] && break
         _awww_bin=""
     done
-    [ -n "$_awww_bin" ] || return 0   # awww 缺失由 install_awww 处理
 
-    local _img="" _cand _ext=""
+    local _img="" _cand
     # 1) 仓库根目录那张图（QQ图片....jpeg / wallpaper.*）统一部署为
     #    ~/.local/share/backgrounds/wallpaper.jpg，hyprlock 与 waypaper 都指向它。
     mkdir -p "$HOME_DIR/.local/share/backgrounds"
@@ -2260,19 +2318,12 @@ PYEOF
     fi
 
     if [ -f "$_img" ]; then
-        mkdir -p "$HOME_DIR/.config/awww"
-        printf '%s\n' "$_img" > "$HOME_DIR/.config/awww/wallpaper"
-        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/awww" 2>/dev/null || true
-        log "$(_t "Wallpaper state written: " "Wallpaper state written: ") $_img"
-        # 修正 waypaper config.ini 里指向参考机的绝对路径（新机器上不存在则换成壁纸图）
+        # --- 无条件修正 waypaper config.ini / hyprlock.conf：路径一律展开为绝对路径
+        #     （模板里的 $HOME 字面量 waypaper 不展开，restore 会静默失败 → 无壁纸）---
         local _wpconf="$HOME_DIR/.config/waypaper/config.ini"
         if [ -f "$_wpconf" ]; then
-            local _oldwp
-            _oldwp=$(grep -E '^wallpaper\s*=' "$_wpconf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \r')
-            if [ -n "$_oldwp" ] && [ ! -f "$_oldwp" ]; then
-                log "$(_t "waypaper config.ini points to missing path " "waypaper config.ini points to missing path ") $_oldwp$(_t " -> " " -> ") $_img"
-                sed -i "s#^wallpaper\s*=.*#wallpaper = $_img#" "$_wpconf" 2>/dev/null || true
-            fi
+            sed -i "s#^wallpaper\s*=.*#wallpaper = $_img#" "$_wpconf" 2>/dev/null || true
+            sed -i "s#^folder\s*=.*#folder = $HOME_DIR/.local/share/backgrounds#" "$_wpconf" 2>/dev/null || true
             # stylesheet 键：配置里的参考机绝对路径通常是 $HOME 字面量，这里展开成绝对路径
             local _oldss
             _oldss=$(grep -E '^stylesheet\s*=' "$_wpconf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \r')
@@ -2287,30 +2338,39 @@ PYEOF
         local _hlconf="$HOME_DIR/.config/hypr/hyprlock.conf"
         if [ -f "$_hlconf" ]; then
             log "$(_t "hyprlock wallpaper path -> " "hyprlock wallpaper path -> ") $_img"
-            sed -i -E "s#^(\s*path\s*=).*#\1 $_img#" "$_hlconf" 2>/dev/null || true
+            # 只改 background 块内的 path=，避免误伤文件里其他 path 键
+            sed -i -E "/^[[:space:]]*background[[:space:]]*\{/,/^[[:space:]]*\}/ s#^([[:space:]]*path[[:space:]]*=).*#\1 $_img#" "$_hlconf" 2>/dev/null || true
             sed -i 's/JetBrains Mono Nerd Font/JetBrainsMono Nerd Font/g' "$_hlconf" 2>/dev/null || true
         fi
         if [ -d "$HOME_DIR/.config/hypr" ]; then
             chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/hypr" 2>/dev/null || true
         fi
-        if [ -f "$_wpconf" ]; then
-            sed -i "s#^wallpaper\s*=.*#wallpaper = $_img#" "$_wpconf" 2>/dev/null || true
-            sed -i "s#^folder\s*=.*#folder = $HOME_DIR/.local/share/backgrounds#" "$_wpconf" 2>/dev/null || true
-        fi
-        # 主动 set：只写状态文件不够——显式让 awww-daemon 应用这张壁纸（daemon 若已响应
-        # 自己读状态文件并应用；此处再主动调用一次确保生效，失败不影响已写状态）。
-        if command -v as_user >/dev/null 2>&1; then
-            local _awww_cmd="$_awww_bin"
-            if ! pgrep -u "$TARGET_USER" -x awww-daemon >/dev/null 2>&1; then
-                as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
-                    nohup /usr/local/bin/awww-daemon >/dev/null 2>>"$LOG_DIR/awww-daemon.log" &
-                sleep 1
-            fi
-            exe as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
-                "$_awww_cmd" img "$_img" 2>>"$LOG_DIR/awww-set.log" || \
+        log "$(_t "Default wallpaper deployed: " "Default wallpaper deployed: ") $_img"
+
+        # --- awww 存在才做“即时应用”：状态文件 + daemon + img（登录时的即时生效） ---
+        if [ -n "$_awww_bin" ]; then
+            # 只写状态文件不够——awww-daemon 必须启动时就有壁纸状态（见
+            # mylinuxforwork/dotfiles#1574），此处再主动调用一次确保生效。
+            mkdir -p "$HOME_DIR/.config/awww"
+            printf '%s\n' "$_img" > "$HOME_DIR/.config/awww/wallpaper"
+            chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/awww" 2>/dev/null || true
+            log "$(_t "Wallpaper state written: " "Wallpaper state written: ") $_img"
+            if command -v as_user >/dev/null 2>&1; then
+                local _awww_cmd="$_awww_bin"
+                if ! pgrep -u "$TARGET_USER" -x awww-daemon >/dev/null 2>&1; then
+                    as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
+                        nohup /usr/local/bin/awww-daemon >/dev/null 2>>"$LOG_DIR/awww-daemon.log" &
+                    sleep 1
+                fi
                 exe as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
-                "$_awww_cmd" set "$_img" 2>>"$LOG_DIR/awww-set.log" || true
-            log "$(_t "awww default wallpaper applied: " "awww default wallpaper applied: ") $_img"
+                    "$_awww_cmd" img "$_img" 2>>"$LOG_DIR/awww-set.log" || \
+                    exe as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
+                    "$_awww_cmd" set "$_img" 2>>"$LOG_DIR/awww-set.log" || true
+                log "$(_t "awww default wallpaper applied: " "awww default wallpaper applied: ") $_img"
+            fi
+        else
+            warn "$(_t "awww 未装好（源码编译进行中或失败）。壁纸文件已就位：登录后 waypaper.service 会自动恢复默认壁纸；若 awww 编译失败请看 Summary 的手动项。" "awww is not installed yet (building in background, or the build failed). The wallpaper file is in place: waypaper.service will restore it on login; if the awww build failed, see the manual items in the Summary.")"
+            MANUAL_ITEMS+=("awww — 壁纸文件已就位（$_img）；awww 装好后执行 awww img $_img 即可即时应用，或重跑 restore")
         fi
     fi
 }
@@ -2321,24 +2381,135 @@ _ensure_waybar_config() {
     [ -f "$_cfg" ] || return 0
 
     # Hardware-specific ignored-sinks entries make Waybar fail on machines whose
-    # PulseAudio sink names differ. Remove that optional key when the config cannot
-    # be parsed, then validate with Waybar itself when available.
+    # PulseAudio sink names differ. Remove that optional key ONLY when the config
+    # really cannot be parsed. Use a pure JSON syntax check instead of launching a
+    # real waybar: as root there is no wayland display, and a live waybar that is
+    # SIGTERMed after 1s exits non-zero — the old logic misread that as "invalid"
+    # and stripped ignored-sinks from perfectly good configs on every run.
     local _valid=1
-    if command -v waybar >/dev/null 2>&1; then
-        waybar -c "$_cfg" -s /dev/null >/dev/null 2>"$LOG_DIR/waybar-config.log" &
-        local _pid=$!
-        sleep 1
-        kill "$_pid" 2>/dev/null || true
-        wait "$_pid" 2>/dev/null && _valid=0 || true
-        grep -q "error parsing JSON" "$LOG_DIR/waybar-config.log" 2>/dev/null && _valid=1
-    else
-        command -v jq >/dev/null 2>&1 && jq empty "$_cfg" >/dev/null 2>"$LOG_DIR/waybar-config.log" || _valid=0
+    if command -v jq >/dev/null 2>&1; then
+        jq empty "$_cfg" >/dev/null 2>"$LOG_DIR/waybar-config.log" && _valid=0 || _valid=1
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$_cfg" >/dev/null 2>"$LOG_DIR/waybar-config.log" && _valid=0 || _valid=1
     fi
     if [ "$_valid" -ne 0 ]; then
         sed -i '/^[[:space:]]*"ignored-sinks"[[:space:]]*:/d' "$_cfg"
         log "$(_t "Removed incompatible Waybar ignored-sinks entry; config repaired." "Removed incompatible Waybar ignored-sinks entry; config repaired.")"
     fi
     chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg" 2>/dev/null || true
+}
+
+install_waybar_guard() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _guard=/usr/local/bin/eilniri-waybar-start
+    cat > "$_guard" <<'GUARDEOF'
+#!/usr/bin/env bash
+# eilNiri: niri 的 waybar 启动守卫。已有实例在跑就直接退出——
+# 即使多个来源同时拉起 waybar，桌面上也只会有一条栏。
+if pgrep -x waybar >/dev/null 2>&1; then
+    exit 0
+fi
+exec waybar "$@"
+GUARDEOF
+    chmod 755 "$_guard"
+}
+
+# --- waybar 单实例化：Debian 的 waybar 包自带 /usr/lib/systemd/user/waybar.service
+# （WantedBy=graphical-session.target）。它一旦被 enable（发行版 preset / 手动 / 旧
+# 尝试），登录时 systemd 拉起一条栏，加上 niri config 的 spawn-at-startup 就是两条。
+# 统一为唯一来源：niri 经守卫脚本启动一次，其余启动来源（user unit / autostart）关掉，
+# 守卫脚本自身再兜底去重。幂等，重跑安全。
+_ensure_waybar_single_source() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    install_waybar_guard
+    local niri_cfg="$HOME_DIR/.config/niri/config.kdl"
+    if [ -f "$niri_cfg" ]; then
+        local tmp
+        tmp=$(mktemp)
+        register_temp_path "$tmp"
+        # 注释行原样保留；所有未注释的 waybar 启动行（含旧的直接 spawn 和旧的守卫行）
+        # 归并为唯一一条守卫启动。
+        awk '
+            /^[[:space:]]*\/\// { print; next }
+            /^[[:space:]]*spawn-at-startup/ && /("waybar"|eilniri-waybar-start)/ {
+                if (!seen) {
+                    print "spawn-at-startup \"/usr/local/bin/eilniri-waybar-start\""
+                    seen = 1
+                }
+                next
+            }
+            { print }
+        ' "$niri_cfg" > "$tmp" && mv "$tmp" "$niri_cfg"
+        exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$niri_cfg"
+    fi
+    # 发行版包自带的 user unit 若被启用，graphical-session.target 会拉起第二条栏
+    as_user systemctl --user disable --quiet waybar.service 2>/dev/null || true
+    # 用户级 XDG autostart 条目（如有）一并移除
+    rm -f "$HOME_DIR/.config/autostart"/waybar*.desktop 2>/dev/null || true
+    log "$(_t "waybar 启动源已统一为 niri 守卫脚本（禁用 waybar.service 自启，清理 autostart 条目）" "waybar startup unified to the niri guard script (waybar.service autostart disabled, autostart entries removed)")"
+}
+
+# --- 输入法环境：此前 deb 版完全不写 IME 环境变量（arch 版写 environment.d/ime.conf）。
+# niri config 的 environment 块只覆盖 niri 直接 spawn 的进程；systemd 用户服务 /
+# XDG autostart 拉起的应用拿不到 GTK_IM_MODULE/QT_IM_MODULE/XMODIFIERS → 预编辑
+# （高亮组词）行为异常、在输入框里直接消失。三处保持一致（值统一用 fcitx）：
+# niri config 块（configs 模板自带）+ environment.d + /etc/environment。
+_configure_ime() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _imed="$HOME_DIR/.config/environment.d"
+    mkdir -p "$_imed"
+    cat > "$_imed/00-ime.conf" <<'IMEEOF'
+# eilNiri: fcitx5 输入法环境变量（覆盖 systemd 用户服务与 XDG autostart 启动的应用；
+# .pam_environment 在 Debian 12+/Ubuntu 22.04+ 默认失效，故写这里）
+GTK_IM_MODULE=fcitx
+QT_IM_MODULE=fcitx
+XMODIFIERS=@im=fcitx
+SDL_IM_MODULE=fcitx
+GLFW_IM_MODULE=ibus
+IMEEOF
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_imed/00-ime.conf" 2>/dev/null || true
+    log "$(_t "Wrote ~/.config/environment.d/00-ime.conf (fcitx IME vars)" "Wrote ~/.config/environment.d/00-ime.conf (fcitx IME vars)")"
+
+    # /etc/environment：PAM 会话级兜底（DM 直接拉起的会话也拿得到这些变量）
+    if ! grep -q "^# >>> eilNiri IME >>>" /etc/environment 2>/dev/null; then
+        [ -f /etc/environment ] || touch /etc/environment
+        {
+            echo ""
+            echo "# >>> eilNiri IME >>>"
+            echo "GTK_IM_MODULE=fcitx"
+            echo "QT_IM_MODULE=fcitx"
+            echo "XMODIFIERS=@im=fcitx"
+            echo "SDL_IM_MODULE=fcitx"
+            echo "GLFW_IM_MODULE=ibus"
+            echo "# <<< eilNiri IME <<<"
+        } >> /etc/environment
+        log "$(_t "Added fcitx IME vars to /etc/environment" "Added fcitx IME vars to /etc/environment")"
+    fi
+
+    # fcitx5 单实例：Debian 包自带 /etc/xdg/autostart/org.fcitx.Fcitx5.desktop，
+    # niri 会话的 xdg-desktop-autostart.target 会拉起它，与 niri config 的
+    # spawn-at-startup "fcitx5" 叠成两个实例互抢输入（预编辑异常的常见来源）。
+    # 用 XDG autostart 标准的 Hidden=true 在用户级屏蔽系统条目。
+    if [ -f /etc/xdg/autostart/org.fcitx.Fcitx5.desktop ]; then
+        mkdir -p "$HOME_DIR/.config/autostart"
+        printf '[Desktop Entry]\nType=Application\nName=fcitx5\nHidden=true\n' > "$HOME_DIR/.config/autostart/org.fcitx.Fcitx5.desktop"
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/autostart/org.fcitx.Fcitx5.desktop" 2>/dev/null || true
+        log "$(_t "Masked system fcitx5 XDG autostart (niri spawns fcitx5 itself; avoids two instances)" "Masked system fcitx5 XDG autostart (niri spawns fcitx5 itself; avoids two instances)")"
+    fi
+
+    # 预编辑兜底：组词高亮显示在候选窗里而不是应用输入框内。应用端 preedit 支持
+    # 不佳（Wayland text-input/XIM 实现差异）时，输入框里的高亮词会“直接消失”——
+    # 把 preedit 移出应用即可绕开。不部署任何主题/美化配置。
+    local _rimeconf="$HOME_DIR/.config/fcitx5/conf"
+    mkdir -p "$_rimeconf"
+    local _rf="$_rimeconf/rime.conf"
+    if grep -q "^PreeditInApplication=" "$_rf" 2>/dev/null; then
+        sed -i 's/^PreeditInApplication=.*/PreeditInApplication=False/' "$_rf"
+    else
+        printf '\n# eilNiri: preedit in candidate window (fixes vanishing preedit in apps with broken preedit support)\nPreeditInApplication=False\n' >> "$_rf"
+    fi
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_rf" 2>/dev/null || true
+    log "$(_t "fcitx5-rime: PreeditInApplication=False（组词高亮改在候选窗显示）" "fcitx5-rime: PreeditInApplication=False (preedit shown in the candidate window)")"
 }
 
 # pip --user 装的 waypaper 没有 .desktop 入口 → fuzzel 启动器里不显示/无图标。
@@ -4137,6 +4308,14 @@ stage_configs() {
             chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
         fi
 
+        # waybar 单实例化（守卫脚本 + 关掉其他启动来源）
+        _ensure_waybar_single_source
+
+        # 输入法环境变量 + fcitx5 单实例 + 预编辑配置（选装了 fcitx5 才需要）
+        if pkg_installed fcitx5 || pkg_installed fcitx5-rime; then
+            _configure_ime
+        fi
+
         _ensure_waybar_config
 
         # 光标拖影：QEMU/KVM 虚拟机常因虚拟硬件 cursor plane 与 Niri 不兼容。
@@ -4394,18 +4573,22 @@ stage_hardware_adapt() {
     local niri_cfg="$HOME_DIR/.config/niri/config.kdl"
     local waybar_cfg="$HOME_DIR/.config/waybar/config"
 
-    # --- 1) detect the actual output name + resolution ---
-    local detected_out="" detected_mode="" p
+    # --- 1) detect ALL connected outputs ---
+    # 只取“第一个连接器”在双屏机器（笔记本 eDP-1 + 外接）上会选错目标；枚举全部
+    # 已连接连接器，为每个生成 output 块。cardN 可能是多位数（card10-…）。
+    local -a detected_outs=()
+    local p cand
     for p in /sys/class/drm/card*-*/status; do
         [ "$(cat "$p" 2>/dev/null)" = "connected" ] || continue
-        local dir
-        dir=$(dirname "$p")
-        detected_out=$(basename "$dir" | sed 's/^card[0-9]-//')
-        detected_mode=$(head -1 "$dir/modes" 2>/dev/null)
-        [ -n "$detected_out" ] && break
+        cand=$(basename "$(dirname "$p")" | sed -E 's/^card[0-9]+-//')
+        [ -n "$cand" ] || continue
+        case " ${detected_outs[*]:-} " in
+            *" $cand "*) ;;   # 两块显卡报出同名连接器时只保留一份
+            *) detected_outs+=("$cand") ;;
+        esac
     done
 
-    if [ -z "$detected_out" ]; then
+    if [ "${#detected_outs[@]}" -eq 0 ]; then
         warn "$(_t "No connected display found, skipping adapt." "No connected display found, skipping adapt.")"
         # On QEMU/KVM this usually means the virtual GPU/render backend isn't
         # producing an active output — the classic cause of niri's
@@ -4423,51 +4606,66 @@ stage_hardware_adapt() {
         return
     fi
 
-    info_kv "$(_t "Detected output" "Detected output")" "$detected_out" "${detected_mode:-preferred}"
+    info_kv "$(_t "Detected output" "Detected output")" "${detected_outs[*]}" "$(_t "preferred mode (no forced mode/scale/position)" "preferred mode (no forced mode/scale/position)")"
 
     # --- 2) fix niri config ---
     if [ -f "$niri_cfg" ]; then
         log "$(_t "Adapting niri output config..." "Adapting niri output config...")"
         # backup
-        cp "$niri_cfg" "$niri_cfg.bak-hw-$(date +%Y%m%d-%H%M%S)"
+        local _bak="$niri_cfg.bak-hw-$(date +%Y%m%d-%H%M%S)"
+        cp "$niri_cfg" "$_bak"
         prune_config_backups "$(dirname "$niri_cfg")" "$(basename "$niri_cfg").bak-hw-*"
 
-        # find the first active output block and replace its name and mode
+        # 逐行重写：把所有“活动”的 output 块整体替换为按实测连接器生成的干净块
+        # （第一个块带 focus-at-startup）。不写死 mode/scale/position——niri 自动选
+        # 首选模式；硬编码 @60 会让输出 inactive（黑屏），模板机遗留的 scale 1.2 /
+        # position 对新机器也是错的。/-注释块只是参考文档，原样保留。
+        # 重写后 niri validate 校验，失败回滚备份。
         local tmp
         tmp=$(mktemp)
         register_temp_path "$tmp"
-        local in_first_output=0 found_output=0
-        while IFS= read -r line; do
-            if [ "$found_output" -eq 0 ] && echo "$line" | grep -qP '^\s*output\s+"'; then
-                found_output=1
-                in_first_output=1
-                echo "output \"$detected_out\" {" >> "$tmp"
+        local depth=0 replaced=0 inblock=0 line o c i
+        : > "$tmp"
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [ "$replaced" -eq 0 ] && echo "$line" | grep -qE '^[[:space:]]*output[[:space:]]+"'; then
+                i=0
+                for p in "${detected_outs[@]}"; do
+                    if [ "$i" -eq 0 ]; then
+                        printf 'output "%s" {\n    focus-at-startup\n}\n' "$p" >> "$tmp"
+                    else
+                        printf 'output "%s" {\n}\n' "$p" >> "$tmp"
+                    fi
+                    i=$((i + 1))
+                done
+                replaced=1
+                inblock=1
+                depth=$(echo "$line" | grep -o '{' | wc -l)
+                depth=$((depth - $(echo "$line" | grep -o '}' | wc -l)))
+                [ "$depth" -le 0 ] && inblock=0
                 continue
             fi
-            if [ "$in_first_output" -eq 1 ]; then
-                # Drop a previously injected mode "WxH@60". niri will pick the
-                # connector's preferred mode; a wrong refresh keeps the output inactive.
-                if echo "$line" | grep -qP '^\s*mode\s+"'; then
-                    continue
-                fi
-                if echo "$line" | grep -qP '^\s*\}'; then
-                    in_first_output=0
-                    echo "$line" >> "$tmp"
-                    continue
-                fi
-                echo "$line" >> "$tmp"
-                continue
-            fi
-            # comment out the 2nd and later output blocks
-            if [ "$found_output" -eq 1 ] && echo "$line" | grep -qP '^\s*output\s+"'; then
-                echo "/-output $(echo "$line" | sed 's/^\s*output\s*//')" >> "$tmp"
+            if [ "$inblock" -eq 1 ]; then
+                # 消耗旧块（花括号深度跟踪；块本身是平的，但嵌套语法出现时也安全）
+                o=$(echo "$line" | grep -o '{' | wc -l)
+                c=$(echo "$line" | grep -o '}' | wc -l)
+                depth=$((depth + o - c))
+                [ "$depth" -le 0 ] && inblock=0
                 continue
             fi
             echo "$line" >> "$tmp"
         done < "$niri_cfg"
-        mv "$tmp" "$niri_cfg"
-        exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$niri_cfg"
-        success "$(_t "niri output adapted" "niri output adapted")"
+        if [ "$replaced" -eq 1 ] && [ -s "$tmp" ]; then
+            if command -v niri >/dev/null 2>&1 && ! as_user niri validate -c "$tmp" >/dev/null 2>&1; then
+                warn "$(_t "重写后的 output 配置未通过 niri validate — 已回滚备份。" "Rewritten output config failed niri validate — backup restored.")"
+                cp "$_bak" "$niri_cfg"
+            else
+                mv "$tmp" "$niri_cfg"
+                exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$niri_cfg"
+                success "$(_t "niri output adapted" "niri output adapted")": "${detected_outs[*]}"
+            fi
+        else
+            warn "$(_t "config.kdl 里没有活动 output 块（或重写结果为空）— 配置未改动。" "No active output block in config.kdl (or rewrite was empty) — config left unchanged.")"
+        fi
     fi
 
     # --- 3) validate the Waybar config after hardware adaptation ---
