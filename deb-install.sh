@@ -806,6 +806,16 @@ if [ "${#outs[@]}" -gt 0 ] && [ -f "$cfg" ]; then
     fi
 fi
 
+# 会话日志：exec 前把本会话（niri-session + niri）的 stdout/stderr 全量重定向到
+# 用户目录下的固定文件。VM/黑屏场景切 TTY（Ctrl+Alt+F3）直接看——niri 的 panic
+# 行（如 "software EGL renderers are skipped"）就在文件末尾。
+# 先 touch 验证可写再重定向：非交互 shell 里 exec 重定向失败会直接退出，
+# 那样诊断日志反而把整个会话搞挂（比黑屏更糟）。
+_slog="${XDG_STATE_HOME:-$HOME/.local/state}/eilniri"
+if mkdir -p "$_slog" 2>/dev/null && touch "$_slog/session.log" 2>/dev/null; then
+    exec &>> "$_slog/session.log"
+fi
+
 if [ -x /usr/local/bin/niri-session.real ]; then
     exec /usr/local/bin/niri-session.real "$@"
 fi
@@ -910,6 +920,60 @@ ensure_debian_graphics_runtime() {
     [ ${#_have[@]} -eq 0 ] && return 0
     log "$(_t "Installing Mesa/DRM runtime for niri (prevents greeter black screen)..." "Installing Mesa/DRM runtime for niri (prevents greeter black screen)...")"
     apt_install_tolerant "${_have[@]}" || warn "$(_t "Some Mesa/DRM runtime packages could not be installed; niri may black-screen without DRI." "Some Mesa/DRM runtime packages could not be installed; niri may black-screen without DRI.")"
+}
+
+# --- QEMU/KVM 图形预检（每次 restore 都跑，早于一切安装）---
+# niri 硬性拒绝软件渲染：src/backend/tty.rs 里 ensure!(!egl_device.is_software())
+# 直接跳过 llvmpipe，没有 fallback（官方 wiki 对 VM 的唯一要求就是开 3D 加速）。
+# VM 常见翻车：DM greeter 用 llvmpipe 能亮 → 误以为图形没问题 → 进 niri 黑屏
+# （EGL 初始化 panic）。本函数把 guest 里能看到的事实列出来并给出宿主机侧修法。
+_vm_graphics_probe() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _virt=""
+    command -v systemd-detect-virt >/dev/null 2>&1 && _virt=$(systemd-detect-virt 2>/dev/null || true)
+    case "$_virt" in
+        qemu|kvm) ;;
+        *) return 0 ;;
+    esac
+
+    section "$(_t "VM Graphics Check" "VM Graphics Check")" "$(_t "QEMU/KVM detected — verifying GPU setup for niri" "QEMU/KVM detected — verifying GPU setup for niri")"
+    info_kv "$(_t "Virtualization" "Virtualization")" "$_virt" ""
+
+    local _cards _renders _conns _vga=""
+    _cards=$(ls /dev/dri/card* 2>/dev/null | tr '\n' ' ')
+    _renders=$(ls /dev/dri/renderD* 2>/dev/null | tr '\n' ' ')
+    _conns=""
+    local _p _cand
+    for _p in /sys/class/drm/card*-*/status; do
+        [ -e "$_p" ] || continue
+        [ "$(cat "$_p" 2>/dev/null)" = "connected" ] || continue
+        _cand=$(basename "$(dirname "$_p")" | sed -E 's/^card[0-9]+-//')
+        _conns="$_conns $_cand"
+    done
+    _conns=${_conns# }
+    if command -v lspci >/dev/null 2>&1; then
+        _vga=$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | head -1 | cut -d: -f3- | xargs)
+    fi
+    info_kv "$(_t "VGA device" "VGA device")" "${_vga:-$(_t "unknown (lspci missing)" "unknown (lspci missing)")}" ""
+    info_kv "$(_t "DRM cards" "DRM cards")" "${_cards:-$(_t "NONE" "NONE")}" ""
+    info_kv "$(_t "Render nodes" "Render nodes")" "${_renders:-$(_t "NONE" "NONE")}" ""
+    info_kv "$(_t "Connected outputs" "Connected outputs")" "${_conns:-$(_t "NONE" "NONE")}" "$(_t "(virtio-gpu shows as Virtual-1)" "(virtio-gpu shows as Virtual-1)")"
+
+    if [ -z "$_cards" ]; then
+        warn "$(_t "VM 没有任何 DRM 显卡设备 — niri 一定会黑屏。请先给虚拟机添加显卡（virt-manager：添加硬件 → Video → Virtio），再运行本脚本。" "This VM has NO DRM graphics device — niri will black-screen. Add a video device first (virt-manager: Add Hardware → Video → Virtio), then run this script.")"
+        return 0
+    fi
+
+    case "$_vga" in
+        *QXL*|*qxl*|*Standard*|*Cirrus*|*cirrus*|*_bochs*|*bochs*)
+            warn "$(_t "虚拟显卡是 QXL/std/bochs（纯 2D）— niri 无法使用它们（拒绝 llvmpipe 软渲染），进桌面必黑屏。请在宿主机关机后把显卡改为 Virtio 并开启 3D 加速。" "The VM video device is QXL/std/bochs (2D only) — niri cannot use them (it rejects llvmpipe software rendering) and will black-screen. Power off the VM and switch the video model to Virtio with 3D acceleration.")"
+            ;;
+        *virtio*|*Virtio*|*virtio-gpu*|"")
+            # virtio 显卡：还差 3D 加速（virgl）。guest 内无法直接探测 virgl 是否启用，
+            # 给出宿主机侧核对步骤 + 黑屏后的取证路径。
+            warn "$(_t "niri 在 VM 里必须开 3D 加速（virgl）：virt-manager → 显示 Virtio → 勾选 3D acceleration；或 virsh edit 把 <video> 改为 <model type='virtio'><acceleration accel3d='yes'/>。注意：登录管理器能用软件渲染点亮，但 niri 拒绝 llvmpipe — greeter 亮不代表 niri 能跑。若已开 3D 仍黑屏：切 TTY（Ctrl+Alt+F3）查看 ~/.local/state/eilniri/session.log，或把 ~/.local/state/eilNiri/ 下的 diag-*.tar.gz 发出来。" "niri REQUIRES 3D acceleration in a VM (virgl): virt-manager → display Virtio → check '3D acceleration'; or virsh edit: <model type='virtio'><acceleration accel3d='yes'/>. Note: the login greeter lights up with software rendering, but niri rejects llvmpipe — a working greeter does NOT mean niri can run. If it still black-screens with 3D on: switch to a TTY (Ctrl+Alt+F3) and check ~/.local/state/eilniri/session.log, or share the diag-*.tar.gz under ~/.local/state/eilNiri/.")"
+            ;;
+    esac
 }
 
 ensure_hypr_cxx_toolchain() {
@@ -2207,10 +2271,12 @@ install_awww() {
     work=$(mktemp -d)
     register_temp_path "$work"
     log "$(_t "Cloning awww source (codeberg)..." "Cloning awww source (codeberg)...")"
-    
-    local _clone_attempts=3 _clone_delay=10 _clonerc=0
+
+    # git_clone_gh：直连失败自动走 CN 镜像代理（ghfast.top 等），比裸 git clone 重试
+    # 在大陆网络下成功率高得多。仍保留一层重试（clone 半途断连时重来）。
+    local _clone_attempts=2 _clone_delay=10 _clonerc=0
     for (( _cattempt=1; _cattempt<=$_clone_attempts; _cattempt++ )); do
-        if exe git clone --depth 1 "$AWWW_REPO" "$work/awww" 2>/dev/null; then
+        if git_clone_gh "$AWWW_REPO" "$work/awww"; then
             _clonerc=0
             break
         fi
@@ -2221,7 +2287,7 @@ install_awww() {
             rm -rf "$work/awww"
         fi
     done
-    
+
     if [ "$_clonerc" -ne 0 ]; then
         MANUAL_ITEMS+=("awww — git clone failed after $_clone_attempts attempts (network or Codeberg blocked), build manually: $AWWW_REPO")
         return 1
@@ -2269,16 +2335,12 @@ install_awww_from_build() { # $1 = srcdir, $2 = logfile
 # 修正 waypaper config.ini 与 hyprlock.conf（锁屏壁纸）里指向参考机的绝对路径。
 _ensure_wallpaper() {
     [ "$DRY_RUN" -eq 1 ] && return 0
-    # awww（swww 的后继，发行版无包 → cargo 源码后台编译）只是“即时应用壁纸”的载体。
-    # 它在本 stage 运行时通常还没装上（stage_wait_builds 在 stage_configs 之后才安装
-    # 编译产物，编译失败时更是永远装不上）——绝不能因为它缺席就跳过壁纸部署。
-    # 壁纸文件与 waypaper/hyprlock 配置无条件就位：登录后 waypaper.service --restore
-    # 即可恢复默认壁纸；awww 存在时再额外主动应用一次。
-    local _awww_bin=""
-    for _awww_bin in /usr/local/bin/awww /usr/bin/awww "$HOME_DIR/.local/bin/awww"; do
-        [ -x "$_awww_bin" ] && break
-        _awww_bin=""
-    done
+    # 单一职责：壁纸文件与 waypaper/hyprlock 路径修正——无条件执行，绝不因 awww 缺席
+    # 而跳过或告警。awww（swww 后继，无发行版包 → cargo 后台编译）在本 stage
+    # （stage_configs）运行时通常还没装上（stage_wait_builds 在其后才安装编译产物，
+    # 首次全新安装时必然如此），在这里判 awww 缺席必然是时序性误报。
+    # “即时应用壁纸”挪到 _apply_wallpaper_if_awww()，由 do_restore 尾部调用——
+    # 那时 awww 要么装好、要么确实失败（Summary 的 MANUAL 项有编译日志细节）。
 
     local _img="" _cand
     # 1) 仓库根目录那张图（QQ图片....jpeg / wallpaper.*）统一部署为
@@ -2357,32 +2419,52 @@ PYEOF
             chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/hypr" 2>/dev/null || true
         fi
         log "$(_t "Default wallpaper deployed: " "Default wallpaper deployed: ") $_img"
+    fi
+}
 
-        # --- awww 存在才做“即时应用”：状态文件 + daemon + img（登录时的即时生效） ---
-        if [ -n "$_awww_bin" ]; then
-            # 只写状态文件不够——awww-daemon 必须启动时就有壁纸状态（见
-            # mylinuxforwork/dotfiles#1574），此处再主动调用一次确保生效。
-            mkdir -p "$HOME_DIR/.config/awww"
-            printf '%s\n' "$_img" > "$HOME_DIR/.config/awww/wallpaper"
-            chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/awww" 2>/dev/null || true
-            log "$(_t "Wallpaper state written: " "Wallpaper state written: ") $_img"
-            if command -v as_user >/dev/null 2>&1; then
-                local _awww_cmd="$_awww_bin"
-                if ! pgrep -u "$TARGET_USER" -x awww-daemon >/dev/null 2>&1; then
-                    as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
-                        nohup /usr/local/bin/awww-daemon >/dev/null 2>>"$LOG_DIR/awww-daemon.log" &
-                    sleep 1
-                fi
-                exe as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
-                    "$_awww_cmd" img "$_img" 2>>"$LOG_DIR/awww-set.log" || \
-                    exe as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
-                    "$_awww_cmd" set "$_img" 2>>"$LOG_DIR/awww-set.log" || true
-                log "$(_t "awww default wallpaper applied: " "awww default wallpaper applied: ") $_img"
-            fi
-        else
-            warn "$(_t "awww 未装好（源码编译进行中或失败）。壁纸文件已就位：登录后 waypaper.service 会自动恢复默认壁纸；若 awww 编译失败请看 Summary 的手动项。" "awww is not installed yet (building in background, or the build failed). The wallpaper file is in place: waypaper.service will restore it on login; if the awww build failed, see the manual items in the Summary.")"
-            MANUAL_ITEMS+=("awww — 壁纸文件已就位（$_img）；awww 装好后执行 awww img $_img 即可即时应用，或重跑 restore")
+# --- awww 即时应用（do_restore 尾部调用，此时 awww 的安装/编译已尘埃落定）---
+# awww 在场：写状态文件（awww-daemon 必须启动时就有壁纸状态，见
+# mylinuxforwork/dotfiles#1574）+ 拉起 daemon + 主动 img 应用一次。
+# awww 缺席：此时是最终事实（非时序噪音），才告警 + MANUAL 提示。
+_apply_wallpaper_if_awww() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _img="$HOME_DIR/.local/share/backgrounds/wallpaper.jpg"
+    # 兜底定位：没有统一部署的 wallpaper.jpg 时取 backgrounds 里已有的图
+    if [ ! -f "$_img" ]; then
+        local _cand
+        for _cand in "$HOME_DIR"/.local/share/backgrounds/*.jpg "$HOME_DIR"/.local/share/backgrounds/*.png "$HOME_DIR"/.local/share/backgrounds/*.webp; do
+            [ -f "$_cand" ] && { _img="$_cand"; break; }
+        done
+    fi
+    [ -f "$_img" ] || return 0
+
+    local _awww_bin=""
+    for _awww_bin in /usr/local/bin/awww /usr/bin/awww "$HOME_DIR/.local/bin/awww"; do
+        [ -x "$_awww_bin" ] && break
+        _awww_bin=""
+    done
+    if [ -z "$_awww_bin" ]; then
+        warn "$(_t "awww 未装上（源码编译失败或未选择）— 桌面壁纸暂由 waypaper.service 在登录时恢复。若 awww 编译失败，原因见 Summary 手动项。" "awww is not installed (source build failed or not selected) — the desktop wallpaper will be restored by waypaper.service on login. If the awww build failed, see the manual items in the Summary.")"
+        MANUAL_ITEMS+=("awww — 壁纸文件已就位（$_img）；awww 装好后执行 awww img $_img 即可即时应用，或重跑 restore")
+        return 0
+    fi
+
+    mkdir -p "$HOME_DIR/.config/awww"
+    printf '%s\n' "$_img" > "$HOME_DIR/.config/awww/wallpaper"
+    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/awww" 2>/dev/null || true
+    log "$(_t "Wallpaper state written: " "Wallpaper state written: ") $_img"
+    if command -v as_user >/dev/null 2>&1; then
+        local _awww_cmd="$_awww_bin"
+        if ! pgrep -u "$TARGET_USER" -x awww-daemon >/dev/null 2>&1; then
+            as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
+                nohup /usr/local/bin/awww-daemon >/dev/null 2>>"$LOG_DIR/awww-daemon.log" &
+            sleep 1
         fi
+        exe as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
+            "$_awww_cmd" img "$_img" 2>>"$LOG_DIR/awww-set.log" || \
+            exe as_user env PATH="/usr/local/bin:/usr/bin:/bin:$HOME_DIR/.local/bin" \
+            "$_awww_cmd" set "$_img" 2>>"$LOG_DIR/awww-set.log" || true
+        log "$(_t "awww default wallpaper applied: " "awww default wallpaper applied: ") $_img"
     fi
 }
 
@@ -5338,7 +5420,7 @@ stage_configs() {
                         rm -f "$_cursor_env"
                         log "$(_t "Removed Mesa software-GL / WLR env (forces black screen on niri after login)" "Removed Mesa software-GL / WLR env (forces black screen on niri after login)")"
                     fi
-                    warn "$(_t "检测到 QEMU/KVM。niri 不是 wlroots，不要设 WLR_* / LIBGL_ALWAYS_SOFTWARE。请将虚拟显卡设为 virtio-gpu 并开启 3D 加速（gl=on），或改用 SPICE。" "QEMU/KVM detected. niri is not wlroots — do not set WLR_* / LIBGL_ALWAYS_SOFTWARE. Use virtio-gpu with 3D (gl=on), or SPICE.")"
+                    warn "$(_t "检测到 QEMU/KVM。niri 不是 wlroots（WLR_* 无效），也不要设 LIBGL_ALWAYS_SOFTWARE。niri 必须要 virgl 3D：宿主机把虚拟显卡设为 Virtio 并勾选 3D acceleration。若登录后黑屏，切 TTY（Ctrl+Alt+F3）查看 ~/.local/state/eilniri/session.log 末尾的 niri 报错。" "QEMU/KVM detected. niri is not wlroots (WLR_* is ignored) and LIBGL_ALWAYS_SOFTWARE must NOT be set. niri requires virgl 3D: set the VM video model to Virtio with '3D acceleration' checked on the host. If login black-screens, switch to a TTY (Ctrl+Alt+F3) and read the tail of ~/.local/state/eilniri/session.log for the niri error.")"
                     ;;
             esac
         fi
@@ -5605,7 +5687,7 @@ stage_hardware_adapt() {
         command -v systemd-detect-virt >/dev/null 2>&1 && _virt=$(systemd-detect-virt 2>/dev/null || true)
         case "$_virt" in
             qemu|kvm)
-                warn "$(_t "检测到 QEMU/KVM 且无可用显示输出 — niri 进桌面可能黑屏 / 提示 display output is not active。请在虚拟机上：① 显卡设为 virtio-gpu 并开 3D（gl=on）；② 显示协议用 SPICE；③ 确保安装了对应的图形驱动（mesa/virtio_gpu）；④ libvirt 里 <video> 的 model 为 virtio 并开启渲染。改完重启即可。" "QEMU/KVM detected with no active display output — niri may black-screen / show 'display output is not active'. On the VM: 1) set the video card to virtio-gpu with 3D (gl=on); 2) use the SPICE display protocol; 3) ensure the graphics driver (mesa/virtio_gpu) is installed; 4) set libvirt <video> model=virtio with rendering enabled. Reboot after changing.")"
+                warn "$(_t "QEMU/KVM 且无已连接的 DRM 输出 — niri 进桌面会黑屏（脚本开头的 VM Graphics Check 已给出显卡型号/渲染节点/连接器检测结果）。修复：宿主机关机 → 显卡改 Virtio 并勾选 3D acceleration（virsh: <model type='virtio'><acceleration accel3d='yes'/>）→ 重开 VM 重跑。niri 拒绝 llvmpipe 软渲染，greeter 能亮不代表 niri 能跑。" "QEMU/KVM with no connected DRM output — niri will black-screen (see the 'VM Graphics Check' results at the top of this run for VGA model / render nodes / connectors). Fix: shut the VM down, switch the video model to Virtio with 3D acceleration enabled (virsh: <model type='virtio'><acceleration accel3d='yes'/>), boot and rerun. niri rejects llvmpipe software rendering — a working greeter does not mean niri can run.")"
                 ;;
         esac
         # Do not rewrite output settings when the installer cannot observe a
@@ -5808,6 +5890,7 @@ do_restore() {
     fi
 
     # update the system first (a fresh machine has a stale package db, so installing fzf directly may fail)
+    _vm_graphics_probe   # QEMU/KVM：提前检测虚拟显卡/DRM，缺 3D 加速时给出明确黑屏指引
     stage_preflight
     unmask_gdm_wayland
     ensure_debian_graphics_runtime
@@ -5828,6 +5911,7 @@ do_restore() {
     stage_wait_builds
     stage_hardware_adapt
     stage_verify
+    _apply_wallpaper_if_awww   # awww 已尘埃落定：在场则应用壁纸，缺席才告警（消灭 stage_configs 的时序误报）
     ensure_dm_session   # idempotent: re-checks every run (niri build may have finished late)
     boot_env_check
     print_niri_status
@@ -5887,6 +5971,25 @@ save_diag_bundle() {
         echo
         echo "=== installed pkgs (gdm/niri/rust/accountsservice/hypr) ==="
         dpkg -l 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr'
+        echo
+        echo "=== virtualization ==="
+        systemd-detect-virt 2>/dev/null || echo "(unknown)"
+        echo
+        echo "=== DRM devices (niri needs a hardware renderer; it rejects llvmpipe) ==="
+        ls -l /dev/dri/ 2>/dev/null || echo "(no /dev/dri — niri cannot run)"
+        for _card in /sys/class/drm/card*-*/status; do
+            [ -e "$_card" ] || continue
+            echo "  $(basename "$(dirname "$_card")"): $(cat "$_card" 2>/dev/null)"
+        done
+        echo
+        echo "=== user niri session log (wrapper redirect; niri panic lands here) ==="
+        tail -n 40 "$HOME_DIR/.local/state/eilniri/session.log" 2>/dev/null || echo "(no session.log yet)"
+        echo
+        echo "=== user niri.service status ==="
+        as_user systemctl --user status niri.service --no-pager -l 2>/dev/null | head -n 25 || echo "(user manager unreachable)"
+        echo
+        echo "=== journalctl -b: niri/EGL/DRM/Smithay lines (tail 60) ==="
+        journalctl -b --no-pager 2>/dev/null | grep -iE 'niri|smithay|EGL|DRM|GBM|llvmpipe|virtio_gpu' | tail -n 60 || echo "(journalctl unavailable)"
         echo
         echo "=== build logs tail ==="
         for _f in "$LOG_DIR/niri-build.log" "$LOG_DIR/awww-build.log" "$LOG_DIR/xwayland-satellite-build.log" "$LOG_DIR/hyprlock-build.log" "$LOG_DIR/hypridle-build.log" "$LOG_DIR/hypr-stack.log"; do
