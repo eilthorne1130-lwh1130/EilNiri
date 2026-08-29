@@ -195,7 +195,7 @@ LOGO
 # 2. Data section — niri suite definition (single source of truth for export/restore)
 # ==============================================================================
 
-GROUP_ORDER=(core lock wallpaper clip media audio ime fonts keyring)
+GROUP_ORDER=(core lock wallpaper clip media audio ime fonts keyring tools)
 
 declare -A GROUP_EN=(
     [core]="Core"
@@ -207,6 +207,7 @@ declare -A GROUP_EN=(
     [ime]="IME"
     [fonts]="Fonts"
     [keyring]="Keyring"
+    [tools]="Tools"
 )
 
 declare -A GROUP_PKGS=(
@@ -214,7 +215,8 @@ declare -A GROUP_PKGS=(
     # distro packages install them in /usr/share or /etc/zsh/zshrc.d, which oh-my-zsh's
     # plugins=() cannot use. install_zsh_extras clones them into ~/.oh-my-zsh/custom/plugins/
     # (works identically on Arch / RHEL / Debian families).
-    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh"
+    # gsimplecal: waybar clock on-click（两版配置都在用它，但一直没进包组）
+    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh gsimplecal"
     [lock]="hyprlock hypridle"
     [wallpaper]="awww waypaper"
     [clip]="copyq satty grim slurp"
@@ -223,6 +225,9 @@ declare -A GROUP_PKGS=(
     [ime]="fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git"
     [fonts]="ttf-jetbrains-mono-nerd wqy-zenhei"
     [keyring]="gnome-keyring"
+    # bluetui: 蓝牙 TUI（waybar bluetooth 模块 on-click 调用；Debian/Ubuntu 无包，
+    # install_debian 特判走 GitHub release 二进制）；ripgrep/zoxide: .zshrc 依赖
+    [tools]="bluetui ripgrep zoxide"
 )
 
 # pkg -> group reverse lookup table (built at runtime)
@@ -270,6 +275,8 @@ declare -A DEB_MANUAL=(
 declare -A DEB_FAIL_HINT=(
     [hyprlock]="Installable on Debian 13 via trixie-backports (apt-get install -t trixie-backports hyprlock); already in Ubuntu 26.04+ repos; otherwise build manually"
     [hypridle]="Installable on Debian 13 via trixie-backports (apt-get install -t trixie-backports hypridle); already in Ubuntu 26.04+ repos; otherwise build manually"
+    # 可选工具：老版本（Debian 12 / Ubuntu 24.04）仓库没有 zoxide，缺了不致命
+    [zoxide]="optional; install via cargo (cargo install zoxide) — .zshrc auto-falls-back to plain cd when missing"
 )
 # Packages installable via pip as a fallback (common to Arch/RHEL/Debian)
 declare -A PIP_PKGS=(
@@ -592,7 +599,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v43"
+PROGRESS_VERSION="v44"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -849,6 +856,17 @@ repair_niri_blackscreen() {
         fi
         sed -i 's#polkit-gnome-authenntication-agent-1#polkit-gnome-authentication-agent-1#g' "$cfg" 2>/dev/null || true
         sed -i 's#spawn-at-startup "swww-daemon"#spawn-at-startup "awww-daemon"#' "$cfg" 2>/dev/null || true
+        # 首次启动空白窗口修复（两问合一）：
+        # 1) CopyQ #3567 — `copyq --start-server` 在无托盘合成器（niri 没有系统托盘）
+        #    且 hide-main-window 配置晚于托盘初始化加载的版本上，主窗口会被显示出来；
+        #    追加 "hide" 让客户端在 server 就绪后立即隐藏主窗口。
+        sed -i 's#^\([[:space:]]*spawn-at-startup "copyq" "--start-server"\)$#\1 "hide"#' "$cfg" 2>/dev/null || true
+        # 2) xwaylandvideobridge（Wayland→X 录屏桥）登录时出现的空白窗（niri #2367
+        #    同款）——窗口规则设为全透明，不影响其录屏桥接功能。
+        if ! grep -q 'xwaylandvideobridge' "$cfg" 2>/dev/null; then
+            printf '\n// eilNiri: xwaylandvideobridge shows a blank window at startup (opacity 0 = invisible)\nwindow-rule {\n    match app-id="xwaylandvideobridge"\n    opacity 0.0\n}\n' >> "$cfg"
+            log "$(_t "Added xwaylandvideobridge window rule (blank window at startup)" "Added xwaylandvideobridge window rule (blank window at startup)")"
+        fi
         if ! grep -q 'disable-cursor-plane' "$cfg" 2>/dev/null; then
             printf '\ndebug {\n    disable-cursor-plane\n    disable-direct-scanout\n}\n' >> "$cfg"
             log "$(_t "Enabled niri software cursor (disable-cursor-plane) to fix stuck cursor / black screen on AMD" "Enabled niri software cursor (disable-cursor-plane) to fix stuck cursor / black screen on AMD")"
@@ -1150,20 +1168,13 @@ REPO_UNIVERSE=()
 
 load_app_universe() {
     # Built-in authoritative package list (no snapshot/pkglist in the snapshot-free mode)
+    # zsh 全家族可用（配合 install_zsh_extras 的 oh-my-zsh/starship 运行时）
     local g raw
     for g in "${GROUP_ORDER[@]}"; do
         for raw in ${GROUP_PKGS[$g]:-}; do
             REPO_UNIVERSE+=("$raw")
         done
     done
-    if [ "$DISTRO_FAMILY" != arch ]; then
-        local _filtered=() _pkg
-        for _pkg in "${REPO_UNIVERSE[@]}"; do
-            [ "$_pkg" = zsh ] && continue
-            _filtered+=("$_pkg")
-        done
-        REPO_UNIVERSE=("${_filtered[@]}")
-    fi
 }
 
 group_tag() { # $1 = pkg
@@ -2375,6 +2386,576 @@ PYEOF
     fi
 }
 
+# --- waybar 参考配置部署（与参考机 ~/.config/waybar 同步）---
+# 参考版 config/style.css：无硬编码 width（超屏根源），边距由 style.css 的 margin 控制，
+# 带 mpris / group 抽屉（audio/sys 可折叠）/ updates / disk 模块。
+# group 抽屉与 mpris 需要 waybar >= 0.10（Debian 13 / Ubuntu 25.04+ 为 0.12）；
+# 更老的 0.9.x（Debian 12 bookworm 0.9.17 / Ubuntu 24.04 0.9.24）保留快照平铺版，
+# 但删掉 "width": 1600 —— 否则屏幕窄于 ~1720px 时 waybar 直接溢出屏幕。
+_deploy_waybar_reference() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _dir="$HOME_DIR/.config/waybar"
+    [ -d "$_dir" ] || return 0
+    command -v waybar >/dev/null 2>&1 || return 0
+
+    local _ver="" _maj=0 _min=0 _num=0
+    _ver=$(waybar --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+    _maj=$(printf '%s' "$_ver" | cut -d. -f1)
+    _min=$(printf '%s' "$_ver" | cut -d. -f2)
+    [[ "$_maj" =~ ^[0-9]+$ ]] || _maj=0
+    [[ "$_min" =~ ^[0-9]+$ ]] || _min=0
+    _num=$(( _maj * 100 + 10#${_min:-0} ))
+    info_kv "$(_t "Waybar version" "Waybar version")" "v$_ver" ""
+
+    if [ "$_num" -lt 10 ]; then
+        # 旧版：只做超屏修复（删硬编码 width），布局保持快照平铺版
+        if [ -f "$_dir/config" ] && grep -q '"width":' "$_dir/config" 2>/dev/null; then
+            cp "$_dir/config" "$_dir/config.bak-wb-$(date +%Y%m%d-%H%M%S)"
+            sed -i '/^[[:space:]]*"width":[[:space:]]*[0-9]/d' "$_dir/config"
+            log "$(_t "waybar < 0.10: removed hardcoded width (overflow fix); flat snapshot layout kept" "waybar < 0.10: removed hardcoded width (overflow fix); flat snapshot layout kept")"
+        fi
+        return 0
+    fi
+
+    # 参考版与当前内容一致则跳过（幂等）
+    if grep -q '"group/audio"' "$_dir/config" 2>/dev/null && ! grep -q '"width":' "$_dir/config" 2>/dev/null; then
+        return 0
+    fi
+    local _ts
+    _ts=$(date +%Y%m%d-%H%M%S)
+    [ -f "$_dir/config" ] && cp "$_dir/config" "$_dir/config.bak-wb-$_ts"
+    [ -f "$_dir/style.css" ] && cp "$_dir/style.css" "$_dir/style.css.bak-wb-$_ts"
+
+    # 与参考机同步的完整配置。仅 custom/updates 按发行版适配：
+    #   Arch 的 checkupdates → apt-get -s dist-upgrade | grep -c '^Inst'（免 root 模拟）
+    cat > "$_dir/config" <<'WBREFEOF'
+{
+    "layer": "top",
+    "position": "top",
+    "height": 32,
+    "spacing": 6,
+    "reload_style_on_change": true,
+
+    "modules-left":   ["niri/workspaces", "niri/window"],
+    "modules-center": ["mpris", "clock"],
+    "modules-right":  ["group/audio", "group/sys", "tray", "custom/shutdown", "custom/reboot"],
+
+    "niri/workspaces": {
+        "format": "{value}",
+        "workspace-format-windows": "{count}",
+        "window-format": "{app_id}",
+        "sort-by-number": true,
+        "disable-scroll": true
+    },
+
+    "niri/window": {
+        "format": "{app_id}",
+        "max-length": 20,
+        "separate-outputs": true
+    },
+
+    "mpris": {
+        "format": "{status_icon} {artist} - {title}",
+        "status-stopped": "",
+        "max-length": 50,
+        "interval": 5,
+        "on-click": "playerctl play-pause",
+        "on-scroll-up": "playerctl next",
+        "on-scroll-down": "playerctl previous",
+        "tooltip-format": "<tt>{player_icon} {player}\n{title}\n{artist} · {album}\n时长: {length}</tt>"
+    },
+
+    "clock": {
+        "format": "{:%H:%M}",
+        "interval": 1,
+        "tooltip-format": "<tt>{:%Y-%m-%d %A\n%H:%M:%S}</tt>",
+        "on-click": "GTK_THEME=Gsimplecal-dark gsimplecal"
+    },
+
+    "pulseaudio": {
+        "format": "{icon} {volume}%",
+        "format-muted": "  Muted",
+        "format-source": " {volume}%",
+        "format-source-muted": " ",
+        "format-icons": {
+            "default": ["", "", ""]
+        },
+        "scroll-step": 5,
+        "on-click": "pactl set-sink-mute @DEFAULT_SINK@ toggle",
+        "on-scroll-up": "pactl set-sink-volume @DEFAULT_SINK@ +5%",
+        "on-scroll-down": "pactl set-sink-volume @DEFAULT_SINK@ -5%",
+        "max-volume": 100,
+        "tooltip-format": "<tt>{desc}\n音量: {volume}%</tt>"
+    },
+
+    "network": {
+        "format-wifi": " {essid} {signalStrength}% ",
+        "format-ethernet": " {ifname} {ipaddr} ",
+        "format-disconnected": " Offline ",
+        "interval": 1,
+        "tooltip-format-wifi": "<tt>{essid}\n信号: {signalStrength}%\nIP: {ipaddr}\n网关: {gwaddr}</tt>",
+        "tooltip-format-ethernet": "<tt>{ifname}\nIP: {ipaddr}\n网关: {gwaddr}</tt>",
+        "tooltip-format-disconnected": "<tt>网络已断开</tt>"
+    },
+
+    "cpu": {
+        "interval": 1.5,
+        "format": "{usage}%",
+        "on-click": "kitty -e btop",
+        "warning": 70,
+        "critical": 90,
+        "tooltip-format": "<tt>CPU 使用率: {usage}%\n频率: {avg_frequency} MHz</tt>"
+    },
+
+    "memory": {
+        "interval": 1,
+        "format": " {percentage}% ",
+        "warning": 85,
+        "critical": 95,
+        "tooltip-format": "<tt>内存使用: {percentage}%\n已用: {used}G / 总共: {total}G</tt>"
+    },
+
+    "custom/more-audio": {
+        "format": "󰆐",
+        "tooltip-format": "音量 / 系统更新 / 蓝牙"
+    },
+
+    "custom/more-sys": {
+        "format": "󰅨",
+        "tooltip-format": "CPU / 内存 / 磁盘"
+    },
+
+    "bluetooth": {
+        "format": "",
+        "format-off": "  Off",
+        "format-on": "  On",
+        "format-connected": " {device_alias}",
+        "format-connected-battery": " {device_alias} {device_battery_percentage}%",
+        "interval": 10,
+        "on-click": "kitty -e bluetui",
+        "tooltip-format": "<tt>{device_alias}\n{device_address}</tt>"
+    },
+
+    "disk": {
+        "format": " {used} / {total}",
+        "interval": 30,
+        "path": "/",
+        "warning": 90,
+        "critical": 98,
+        "tooltip-format": "<tt>根分区\n已用: {used} / 总共: {total} ({percentage_used}%)\n剩余: {free}</tt>"
+    },
+
+    "custom/updates": {
+        "exec": "count=$(apt-get -s dist-upgrade 2>/dev/null | grep -c '^Inst'); [ \"$count\" -gt 0 ] && echo \"$count\"",
+        "exec-if": "ping -q -c1 -W1 223.5.5.5 >/dev/null 2>&1",
+        "interval": 3600,
+        "format": " {}",
+        "tooltip-format": "<tt>可用更新: {} 个\n点击打开更新终端</tt>",
+        "on-click": "kitty -e sh -c 'sudo apt update && sudo apt upgrade -y'"
+    },
+
+    "group/audio": {
+        "orientation": "horizontal",
+        "drawer": {
+            "transition-duration": 300,
+            "transition-left-to-right": false,
+            "click-to-reveal": true
+        },
+        "modules": [
+            "custom/more-audio",
+            "pulseaudio",
+            "custom/updates",
+            "bluetooth"
+        ]
+    },
+
+    "group/sys": {
+        "orientation": "horizontal",
+        "drawer": {
+            "transition-duration": 300,
+            "transition-left-to-right": false,
+            "click-to-reveal": true
+        },
+        "modules": [
+            "custom/more-sys",
+            "cpu",
+            "memory",
+            "disk"
+        ]
+    },
+
+    "tray": {
+        "icon-size": 20,
+        "spacing": 6
+    },
+
+    "custom/shutdown": {
+        "format": "⏻",
+        "tooltip-format": "关机",
+        "on-click": "sh -c \"zenity --question --text='确定要关机吗?' --title='关机' --width=300 && systemctl poweroff\""
+    },
+
+    "custom/reboot": {
+        "format": "󰑐",
+        "tooltip-format": "重启",
+        "on-click": "sh -c \"zenity --question --text='确定要重启吗?' --title='重启' --width=300 && systemctl reboot\""
+    }
+}
+WBREFEOF
+
+    # 与参考机同步的样式表（Catppuccin Mocha "glass card"）
+    cat > "$_dir/style.css" <<'WBSSEOF'
+/*
+ * waybar style — Catppuccin Mocha "glass card" edition
+ *
+ * base    #1e1e2e   text     #cdd6f4
+ * blue    #89b4fa   green    #a6e3a1
+ * yellow  #f9e2af   red      #f38ba8
+ * pink    #f5c2e7   teal     #94e2d5
+ * mantle  #181825   crust    #11111b
+ * surface0 #313244  surface1 #45475a
+ * overlay0 #6c7086  subtext0 #a6adc8
+ */
+
+/* ═══════════════════════════════════════════════════════════════
+   1. Global Reset
+   ═══════════════════════════════════════════════════════════════ */
+* {
+    border: none;
+    border-radius: 0;
+    font-family: "JetBrainsMono Nerd Font", "Noto Sans CJK SC", monospace;
+    font-size: 14px;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   2. Bar Window — glass card
+   ═══════════════════════════════════════════════════════════════ */
+window#waybar {
+    margin-top: 16px;
+    margin-left: 64px;
+    margin-right: 60px;
+    border-radius: 20px;
+
+    /* layered dark gradient — richer than flat rgba */
+    background: linear-gradient(
+        135deg,
+        rgba(24, 24, 37, 0.72),
+        rgba(30, 30, 46, 0.65),
+        rgba(24, 24, 37, 0.72)
+    );
+
+    color: #cdd6f4;
+
+    /* subtle double border: outer glow + inner edge */
+    border: 1px solid rgba(137, 180, 250, 0.12);
+    box-shadow:
+        0 4px 24px rgba(0, 0, 0, 0.35),
+        inset 0 1px 0 rgba(255, 255, 255, 0.04);
+
+    transition: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   3. Workspace Buttons — pill capsules
+   ═══════════════════════════════════════════════════════════════ */
+#workspaces {
+    padding: 0 6px;
+}
+
+#workspaces button {
+    padding: 0 10px;
+    margin: 3px 2px;
+    color: #6c7086;
+    background: rgba(49, 50, 68, 0.75);
+    border-radius: 10px;
+    transition: all 200ms ease;
+    box-shadow: none;
+}
+
+#workspaces button:hover {
+    background: rgba(69, 71, 90, 0.85);
+    color: #cdd6f4;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+#workspaces button.focused {
+    background: linear-gradient(135deg, rgba(137, 180, 250, 0.92), rgba(148, 226, 213, 0.85));
+    color: #1e1e2e;
+    font-weight: bold;
+    box-shadow:
+        0 0 12px rgba(137, 180, 250, 0.3),
+        0 2px 6px rgba(0, 0, 0, 0.2);
+    padding: 0 14px;
+}
+
+#workspaces button.active {
+    background: rgba(137, 180, 250, 0.22);
+    color: #89b4fa;
+    border: 1px solid rgba(137, 180, 250, 0.25);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   4. Module Widgets — universal pill
+   ═══════════════════════════════════════════════════════════════ */
+#clock,
+#pulseaudio,
+#network,
+#cpu,
+#memory,
+#bluetooth,
+#window,
+#tray,
+#mpris,
+#disk,
+#custom-updates,
+#custom-shutdown,
+#custom-reboot {
+
+    padding: 0 14px;
+    margin: 3px 0;
+    color: #cdd6f4;
+    background: rgba(49, 50, 68, 0.72);
+    border-radius: 10px;
+    transition: all 200ms ease;
+}
+
+/* left accent stripe — one per module */
+#pulseaudio  { border-left: 2px solid rgba(137, 180, 250, 0.55); }
+#network     { border-left: 2px solid rgba(166, 227, 161, 0.55); }
+#cpu         { border-left: 2px solid rgba(249, 226, 175, 0.55); }
+#memory      { border-left: 2px solid rgba(245, 194, 231, 0.55); }
+#bluetooth   { border-left: 2px solid rgba(148, 226, 213, 0.55); }
+#clock       { border-left: 2px solid rgba(203, 166, 247, 0.55); }
+#window           { border-left: 2px solid rgba(137, 180, 250, 0.4); }
+#mpris           { border-left: 2px solid rgba(203, 166, 247, 0.55); }
+#disk            { border-left: 2px solid rgba(137, 180, 250, 0.55); }
+#custom-updates  { border-left: 2px solid rgba(249, 226, 175, 0.55); }
+#custom-shutdown  { border-left: 2px solid rgba(243, 139, 168, 0.55); }
+#custom-reboot    { border-left: 2px solid rgba(249, 226, 175, 0.55); }
+
+/* hover glow */
+#clock:hover, #pulseaudio:hover, #network:hover,
+#cpu:hover, #memory:hover, #bluetooth:hover,
+#mpris:hover, #disk:hover, #custom-updates:hover,
+#custom-shutdown:hover, #custom-reboot:hover {
+    background: rgba(69, 71, 90, 0.78);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+    5. Clock — prominent centerpiece
+   ═══════════════════════════════════════════════════════════════ */
+#clock {
+    font-weight: bold;
+    font-size: 14px;
+    letter-spacing: 0.5px;
+    background: linear-gradient(
+        135deg,
+        rgba(203, 166, 247, 0.22),
+        rgba(137, 180, 250, 0.16),
+        rgba(203, 166, 247, 0.22)
+    );
+    border-left: 2px solid rgba(203, 166, 247, 0.55);
+    box-shadow:
+        0 0 16px rgba(137, 180, 250, 0.08);
+}
+
+#mpris {
+    font-size: 13px;
+}
+
+#mpris.playing {
+    color: #a6e3a1;
+}
+
+#mpris.paused {
+    color: #f9e2af;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   6. State Variants
+   ═══════════════════════════════════════════════════════════════ */
+#pulseaudio.muted {
+    color: #6c7086;
+    background: rgba(49, 50, 68, 0.4);
+    border-left: 2px solid rgba(108, 112, 134, 0.4);
+    text-shadow: none;
+}
+
+#network.disconnected {
+    color: #f38ba8;
+    background: rgba(243, 139, 168, 0.12);
+    border-left: 2px solid rgba(243, 139, 168, 0.6);
+}
+
+#network.linked {
+    color: #f9e2af;
+    border-left: 2px solid rgba(249, 226, 175, 0.55);
+}
+
+#network.ethernet,
+#network.wifi {
+    color: #a6e3a1;
+    border-left: 2px solid rgba(166, 227, 161, 0.55);
+}
+
+#battery.charging {
+    color: #a6e3a1;
+}
+
+#battery.warning:not(.charging) {
+    color: #f9e2af;
+}
+
+#battery.critical:not(.charging) {
+    color: #f38ba8;
+    animation: blink 800ms infinite;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   7. CPU / Memory / Disk thresholds
+   ═══════════════════════════════════════════════════════════════ */
+#cpu.warning, #memory.warning, #disk.warning {
+    color: #f9e2af;
+    background: rgba(249, 226, 175, 0.1);
+}
+
+#cpu.critical, #memory.critical, #disk.critical {
+    color: #f38ba8;
+    background: rgba(243, 139, 168, 0.12);
+    animation: blink 800ms infinite;
+}
+
+/* 有可用系统更新时高亮 */
+#custom-updates.warning {
+    color: #f9e2af;
+    background: rgba(249, 226, 175, 0.1);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   8. Window title
+   ═══════════════════════════════════════════════════════════════ */
+#window {
+    color: #cdd6f4;
+    font-style: italic;
+}
+
+#window.empty {
+    color: #6c7086;
+    background: rgba(49, 50, 68, 0.35);
+    font-style: normal;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   9. Groups — audio / sys collapsible drawers
+   ═══════════════════════════════════════════════════════════════ */
+#group-audio,
+#group-sys {
+    padding: 0 6px;
+    margin: 3px 0;
+    color: #cdd6f4;
+    background: rgba(49, 50, 68, 0.72);
+    border-radius: 10px;
+    transition: all 200ms ease;
+}
+
+#group-audio {
+    border-left: 2px solid rgba(137, 180, 250, 0.55);
+}
+
+#group-sys {
+    border-left: 2px solid rgba(249, 226, 175, 0.55);
+}
+
+#group-audio:hover,
+#group-sys:hover {
+    background: rgba(69, 71, 90, 0.78);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+
+/* 组内模块共用胶囊底,不重复绘制 */
+#custom-more-audio,
+#custom-more-sys,
+#group-audio #pulseaudio,
+#group-audio #custom-updates,
+#group-audio #bluetooth,
+#group-sys #cpu,
+#group-sys #memory,
+#group-sys #disk {
+    padding: 0 8px;
+    margin: 3px 0;
+    background: transparent;
+    border-left: none;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+/* drawer 子项悬停提示 */
+#group-audio .drawer-child:hover,
+#group-sys .drawer-child:hover {
+    background: rgba(69, 71, 90, 0.5);
+    border-radius: 8px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   10. System Tray
+   ═══════════════════════════════════════════════════════════════ */
+#tray {
+    background: rgba(49, 50, 68, 0.72);
+    border-radius: 10px;
+    padding: 0 8px;
+    margin: 3px 0;
+    border-left: 2px solid rgba(245, 194, 231, 0.4);
+}
+
+#tray > .passive {
+    -gtk-icon-effect: dim;
+}
+
+#tray > .needs-attention {
+    -gtk-icon-effect: highlight;
+    animation: blink 1s infinite;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   11. Tooltip
+   ═══════════════════════════════════════════════════════════════ */
+tooltip {
+    background: rgba(24, 24, 37, 0.94);
+    border: 1px solid rgba(137, 180, 250, 0.3);
+    border-radius: 10px;
+    color: #cdd6f4;
+    padding: 6px 12px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+tooltip label {
+    padding: 2px 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   12. Animations
+   ═══════════════════════════════════════════════════════════════ */
+@keyframes blink {
+    0% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.35;
+    }
+    100% {
+        opacity: 1;
+    }
+}
+WBSSEOF
+
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_dir/config" "$_dir/style.css" 2>/dev/null || true
+    success "$(_t "waybar 配置已同步为参考机完整版（mpris / 折叠抽屉 / 更新计数）" "waybar config synced to the full reference edition (mpris / drawers / updates)")"
+}
+
 _ensure_waybar_config() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     local _cfg="$HOME_DIR/.config/waybar/config"
@@ -2510,6 +3091,136 @@ IMEEOF
     fi
     chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_rf" 2>/dev/null || true
     log "$(_t "fcitx5-rime: PreeditInApplication=False（组词高亮改在候选窗显示）" "fcitx5-rime: PreeditInApplication=False (preedit shown in the candidate window)")"
+
+    # --- 快捷键与输入法组（与参考机同步）---
+    # config：单击左 Shift 切换中英文（TriggerKeys=Shift+Shift_L + AltTriggerKeys=Shift_L，
+    # ModifierOnlyKeyTimeout=250ms 判定单击修饰键）——deb 版此前跳过 fcitx5 目录，
+    # 发行版 stock 配置没有 Shift 绑定，用户只能靠 Ctrl+Space。
+    # profile：keyboard-us + rime 组、DefaultIM=rime——stock profile 缺 rime 时
+    # rime-ice 词库装了也不会成为默认输入法。
+    # fcitx5 退出时会用内存状态回写 profile，因此每次 restore 都重写（先备份）。
+    # classicui.conf（主题/美化）继续不部署，保持发行版默认外观。
+    local _f5dir="$HOME_DIR/.config/fcitx5"
+    mkdir -p "$_f5dir/conf"
+    local _f5cfg="$_f5dir/config" _f5profile="$_f5dir/profile" _ts5
+    _ts5=$(date +%Y%m%d-%H%M%S)
+    if [ ! -f "$_f5cfg" ] || ! grep -q "Shift+Shift_L" "$_f5cfg" 2>/dev/null; then
+        [ -f "$_f5cfg" ] && cp "$_f5cfg" "$_f5cfg.bak-$_ts5"
+        cat > "$_f5cfg" <<'F5CFGEOF'
+[Hotkey]
+# 按住切换键的修饰键时进行轮换切换
+EnumerateWithTriggerKeys=True
+# 向前切换输入法
+EnumerateForwardKeys=
+# 向后切换输入法
+EnumerateBackwardKeys=
+# 轮换输入法时跳过第一个输入法
+EnumerateSkipFirst=False
+# 触发修饰键快捷键的时限 (毫秒)
+ModifierOnlyKeyTimeout=250
+
+[Hotkey/TriggerKeys]
+0=Shift+Shift_L
+1=Zenkaku_Hankaku
+2=Hangul
+
+[Hotkey/ActivateKeys]
+0=Hangul_Hanja
+
+[Hotkey/DeactivateKeys]
+0=Hangul_Romaja
+
+[Hotkey/AltTriggerKeys]
+0=Shift_L
+
+[Hotkey/EnumerateGroupForwardKeys]
+0=Super+space
+
+[Hotkey/EnumerateGroupBackwardKeys]
+0=Shift+Super+space
+
+[Hotkey/PrevPage]
+0=Up
+
+[Hotkey/NextPage]
+0=Down
+
+[Hotkey/PrevCandidate]
+0=Shift+Tab
+
+[Hotkey/NextCandidate]
+0=Tab
+
+[Hotkey/TogglePreedit]
+0=Control+Alt+P
+
+[Behavior]
+# 默认激活输入法
+ActiveByDefault=False
+# 重新聚焦时重置状态
+resetStateWhenFocusIn=Program
+# 共享输入状态
+ShareInputState=No
+# 在程序中显示预编辑文本
+PreeditEnabledByDefault=True
+# 切换输入法时显示输入法信息
+ShowInputMethodInformation=True
+# 在焦点更改时显示输入法信息
+showInputMethodInformationWhenFocusIn=False
+# 显示紧凑的输入法信息
+CompactInputMethodInformation=True
+# 显示第一个输入法的信息
+ShowFirstInputMethodInformation=True
+# 缺省每页候选词
+DefaultPageSize=5
+# 覆盖 XKB 选项
+OverrideXkbOption=False
+# 自定义 XKB 选项
+CustomXkbOption=
+# Force Enabled Addons
+EnabledAddons=
+# Force Disabled Addons
+DisabledAddons=
+# Preload input method to be used by default
+PreloadInputMethod=True
+# 允许在密码框中使用输入法
+AllowInputMethodForPassword=False
+# 输入密码时显示预编辑文本
+ShowPreeditForPassword=False
+# 保存用户数据的时间间隔（以分钟为单位）
+AutoSavePeriod=30
+F5CFGEOF
+        log "$(_t "fcitx5 快捷键已部署：单击左 Shift 切换中英文" "fcitx5 hotkeys deployed: single Left-Shift toggles Chinese/English")"
+    fi
+    if [ ! -f "$_f5profile" ] || ! grep -q "^Name=rime$\|Items/1" "$_f5profile" 2>/dev/null; then
+        [ -f "$_f5profile" ] && cp "$_f5profile" "$_f5profile.bak-$_ts5"
+        cat > "$_f5profile" <<'F5PROFEOF'
+[Groups/0]
+# Group Name
+Name=默认
+# Layout
+Default Layout=us
+# Default Input Method
+DefaultIM=rime
+
+[Groups/0/Items/0]
+# Name
+Name=keyboard-us
+# Layout
+Layout=
+
+[Groups/0/Items/1]
+# Name
+Name=rime
+# Layout
+Layout=
+
+[GroupOrder]
+0=默认
+F5PROFEOF
+        log "$(_t "fcitx5 输入法组已部署：keyboard-us + rime（默认 rime）" "fcitx5 profile deployed: keyboard-us + rime (default rime)")"
+    fi
+    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_f5dir" 2>/dev/null || true
 }
 
 # pip --user 装的 waypaper 没有 .desktop 入口 → fuzzel 启动器里不显示/无图标。
@@ -2535,6 +3246,52 @@ EOF
         chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_wpd" 2>/dev/null || true
         log "$(_t "waypaper.desktop created (fuzzel icon)" "waypaper.desktop created (fuzzel icon)")"
     fi
+}
+
+# --- 首次登录壁纸竞态修复 ---
+# 时序：niri 的 spawn-at-startup 拉起 awww-daemon，graphical-session.target 拉起
+# waypaper.service（After=graphical-session.target），两者之间没有顺序约束；
+# waypaper 源码里 daemon 未就绪时 `awww img` 静默失败且无重试（swww #444 同款），
+# 表现为首次登录壁纸空白。解法：给 waypaper.service / waypaper-random.service 插入
+# ExecStartPre 等待脚本（轮询 pgrep + `awww query` 最多 15s；超时也放行 exit 0，
+# 不阻塞随机换壁纸 timer；失败场景由 _ensure_wallpaper 写入的 awww 状态文件兜底，
+# daemon 启动时会自己读状态文件应用壁纸）。
+install_awww_wait_helper() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _helper=/usr/local/bin/eilniri-wait-awww
+    cat > "$_helper" <<'AWWWWAITEOF'
+#!/usr/bin/env bash
+# eilNiri: wait until awww-daemon is up and answering (max ~15s), then return 0
+# regardless — this is an ExecStartPre guard, never a hard dependency.
+i=0
+while [ "$i" -lt 30 ]; do
+    if pgrep -x awww-daemon >/dev/null 2>&1; then
+        if command -v awww >/dev/null 2>&1 && awww query >/dev/null 2>&1; then
+            exit 0
+        fi
+    fi
+    sleep 0.5
+    i=$((i + 1))
+done
+exit 0
+AWWWWAITEOF
+    chmod 755 "$_helper"
+}
+
+_fix_wallpaper_startup() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _udir="$HOME_DIR/.config/systemd/user" _sf
+    [ -d "$_udir" ] || return 0
+    local _patched=0
+    for _sf in "$_udir/waypaper.service" "$_udir/waypaper-random.service"; do
+        [ -f "$_sf" ] || continue
+        grep -q "eilniri-wait-awww" "$_sf" 2>/dev/null && continue
+        install_awww_wait_helper
+        sed -i '/^ExecStart=/a ExecStartPre=/usr/local/bin/eilniri-wait-awww' "$_sf"
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_sf" 2>/dev/null || true
+        _patched=1
+    done
+    [ "$_patched" -eq 1 ] && log "$(_t "waypaper services: added ExecStartPre wait for awww-daemon (first-login wallpaper race fix)" "waypaper services: added ExecStartPre wait for awww-daemon (first-login wallpaper race fix)")"
 }
 
 _waypaper_pip_index() {
@@ -3032,6 +3789,66 @@ install_satty() {
     satty_tail=$(tail -n 8 "$satty_log" 2>/dev/null | tr '\n' ' ')
     MANUAL_ITEMS+=("satty — build failed ($satty_tail); install manually: $SATTY_GH")
     return 1
+}
+
+# bluetui (pythops/bluetui): 蓝牙 TUI，waybar bluetooth 模块 on-click 的目标程序。
+# Debian/Ubuntu 全系仓库都没有这个包；GitHub release 提供静态 musl 二进制
+# （免运行时库；org.bluez 的 D-Bus 策略默认放行普通用户，无需加组）。
+BLUETUI_GH="https://github.com/pythops/bluetui/releases"
+
+install_bluetui() {
+    if command -v bluetui >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("bluetui (already installed)")
+    else
+        if [ "$DRY_RUN" -eq 1 ]; then
+            DRY_PKGS+=("bluetui (official prebuilt)")
+            return "$DRY_RUN_RC"
+        fi
+        local arch asset url tmp rc=1 prox
+        case "$(uname -m)" in
+            x86_64)  arch=x86_64 ;;
+            aarch64) arch=aarch64 ;;
+            *)
+                MANUAL_ITEMS+=("bluetui — unsupported architecture $(uname -m), install manually: $BLUETUI_GH")
+                return 1
+                ;;
+        esac
+        asset="bluetui-${arch}-linux-musl"
+        url=$(github_release_asset pythops/bluetui "bluetui-${arch}-linux-musl" 2>/dev/null || true)
+        [ -n "$url" ] || url="$BLUETUI_GH/latest/download/$asset"
+        log "$(_t "Downloading bluetui official prebuilt binary..." "Downloading bluetui official prebuilt binary...")"
+        tmp=$(mktemp)
+        register_temp_path "$tmp"
+        # 资产是裸 ELF 二进制而非压缩包，archive_is_valid 不适用——按 ELF 魔数校验，
+        # 直连失败走 CN 镜像（与 _dl_gh_bounded 同一套镜像列表）。
+        if curl -fsSL --retry 1 --connect-timeout 8 --max-time 90 -o "$tmp" "$url" 2>/dev/null \
+           && [ -s "$tmp" ] && head -c 4 "$tmp" | grep -q $'\x7fELF'; then
+            rc=0
+        else
+            for prox in ${EILNIRI_GH_PROXY:-${GH_MIRRORS:-}}; do
+                rm -f "$tmp"
+                if curl -fsSL --retry 1 --connect-timeout 8 --max-time 90 -o "$tmp" "${prox%/}/$url" 2>/dev/null \
+                   && [ -s "$tmp" ] && head -c 4 "$tmp" | grep -q $'\x7fELF'; then
+                    rc=0
+                    break
+                fi
+            done
+        fi
+        if [ "$rc" -eq 0 ]; then
+            exe install -m 755 "$tmp" /usr/local/bin/bluetui
+            INSTALLED_PKGS+=("bluetui (official prebuilt)")
+            success "$(_t "bluetui installed from GitHub releases" "bluetui installed from GitHub releases")"
+        else
+            MANUAL_ITEMS+=("bluetui — download failed (network blocked?); install manually from $BLUETUI_GH (asset: $asset)")
+            return 1
+        fi
+    fi
+    # bluetui 走 org.bluez D-Bus，需要 bluez 守护进程在跑；服务启用失败只提示不阻断
+    pkg_installed bluez || pm_install bluez 2>/dev/null \
+        || warn "$(_t "bluez install failed — bluetui needs bluetooth.service" "bluez install failed — bluetui needs bluetooth.service")"
+    exe systemctl enable --now bluetooth.service 2>/dev/null \
+        || warn "$(_t "bluetooth.service enable failed — run 'systemctl enable --now bluetooth' after reboot" "bluetooth.service enable failed — run 'systemctl enable --now bluetooth' after reboot")"
+    return 0
 }
 
 # --- rime-ice (Lùsōng) dictionary deploy (Debian/RHEL families) ---
@@ -3705,6 +4522,11 @@ install_debian() {
             install_satty
             continue
         fi
+        # bluetui: no .deb in Debian/Ubuntu repos; prebuilt musl binary from GitHub releases
+        if [ "$p" = "bluetui" ]; then
+            install_bluetui
+            continue
+        fi
         # rime-ice: no .deb; deploy the dictionary from GitHub (fcitx5-rime package provides the engine)
         if [ "$p" = "rime-ice-pinyin-git" ]; then
             install_rime_ice
@@ -4178,13 +5000,184 @@ stage_dm() {
 
 # --- 4.6 config deploy ---
 
-# Install the zsh runtime that configs/.zshrc depends on (oh-my-zsh + its custom
+# Install the zsh runtime that the embedded .zshrc depends on (oh-my-zsh + its custom
 # plugins + starship + eza + bat).  The distro packages for zsh-autosuggestions /
 # zsh-syntax-highlighting cannot satisfy oh-my-zsh's plugins=() list, and
-# oh-my-zsh itself is not packaged in Debian/RHEL at all — this is why the
-# collected .zshrc only ever worked on the Arch reference machine.  Runs only
-# when zsh was selected; every step is best-effort with a MANUAL_ITEMS note on
-# failure (the .zshrc itself is tolerant of missing pieces).
+# oh-my-zsh itself is not packaged in Debian/RHEL at all.  Runs only when zsh was
+# selected; every step is best-effort with a MANUAL_ITEMS note on failure
+# (the .zshrc itself is tolerant of missing pieces).
+deploy_zsh_config() { # 写入标准 .zshrc（净化自参考机：加 command -v 守卫，去掉本机专属条目）
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _has_zsh=0 _p
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        [ "$_p" = "zsh" ] && _has_zsh=1
+    done
+    [ "$_has_zsh" -eq 1 ] || return 0
+    # 已经是 oh-my-zsh 配置的 .zshrc 不覆盖（尊重用户自定义）
+    if [ -f "$HOME_DIR/.zshrc" ] && grep -q 'oh-my-zsh.sh' "$HOME_DIR/.zshrc" 2>/dev/null; then
+        log "$(_t ".zshrc already has oh-my-zsh config, keeping it." ".zshrc already has oh-my-zsh config, keeping it.")"
+        return 0
+    fi
+    [ -f "$HOME_DIR/.zshrc" ] && cp "$HOME_DIR/.zshrc" "$HOME_DIR/.zshrc.bak-$(date +%Y%m%d-%H%M%S)"
+    cat > "$HOME_DIR/.zshrc" <<'ZSHRCEOF'
+# eilNiri zsh — oh-my-zsh + starship（与参考机同步，缺依赖时自动降级）
+export ZSH="$HOME/.oh-my-zsh"
+
+ZSH_THEME=""
+
+HYPHEN_INSENSITIVE="true"
+
+ENABLE_CORRECTION="false"
+
+COMPLETION_WAITING_DOTS="true"
+
+HIST_STAMPS="yyyy-mm-dd"
+
+plugins=(
+    git
+    zsh-autosuggestions
+    extract
+    z
+    fzf
+    colored-man-pages
+    command-not-found
+    sudo
+    history
+    copypath
+    copyfile
+    dirhistory
+    zsh-syntax-highlighting
+)
+
+source $ZSH/oh-my-zsh.sh
+
+export PATH="$HOME/.local/bin:$PATH"
+
+# starship 提示符（未装上时保持 oh-my-zsh 兜底主题）
+command -v starship >/dev/null 2>&1 && eval "$(starship init zsh)"
+
+export EDITOR="$(command -v nvim || command -v nano || command -v vi)"
+export VISUAL="$EDITOR"
+
+export LANG="zh_CN.UTF-8"
+export LANGUAGE="zh_CN:en_US"
+
+HISTSIZE=50000
+SAVEHIST=50000
+HISTFILE="$HOME/.zsh_history"
+setopt HIST_IGNORE_ALL_DUPS
+setopt HIST_SAVE_NO_DUPS
+setopt HIST_REDUCE_BLANKS
+setopt INC_APPEND_HISTORY
+setopt SHARE_HISTORY
+
+# eza / bat / ripgrep / zoxide：装了才生效，没装回退原生命令
+if command -v eza >/dev/null 2>&1; then
+    alias ls="eza"
+    alias ll="eza -lah"
+    alias la="eza -a"
+    alias lt="eza --tree"
+    alias l="eza -l"
+fi
+command -v bat >/dev/null 2>&1 && alias cat="bat --paging=never" && alias batp="bat"
+command -v rg >/dev/null 2>&1 && alias grep="rg"
+command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init zsh)"
+ZSHRCEOF
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.zshrc" 2>/dev/null || true
+    log "$(_t "Deployed ~/.zshrc (oh-my-zsh + starship prompt)" "Deployed ~/.zshrc (oh-my-zsh + starship prompt)")"
+}
+
+install_zsh_extras() {
+    local _has_zsh=0 _p
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        [ "$_p" = "zsh" ] && _has_zsh=1
+    done
+    [ "$_has_zsh" -eq 1 ] || return 0
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("oh-my-zsh (git clone) starship eza bat"); return "$DRY_RUN_RC"; }
+
+    local _zsh_bin
+    _zsh_bin=$(command -v zsh 2>/dev/null || echo /bin/zsh)
+    pkg_installed zsh || pm_install zsh 2>/dev/null || true
+    # git/curl：clone 与 starship 安装脚本的依赖，缺则补装
+    command -v git >/dev/null 2>&1 || pm_install git 2>/dev/null || true
+    command -v curl >/dev/null 2>&1 || pm_install curl 2>/dev/null || true
+
+    # 1) oh-my-zsh 本体（git_clone_gh 自带 CN 镜像回退）
+    if [ ! -d "$HOME_DIR/.oh-my-zsh" ]; then
+        log "$(_t "Installing oh-my-zsh..." "Installing oh-my-zsh...")"
+        if git_clone_gh https://github.com/ohmyzsh/ohmyzsh.git "$HOME_DIR/.oh-my-zsh"; then
+            INSTALLED_PKGS+=("oh-my-zsh")
+        else
+            MANUAL_ITEMS+=("oh-my-zsh — clone failed (直连与镜像均不可达); 手动: git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git $HOME_DIR/.oh-my-zsh")
+        fi
+    else
+        log "$(_t "oh-my-zsh already present, skipping." "oh-my-zsh already present, skipping.")"
+    fi
+
+    # 2) .zshrc plugins 列表用到的外部插件必须放进 $ZSH_CUSTOM/plugins
+    #    （发行版包装到 /usr/share，oh-my-zsh 的 plugins=() 找不到）
+    if [ -d "$HOME_DIR/.oh-my-zsh" ]; then
+        mkdir -p "$HOME_DIR/.oh-my-zsh/custom/plugins"
+        local _plugin _plug_url
+        for _plugin in zsh-autosuggestions zsh-syntax-highlighting; do
+            if [ ! -d "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" ]; then
+                case "$_plugin" in
+                    zsh-autosuggestions)     _plug_url="https://github.com/zsh-users/zsh-autosuggestions" ;;
+                    zsh-syntax-highlighting) _plug_url="https://github.com/zsh-users/zsh-syntax-highlighting" ;;
+                esac
+                log "$(_t "Installing oh-my-zsh plugin: " "Installing oh-my-zsh plugin: ") $_plugin"
+                git_clone_gh "$_plug_url" "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" \
+                    || MANUAL_ITEMS+=("oh-my-zsh plugin $_plugin — clone failed")
+            fi
+        done
+        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+            "$HOME_DIR/.oh-my-zsh" 2>/dev/null || true
+    fi
+
+    # 3) starship（.zshrc eval `starship init zsh`；Debian 仓库无此包）
+    if ! command -v starship >/dev/null 2>&1; then
+        log "$(_t "Installing starship..." "Installing starship...")"
+        if exe bash -c 'curl -sSfL https://starship.rs/install.sh | sh -s -- -y -b /usr/local/bin' 2>/dev/null; then
+            INSTALLED_PKGS+=("starship")
+        else
+            MANUAL_ITEMS+=("starship — install failed; run: curl -sSfL https://starship.rs/install.sh | sh -s -- -y")
+            # starship 缺席时给 .zshrc 一个内置主题兜底（nerd font 提供 powerline 符号）
+            if [ -f "$HOME_DIR/.zshrc" ] && grep -q '^ZSH_THEME=""' "$HOME_DIR/.zshrc" 2>/dev/null; then
+                sed -i 's/^ZSH_THEME=""/ZSH_THEME="agnoster"/' "$HOME_DIR/.zshrc" 2>/dev/null || true
+                log "$(_t "Set ZSH_THEME=agnoster (starship unavailable fallback)" "Set ZSH_THEME=agnoster (starship unavailable fallback)")"
+            fi
+        fi
+    fi
+
+    # 4) eza（.zshrc alias 用；Debian 13 起有包，老版本 cargo 兜底）
+    if ! command -v eza >/dev/null 2>&1; then
+        log "$(_t "Installing eza..." "Installing eza...")"
+        pm_install eza 2>/dev/null || true
+        if ! command -v eza >/dev/null 2>&1; then
+            if command -v cargo >/dev/null 2>&1 && exe cargo install --locked --root /usr/local eza 2>>"$LOG_DIR/eza-cargo.log"; then
+                INSTALLED_PKGS+=("eza (cargo build)")
+            else
+                MANUAL_ITEMS+=("eza — 无仓库包且 cargo 构建失败; 手动: cargo install eza（.zshrc 的 ls alias 会自动降级为原版 ls）")
+            fi
+        fi
+    fi
+
+    # 5) bat（.zshrc alias 用；Debian/Ubuntu 二进制叫 batcat → 软链兜底）
+    if ! command -v bat >/dev/null 2>&1; then
+        pm_install bat 2>/dev/null || true
+        if ! command -v bat >/dev/null 2>&1 && command -v batcat >/dev/null 2>&1; then
+            ln -sf "$(command -v batcat)" /usr/local/bin/bat
+            log "$(_t "Linked /usr/local/bin/bat -> batcat" "Linked /usr/local/bin/bat -> batcat")"
+        fi
+    fi
+
+    # 6) zsh 设为默认登录 shell
+    if [ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != "$_zsh_bin" ]; then
+        exe chsh -s "$_zsh_bin" "$TARGET_USER" 2>/dev/null \
+            || warn "$(_t "Failed to set zsh as default shell (run manually: chsh -s $_zsh_bin $TARGET_USER)" "Failed to set zsh as default shell (run manually: chsh -s $_zsh_bin $TARGET_USER)")"
+    fi
+}
+
 prune_config_backups() { # $1 = directory, $2 = basename glob
     local dir="$1" pattern="$2" backup
     [ -d "$dir" ] || return 0
@@ -4305,16 +5298,29 @@ stage_configs() {
             fi
             sed -i 's#polkit-gnome-authenntication-agent-1#polkit-gnome-authentication-agent-1#g' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
             sed -i 's#spawn-at-startup "swww-daemon"#spawn-at-startup "awww-daemon"#' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
+            # 空白窗口修复：copyq 主窗口隐藏（CopyQ #3567）+ xwaylandvideobridge 透明
+            # （与 repair_niri_blackscreen 同一套幂等补丁，此处覆盖刚部署的快照配置）
+            sed -i 's#^\([[:space:]]*spawn-at-startup "copyq" "--start-server"\)$#\1 "hide"#' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
+            if ! grep -q 'xwaylandvideobridge' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
+                printf '\n// eilNiri: xwaylandvideobridge shows a blank window at startup (opacity 0 = invisible)\nwindow-rule {\n    match app-id="xwaylandvideobridge"\n    opacity 0.0\n}\n' >> "$HOME_DIR/.config/niri/config.kdl"
+            fi
             chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
         fi
 
         # waybar 单实例化（守卫脚本 + 关掉其他启动来源）
         _ensure_waybar_single_source
 
+        # waybar 配置同步参考机完整版（waybar >= 0.10；旧版仅删超屏的硬编码 width）
+        _deploy_waybar_reference
+
         # 输入法环境变量 + fcitx5 单实例 + 预编辑配置（选装了 fcitx5 才需要）
         if pkg_installed fcitx5 || pkg_installed fcitx5-rime; then
             _configure_ime
         fi
+
+        # zsh 默认 shell + oh-my-zsh 运行时（选装了 zsh 才需要）
+        deploy_zsh_config
+        install_zsh_extras
 
         _ensure_waybar_config
 
@@ -4352,6 +5358,8 @@ stage_configs() {
             [ "$_p" = "waypaper" ] && _has_wp=1
         done
         if [ "$_has_wp" -eq 1 ] && [ -f "$HOME_DIR/.config/systemd/user/waypaper.service" ]; then
+            # 先插 ExecStartPre 等待（awww-daemon 未就绪时 waypaper 恢复壁纸会静默失败）
+            _fix_wallpaper_startup
             log "$(_t "Enabling waypaper user services..." "Enabling waypaper user services...")"
             as_user systemctl --user daemon-reload 2>/dev/null || true
             as_user systemctl --user enable --now waypaper.service waypaper-random.timer 2>/dev/null || true
@@ -4710,9 +5718,9 @@ stage_verify() {
         local p name
         for p in "${all_sel[@]}"; do
             [ -n "${PIP_PKGS[$p]:-}" ] && continue
-            # niri/awww/satty/xwayland-satellite may be installed via dnf/prebuilt/source/cargo; check by PATH
+            # niri/awww/satty/bluetui/xwayland-satellite may be installed via dnf/prebuilt/source/cargo; check by PATH
             case "$p" in
-                niri|awww|satty|xwayland-satellite)
+                niri|awww|satty|bluetui|xwayland-satellite)
                     command -v "$p" >/dev/null 2>&1 || missing+=("$p")
                     continue
                     ;;
