@@ -216,7 +216,8 @@ declare -A GROUP_PKGS=(
     # plugins=() cannot use. install_zsh_extras clones them into ~/.oh-my-zsh/custom/plugins/
     # (works identically on Arch / RHEL / Debian families).
     # gsimplecal: waybar clock on-click（两版配置都在用它，但一直没进包组）
-    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh gsimplecal"
+    # adwaita-icon-theme: fuzzel 从 icon theme 解析应用图标，minimal 安装缺 theme 时部分图标空白
+    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh gsimplecal adwaita-icon-theme"
     [lock]="hyprlock hypridle"
     [wallpaper]="awww waypaper"
     [clip]="copyq satty grim slurp"
@@ -599,7 +600,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v44"
+PROGRESS_VERSION="v46"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -742,9 +743,11 @@ cfg="${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl"
 tmp="${cfg}.eilniri-output.$$"
 
 # Collect EVERY connected DRM connector (strip the cardN- prefix; cardN can be
-# multi-digit). Install-time detection may see a different set than the login
-# session (esp. on VMs / hybrid GPUs), so this re-runs at every session start.
+# multi-digit) plus its sysfs preferred resolution (plain WxH, no refresh rate).
+# Install-time detection may see a different set than the login session (esp. on
+# VMs / hybrid GPUs), so this re-runs at every session start.
 outs=()
+modes=()
 for status in /sys/class/drm/card*-*/status; do
     [ -f "$status" ] || continue
     [ "$(<"$status")" = connected ] || continue
@@ -754,16 +757,41 @@ for status in /sys/class/drm/card*-*/status; do
     [ -n "$cand" ] || continue
     case " ${outs[*]:-} " in
         *" $cand "*) ;;          # same connector name on two cards — keep once
-        *) outs+=("$cand") ;;
+        *)
+            om=$(head -n1 "${status%/status}/modes" 2>/dev/null | tr -d '[:space:]')
+            case "${om:-}" in
+                [0-9]*x[0-9]*) ;;
+                *) om="" ;;
+            esac
+            outs+=("$cand"); modes+=("$om")
+            ;;
     esac
 done
 
+# Respect user config: if every active output block already targets a connected
+# connector, the user may have hand-tuned scale/position there — leave them be.
+# Only rewrite when names don't match (first login / monitor swapped).
+skip=0
+if [ -f "$cfg" ] && [ "${#outs[@]}" -gt 0 ]; then
+    skip=1
+    cfg_outs=$(grep -E '^[[:space:]]*output[[:space:]]+"' "$cfg" 2>/dev/null \
+        | sed -E 's/^[[:space:]]*output[[:space:]]+"([^"]+)".*/\1/')
+    [ -n "$cfg_outs" ] || skip=0     # no active blocks → rewrite (inject correct ones)
+    for co in $cfg_outs; do
+        case " ${outs[*]:-} " in
+            *" $co "*) ;;
+            *) skip=0; break ;;
+        esac
+    done
+fi
+[ "$skip" -eq 1 ] && echo "eilNiri: config outputs match connected connectors — keeping user config" >&2
+
 # Rewrite the ACTIVE output blocks: one clean block per connected output, the
-# first gets focus-at-startup. Never write mode/scale/position: niri picks the
-# connector's preferred mode, and a hardcoded @60 (or a stale scale/position
-# from another machine) black-screens or misplaces the desktop. /-commented
-# blocks are documentation and are left untouched.
-if [ "${#outs[@]}" -gt 0 ] && [ -f "$cfg" ]; then
+# first gets focus-at-startup; the sysfs resolution (if reported) becomes
+# mode "WxH" — niri then picks the HIGHEST refresh rate for that resolution.
+# scale/position are never written: stale values from another machine
+# misplace the desktop. /-commented blocks are documentation, left untouched.
+if [ "$skip" -eq 0 ] && [ "${#outs[@]}" -gt 0 ] && [ -f "$cfg" ]; then
     tmp2="${cfg}.eilniri-new.$$"
     trap 'rm -f "$tmp2"' EXIT
     : > "$tmp2"
@@ -772,11 +800,15 @@ if [ "${#outs[@]}" -gt 0 ] && [ -f "$cfg" ]; then
         if [ "$replaced" -eq 0 ] && printf '%s' "$line" | grep -qE '^[[:space:]]*output[[:space:]]+"'; then
             i=0
             for o in "${outs[@]}"; do
-                if [ "$i" -eq 0 ]; then
-                    printf 'output "%s" {\n    focus-at-startup\n}\n' "$o" >> "$tmp2"
-                else
-                    printf 'output "%s" {\n}\n' "$o" >> "$tmp2"
-                fi
+                om="${modes[$i]:-}"
+                {
+                    printf 'output "%s" {\n' "$o"
+                    [ -n "$om" ] && printf '    mode "%s"\n' "$om"
+                    if [ "$i" -eq 0 ]; then
+                        printf '    focus-at-startup\n'
+                    fi
+                    printf '}\n'
+                } >> "$tmp2"
                 i=$((i + 1))
             done
             replaced=1
@@ -1857,7 +1889,7 @@ _ensure_niri_units() {
 }
 
 install_niri_binary() {
-    if command -v niri >/dev/null 2>&1; then
+    if command -v niri >/dev/null 2>&1 && [ "${EILNIRI_FORCE_UPDATE:-0}" != "1" ]; then
         if [ -f /usr/share/wayland-sessions/niri.desktop ] || [ -f /usr/local/share/wayland-sessions/niri.desktop ]; then
             SKIPPED_PKGS+=("niri (already installed)")
             ensure_localbin_on_path
@@ -2211,7 +2243,7 @@ install_niri_from_build() { # $1 = srcdir, $2 = logfile
 AWWW_REPO="https://codeberg.org/LGFae/awww"
 
 install_awww() {
-    if command -v awww >/dev/null 2>&1 && command -v awww-daemon >/dev/null 2>&1; then
+    if command -v awww >/dev/null 2>&1 && command -v awww-daemon >/dev/null 2>&1 && [ "${EILNIRI_FORCE_UPDATE:-0}" != "1" ]; then
         SKIPPED_PKGS+=("awww (already installed)")
         return 0
     fi
@@ -2489,6 +2521,7 @@ _deploy_waybar_reference() {
     _num=$(( _maj * 100 + 10#${_min:-0} ))
     info_kv "$(_t "Waybar version" "Waybar version")" "v$_ver" ""
 
+    local _ref_done=0
     if [ "$_num" -lt 10 ]; then
         # 旧版：只做超屏修复（删硬编码 width），布局保持快照平铺版
         if [ -f "$_dir/config" ] && grep -q '"width":' "$_dir/config" 2>/dev/null; then
@@ -2496,17 +2529,14 @@ _deploy_waybar_reference() {
             sed -i '/^[[:space:]]*"width":[[:space:]]*[0-9]/d' "$_dir/config"
             log "$(_t "waybar < 0.10: removed hardcoded width (overflow fix); flat snapshot layout kept" "waybar < 0.10: removed hardcoded width (overflow fix); flat snapshot layout kept")"
         fi
-        return 0
-    fi
-
-    # 参考版与当前内容一致则跳过（幂等）
-    if grep -q '"group/audio"' "$_dir/config" 2>/dev/null && ! grep -q '"width":' "$_dir/config" 2>/dev/null; then
-        return 0
-    fi
-    local _ts
-    _ts=$(date +%Y%m%d-%H%M%S)
-    [ -f "$_dir/config" ] && cp "$_dir/config" "$_dir/config.bak-wb-$_ts"
-    [ -f "$_dir/style.css" ] && cp "$_dir/style.css" "$_dir/style.css.bak-wb-$_ts"
+    elif grep -q '"group/audio"' "$_dir/config" 2>/dev/null && ! grep -q '"width":' "$_dir/config" 2>/dev/null; then
+        # 参考版已就绪（幂等），跳过重写
+        _ref_done=1
+    else
+        local _ts
+        _ts=$(date +%Y%m%d-%H%M%S)
+        [ -f "$_dir/config" ] && cp "$_dir/config" "$_dir/config.bak-wb-$_ts"
+        [ -f "$_dir/style.css" ] && cp "$_dir/style.css" "$_dir/style.css.bak-wb-$_ts"
 
     # 与参考机同步的完整配置。仅 custom/updates 按发行版适配：
     #   Arch 的 checkupdates → apt-get -s dist-upgrade | grep -c '^Inst'（免 root 模拟）
@@ -3036,6 +3066,95 @@ WBSSEOF
 
     chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_dir/config" "$_dir/style.css" 2>/dev/null || true
     success "$(_t "waybar 配置已同步为参考机完整版（mpris / 折叠抽屉 / 更新计数）" "waybar config synced to the full reference edition (mpris / drawers / updates)")"
+    fi   # 参考版写入（仅 waybar >= 0.10）
+
+    # --- 电量模块（用户可选，默认按是否检测到电池预填）---
+    # 笔记本/带电池设备需要，台式机没有电池（waybar 对无电池机器会自动隐藏该模块，
+    # 误选也无副作用）。用 power_supply 设备的 type 文件检测（涵盖 BAT0/BAT1/ups 等命名）。
+    local _bat_def="N" _ps
+    for _ps in /sys/class/power_supply/*/type; do
+        [ -e "$_ps" ] || continue
+        if [ "$(cat "$_ps" 2>/dev/null)" = "Battery" ]; then
+            _bat_def="Y"
+            break
+        fi
+    done
+    if confirm "$(_t "添加 waybar 电量模块（笔记本/带电池设备）？[Y/n] (default ${_bat_def}, 15s):" "Add the waybar battery module (laptop/battery-powered device)? [Y/n] (default ${_bat_def}, 15s):")" "$_bat_def" 15; then
+        _waybar_add_battery
+    else
+        log "$(_t "未添加电量模块（选 N 仅指本次不写入；已添加过的模块不会被移除）。" "Battery module not added (choosing N only skips writing this time; an already-added module is not removed).")"
+    fi
+}
+
+_waybar_add_battery() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _cfg="$HOME_DIR/.config/waybar/config" _css="$HOME_DIR/.config/waybar/style.css"
+    [ -f "$_cfg" ] || return 0
+
+    # JSON 注入：modules-right 在 "tray" 前插 "battery"（无 tray 则放最前）+ battery 模块定义。
+    # 参考版/平铺版 JSON 通用；幂等（battery 已存在则只补定义，modules-right 不重复）。
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$_cfg" <<'PYBATEOF'
+import json, sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    cfg = json.load(f)
+
+mods = cfg.get("modules-right", [])
+if "battery" not in mods:
+    pos = mods.index("tray") if "tray" in mods else 0
+    mods.insert(pos, "battery")
+cfg["modules-right"] = mods
+
+cfg["battery"] = {
+    "format": "{capacity}% {icon}",
+    "format-charging": "{capacity}% \U000F0084",
+    "format-plugged": "{capacity}% \U000F06A5",
+    "format-icons": ["\U000F007A", "\U000F007C", "\U000F007E", "\U000F0080", "\U000F0082"],
+    "states": {"warning": 30, "critical": 15},
+    "interval": 30,
+    "tooltip-format": "<tt>\u7535\u91cf: {capacity}%\n\u5269\u4f59: {timeTo}</tt>",
+}
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=4, ensure_ascii=False)
+PYBATEOF
+        if [ $? -ne 0 ]; then
+            warn "$(_t "电量模块 JSON 注入失败（python3 解析 config 出错），已跳过。" "Battery JSON injection failed (python3 could not parse the config); skipped.")"
+            return 1
+        fi
+    else
+        warn "$(_t "未找到 python3，无法注入电量模块，已跳过。" "python3 not found — battery module injection skipped.")"
+        return 0
+    fi
+
+    # CSS：追加 #battery 基础 pill 样式（两版 style.css 已有状态色规则但缺基础样式；幂等）
+    if [ -f "$_css" ] && ! grep -q "^#battery {" "$_css"; then
+        cat >> "$_css" <<'BATCSSEOF'
+
+/* ═══════════════════════════════════════════════════════════════
+   13. Battery（eilNiri 按需添加）
+   ═══════════════════════════════════════════════════════════════ */
+#battery {
+    padding: 0 14px;
+    margin: 3px 0;
+    color: #cdd6f4;
+    background: rgba(49, 50, 68, 0.72);
+    border-radius: 10px;
+    border-left: 2px solid rgba(166, 227, 161, 0.55);
+    transition: all 200ms ease;
+}
+
+#battery:hover {
+    background: rgba(69, 71, 90, 0.78);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+BATCSSEOF
+    fi
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg" 2>/dev/null || true
+    [ -f "$_css" ] && chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_css" 2>/dev/null || true
+    success "$(_t "waybar 电量模块已添加" "waybar battery module added")"
 }
 
 _ensure_waybar_config() {
@@ -3069,9 +3188,15 @@ install_waybar_guard() {
 #!/usr/bin/env bash
 # eilNiri: niri 的 waybar 启动守卫。已有实例在跑就直接退出——
 # 即使多个来源同时拉起 waybar，桌面上也只会有一条栏。
-if pgrep -x waybar >/dev/null 2>&1; then
-    exit 0
-fi
+# 复查 3 次（共 ~0.4s）：另一个启动来源几乎同时拉起时，双方都可能
+# 赶在对方进程名注册前通过第一轮 pgrep。
+i=0
+while [ "$i" -lt 2 ]; do
+    pgrep -x waybar >/dev/null 2>&1 && exit 0
+    sleep 0.2
+    i=$((i + 1))
+done
+pgrep -x waybar >/dev/null 2>&1 && exit 0
 exec waybar "$@"
 GUARDEOF
     chmod 755 "$_guard"
@@ -3090,10 +3215,10 @@ _ensure_waybar_single_source() {
         local tmp
         tmp=$(mktemp)
         register_temp_path "$tmp"
-        # 注释行原样保留；所有未注释的 waybar 启动行（含旧的直接 spawn 和旧的守卫行）
-        # 归并为唯一一条守卫启动。
+        # 所有 waybar 启动行（未注释的旧 spawn/旧守卫行，以及用户排查时临时注释掉的
+        # "// spawn-at-startup \"waybar\""）统一归并为唯一一条未注释守卫启动——
+        # 重跑 restore 意味着脚本接管配置，不能因为之前被注释就丢掉 waybar。
         awk '
-            /^[[:space:]]*\/\// { print; next }
             /^[[:space:]]*spawn-at-startup/ && /("waybar"|eilniri-waybar-start)/ {
                 if (!seen) {
                     print "spawn-at-startup \"/usr/local/bin/eilniri-waybar-start\""
@@ -3105,11 +3230,38 @@ _ensure_waybar_single_source() {
         ' "$niri_cfg" > "$tmp" && mv "$tmp" "$niri_cfg"
         exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$niri_cfg"
     fi
-    # 发行版包自带的 user unit 若被启用，graphical-session.target 会拉起第二条栏
+    # 发行版包自带的 user unit 若被启用，graphical-session.target 会拉起第二条栏。
+    # 在线 disable 需要用户总线存在——安装期（root、无用户会话）通常没有，
+    # systemctl --user 会静默失败，所以必须同时做离线清理：
+    # 直接删 enable 产生的 .wants 符号链接（用户级 + 全局级）。
+    rm -f "$HOME_DIR/.config/systemd/user/"*.wants/waybar.service 2>/dev/null || true
+    rm -f /etc/systemd/user/*.wants/waybar.service 2>/dev/null || true
     as_user systemctl --user disable --quiet waybar.service 2>/dev/null || true
     # 用户级 XDG autostart 条目（如有）一并移除
     rm -f "$HOME_DIR/.config/autostart"/waybar*.desktop 2>/dev/null || true
-    log "$(_t "waybar 启动源已统一为 niri 守卫脚本（禁用 waybar.service 自启，清理 autostart 条目）" "waybar startup unified to the niri guard script (waybar.service autostart disabled, autostart entries removed)")"
+    log "$(_t "waybar 启动源已统一为 niri 守卫脚本（离线清理 waybar.service 自启链接与 autostart 条目）" "waybar startup unified to the niri guard script (waybar.service enable links removed offline, autostart entries removed)")"
+}
+
+# --- 同步参考机的 niri 配置差异（与 configs 快照的 diff，四处幂等补丁）---
+# 参考机 ~/.config/niri/config.kdl 与仓库快照的内容差异中，属于配置偏好的四处：
+#   gaps 5（快照 16）、focus-ring off（快照注释）、animations 的 window-open 曲线、
+#   Mod+W 打开 kitty -e zsh。其余差异（注释 typo、末尾 debug 块、output mode）
+#   由脚本其他补丁/注入流程负责，不在此处理。
+_sync_reference_niri_config() {
+    local cfg="$HOME_DIR/.config/niri/config.kdl"
+    [ -f "$cfg" ] || return 0
+    # 1) gaps 16 -> 5
+    sed -i 's#^\([[:space:]]*gaps[[:space:]]\+\)16[[:space:]]*$#\15#' "$cfg"
+    # 2) focus-ring：块内 "        // off" 取消注释为 off（限定 focus-ring 块范围，
+    #    避免误伤文件里其他 "// off" 注释行）
+    sed -i '/^    focus-ring {/,/^    }/ s#^\([[:space:]]*\)// off$#\1off#' "$cfg"
+    # 3) animations：插入 window-open 曲线（幂等）
+    if ! grep -q 'window-open' "$cfg" 2>/dev/null; then
+        sed -i '/^animations {/a\    window-open {\n\t    curve "cubic-bezier" 0.05 0.7 0.1 1\n    }' "$cfg"
+    fi
+    # 4) Mod+W：kitty -> kitty -e zsh（含 IME env 前缀的整行，改尾段即可；幂等）
+    sed -i '/Mod+W/s#\(spawn-sh "[^"]*\)kitty"; }#\1kitty -e zsh"; }#' "$cfg"
+    log "$(_t "niri 配置已同步参考机风格（gaps/focus-ring/window-open/Mod+W zsh）" "niri config synced to reference style (gaps/focus-ring/window-open/Mod+W zsh)")"
 }
 
 # --- 输入法环境：此前 deb 版完全不写 IME 环境变量（arch 版写 environment.d/ime.conf）。
@@ -3925,11 +4077,24 @@ install_bluetui() {
             return 1
         fi
     fi
-    # bluetui 走 org.bluez D-Bus，需要 bluez 守护进程在跑；服务启用失败只提示不阻断
+    # --- 蓝牙栈保障：bluetui 与 waybar 蓝牙模块都走 org.bluez D-Bus ---
+    # bluetoothd 没在运行时，D-Bus 激活 org.bluez 超时（"Failed to activate service
+    # 'org.bluez'"），表现为 bluetui 打不开、waybar 蓝牙模块不显示——同一根因。
     pkg_installed bluez || pm_install bluez 2>/dev/null \
-        || warn "$(_t "bluez install failed — bluetui needs bluetooth.service" "bluez install failed — bluetui needs bluetooth.service")"
-    exe systemctl enable --now bluetooth.service 2>/dev/null \
-        || warn "$(_t "bluetooth.service enable failed — run 'systemctl enable --now bluetooth' after reboot" "bluetooth.service enable failed — run 'systemctl enable --now bluetooth' after reboot")"
+        || warn "$(_t "bluez 安装失败 — bluetui 需要 bluetooth.service" "bluez install failed — bluetui needs bluetooth.service")"
+    # enable 与 start 分开：enable 不依赖 D-Bus 激活，保证开机自启先落袋
+    exe systemctl enable bluetooth.service 2>/dev/null \
+        || warn "$(_t "bluetooth.service enable 失败 — 重启后手动执行: systemctl enable bluetooth" "bluetooth.service enable failed — run 'systemctl enable bluetooth' after reboot")"
+    # 软阻塞（rfkill）是常见坑：bluetoothd 在跑但 hci0 被 soft block → 无适配器
+    if command -v rfkill >/dev/null 2>&1 || pm_install rfkill 2>/dev/null; then
+        rfkill unblock bluetooth 2>/dev/null || true
+    fi
+    exe systemctl start bluetooth.service 2>/dev/null || true
+    if ! systemctl is-active --quiet bluetooth.service 2>/dev/null; then
+        warn "$(_t "bluetooth.service 未在运行 — bluetui/waybar 蓝牙模块会因 org.bluez 激活超时失败。排查: journalctl -u bluetooth（VM 无蓝牙控制器时属正常，忽略即可）。" "bluetooth.service is NOT running — bluetui and the waybar bluetooth module will fail with an org.bluez activation timeout. Check: journalctl -u bluetooth (on a VM without a Bluetooth controller this is expected; ignore it).")"
+    else
+        success "$(_t "bluetooth.service 运行中 — bluetui / waybar 蓝牙模块可用" "bluetooth.service is running — bluetui / waybar bluetooth module ready")"
+    fi
     return 0
 }
 
@@ -4050,7 +4215,7 @@ install_rime_ice() {
 # NOT published on crates.io (verified 404) — install from the upstream GitHub repo via cargo --git.
 XWS_REPO="https://github.com/Supreeeme/xwayland-satellite"
 install_xwayland_satellite() {
-    if command -v xwayland-satellite >/dev/null 2>&1; then
+    if command -v xwayland-satellite >/dev/null 2>&1 && [ "${EILNIRI_FORCE_UPDATE:-0}" != "1" ]; then
         SKIPPED_PKGS+=("xwayland-satellite (already installed)")
         return 0
     fi
@@ -4784,7 +4949,12 @@ build_progress_line() { # $1 = logfile
 }
 
 stage_wait_builds() {
-    [ ${#BG_JOBS[@]} -eq 0 ] && { stage_mark apps; return; }
+    # EILNIRI_NO_STAGE_MARK=1（update 子命令）时绝不写 restore 的断点文件
+    if [ "${EILNIRI_NO_STAGE_MARK:-0}" != "1" ]; then
+        [ ${#BG_JOBS[@]} -eq 0 ] && { stage_mark apps; return; }
+    else
+        [ ${#BG_JOBS[@]} -eq 0 ] && return
+    fi
     section "$(_t "Background Builds" "Background Builds")" "$(_t "waiting for cargo builds (niri/awww)" "waiting for cargo builds (niri/awww)")"
     log "$(_t "Run './deb-install.sh status' in another terminal to watch progress live." "Run './deb-install.sh status' in another terminal to watch progress live.")"
     local entry name pid logfile srcdir rc tailmsg start now prog any_failed=0
@@ -4821,7 +4991,7 @@ stage_wait_builds() {
     rm -f "$BUILD_STATE_FILE"
     BG_JOBS=()
     if [ "$any_failed" -eq 0 ]; then
-        stage_mark apps
+        [ "${EILNIRI_NO_STAGE_MARK:-0}" != "1" ] && stage_mark apps
     else
         warn "$(_t "Some background builds failed; apps stage not marked complete — rerun (without deleting progress) retries them." "Some background builds failed; apps stage not marked complete — rerun (without deleting progress) retries them.")"
     fi
@@ -5386,6 +5556,8 @@ stage_configs() {
             if ! grep -q 'xwaylandvideobridge' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
                 printf '\n// eilNiri: xwaylandvideobridge shows a blank window at startup (opacity 0 = invisible)\nwindow-rule {\n    match app-id="xwaylandvideobridge"\n    opacity 0.0\n}\n' >> "$HOME_DIR/.config/niri/config.kdl"
             fi
+            # 同步参考机配置风格（gaps/focus-ring/window-open/Mod+W zsh，幂等）
+            _sync_reference_niri_config
             chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
         fi
 
@@ -5666,15 +5838,23 @@ stage_hardware_adapt() {
     # --- 1) detect ALL connected outputs ---
     # 只取“第一个连接器”在双屏机器（笔记本 eDP-1 + 外接）上会选错目标；枚举全部
     # 已连接连接器，为每个生成 output 块。cardN 可能是多位数（card10-…）。
-    local -a detected_outs=()
-    local p cand
+    # 同时记录 sysfs modes 首行（DRM 首选分辨率，纯 WxH 不带刷新率）——写进
+    # output 块的 mode "WxH"（niri 自动取该分辨率下最高刷新率）；分辨率来自
+    # DRM 报告，不存在写错导致输出 inactive 的问题。
+    local -a detected_outs=() detected_modes=()
+    local p cand _m
     for p in /sys/class/drm/card*-*/status; do
         [ "$(cat "$p" 2>/dev/null)" = "connected" ] || continue
         cand=$(basename "$(dirname "$p")" | sed -E 's/^card[0-9]+-//')
         [ -n "$cand" ] || continue
+        _m=$(head -n1 "$(dirname "$p")/modes" 2>/dev/null | tr -d '[:space:]')
+        case "${_m:-}" in
+            [0-9]*x[0-9]*) ;;
+            *) _m="" ;;   # sysfs 缺 modes 文件/格式异常时不写 mode 行
+        esac
         case " ${detected_outs[*]:-} " in
             *" $cand "*) ;;   # 两块显卡报出同名连接器时只保留一份
-            *) detected_outs+=("$cand") ;;
+            *) detected_outs+=("$cand"); detected_modes+=("$_m") ;;
         esac
     done
 
@@ -5696,7 +5876,7 @@ stage_hardware_adapt() {
         return
     fi
 
-    info_kv "$(_t "Detected output" "Detected output")" "${detected_outs[*]}" "$(_t "preferred mode (no forced mode/scale/position)" "preferred mode (no forced mode/scale/position)")"
+    info_kv "$(_t "Detected output" "Detected output")" "${detected_outs[*]}" "${detected_modes[*]:-$(_t "preferred mode" "preferred mode")}"
 
     # --- 2) fix niri config ---
     if [ -f "$niri_cfg" ]; then
@@ -5707,23 +5887,32 @@ stage_hardware_adapt() {
         prune_config_backups "$(dirname "$niri_cfg")" "$(basename "$niri_cfg").bak-hw-*"
 
         # 逐行重写：把所有“活动”的 output 块整体替换为按实测连接器生成的干净块
-        # （第一个块带 focus-at-startup）。不写死 mode/scale/position——niri 自动选
-        # 首选模式；硬编码 @60 会让输出 inactive（黑屏），模板机遗留的 scale 1.2 /
-        # position 对新机器也是错的。/-注释块只是参考文档，原样保留。
+        # （第一个块带 focus-at-startup；有 DRM 分辨率报告时写入 mode "WxH"，
+        # niri 自动取该分辨率最高刷新率）。scale/position 不写死——模板机遗留值
+        # 对新机器是错的。/-注释块只是参考文档，原样保留。
         # 重写后 niri validate 校验，失败回滚备份。
         local tmp
         tmp=$(mktemp)
         register_temp_path "$tmp"
-        local depth=0 replaced=0 inblock=0 line o c i
+        local depth=0 replaced=0 inblock=0 line o c i _om
         : > "$tmp"
         while IFS= read -r line || [ -n "$line" ]; do
             if [ "$replaced" -eq 0 ] && echo "$line" | grep -qE '^[[:space:]]*output[[:space:]]+"'; then
                 i=0
                 for p in "${detected_outs[@]}"; do
+                    _om="${detected_modes[$i]:-}"
                     if [ "$i" -eq 0 ]; then
-                        printf 'output "%s" {\n    focus-at-startup\n}\n' "$p" >> "$tmp"
+                        {
+                            printf 'output "%s" {\n' "$p"
+                            [ -n "$_om" ] && printf '    mode "%s"\n' "$_om"
+                            printf '    focus-at-startup\n}\n'
+                        } >> "$tmp"
                     else
-                        printf 'output "%s" {\n}\n' "$p" >> "$tmp"
+                        {
+                            printf 'output "%s" {\n' "$p"
+                            [ -n "$_om" ] && printf '    mode "%s"\n' "$_om"
+                            printf '}\n'
+                        } >> "$tmp"
                     fi
                     i=$((i + 1))
                 done
@@ -5917,6 +6106,12 @@ do_restore() {
     print_niri_status
     print_summary
     save_diag_bundle
+
+    # restore 后给用户的可选后续动作：立即检查并升级软件包（apt 可直接下载的 + 需要源码重编译的）。
+    # 默认 N——首次全新安装后组件都是最新的；重跑/旧机器上可答 Y。
+    if confirm "$(_t "是否立即检查并升级软件包（apt 升级 + niri/awww 等源码组件重编译）？[Y/n] (default N, 20s):" "Check for software updates now (apt upgrade + rebuild of niri/awww etc.)? [Y/n] (default N, 20s):")" "N" 20; then
+        do_update
+    fi
 }
 
 # --- 4.10c one-line niri status (printed right before the summary) ---
@@ -6006,7 +6201,151 @@ save_diag_bundle() {
     fi
 }
 
-# --- 4.10b ensure display manager default session = niri (idempotent, runs on EVERY restore) ---
+# --- 软件更新（./deb-install.sh update + restore 末尾询问）---
+
+# niri 最新版本号（releases/latest 302 重定向优先、GitHub API 兜底；失败输出空）
+niri_latest_version() {
+    local _v
+    _v=$(curl -fsSI --retry 2 https://github.com/niri-wm/niri/releases/latest 2>/dev/null \
+        | grep -i '^location:' | sed -n 's#.*/tag/\(v[^/]*\).*#\1#p' | head -n 1 | sed 's/^v//' | tr -d '\r')
+    if [ -z "$_v" ]; then
+        _v=$(curl -fsSL https://api.github.com/repos/niri-wm/niri/releases/latest 2>/dev/null \
+            | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/' | tr -d '\r')
+    fi
+    printf '%s\n' "$_v"
+}
+
+# awww 最新 tag（Codeberg git ls-remote；无 tag/网络失败输出空）
+awww_latest_version() {
+    git ls-remote --tags "$AWWW_REPO" 'refs/tags/v*' 2>/dev/null \
+        | sed -n 's#.*refs/tags/v##p' | sort -V | tail -n 1
+}
+
+# 软件更新子命令：apt 包升级（直接下载安装）+ 源码组件升级（niri/awww/xwayland-satellite 重编译）。
+# 菜单只列出可升级项（版本对比）；执行顺序固定 niri -> awww -> xws（满足 awww 低内存
+# 串行逻辑对 BG_JOBS[0] 为 niri 的假设）。EILNIRI_NO_STAGE_MARK=1 保证不碰 restore 断点。
+do_update() {
+    init_logger
+    check_root
+    detect_distro
+    detect_target_user
+    ensure_fzf
+    apply_cargo_mirror
+
+    section "$(_t "Software Update" "Software Update")" "$(_t "apt packages + source-built components" "apt packages + source-built components")"
+    local EILNIRI_NO_STAGE_MARK=1
+
+    # --- 1) apt 索引刷新 + 可升级数统计 ---
+    log "$(_t "Refreshing apt index..." "Refreshing apt index...")"
+    if ! exe apt-get update; then
+        warn "$(_t "apt-get update 失败 — apt 升级将不可用（可稍后手动: sudo apt-get update && sudo apt-get upgrade）。源码组件升级不受影响。" "apt-get update failed — the apt upgrade option will be unavailable (run manually later: sudo apt-get update && sudo apt-get upgrade). Source-component updates are unaffected.")"
+    fi
+    local _apt_n=0
+    _apt_n=$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' || true)
+    [ "$_apt_n" -gt 0 ] 2>/dev/null || _apt_n=0
+
+    # --- 2) 源码组件版本对比 ---
+    local _niri_local="" _niri_remote="" _awww_local="" _awww_remote="" _xws_cur=""
+    command -v niri >/dev/null 2>&1 && _niri_local=$(niri --version 2>/dev/null | awk '{print $2}')
+    _niri_remote=$(niri_latest_version)
+    command -v awww >/dev/null 2>&1 && _awww_local=$(awww --version 2>/dev/null | awk '{print $2}')
+    _awww_remote=$(awww_latest_version)
+    _xws_cur=$(cargo install --list 2>/dev/null | grep -m1 '^xwayland-satellite' | sed 's/.*v\([0-9][^ :]*\).*/\1/')
+    [ -n "$_xws_cur" ] || _xws_cur=$(_t "未知" "unknown")
+
+    # --- 3) 构造菜单（只列可升级/可更新项）---
+    local lines=() _desc
+    local _t_niri="$(_t "源码编译, 约 15 分钟" "source build, ~15 min")"
+    local _t_awww="$(_t "源码编译, 约 5 分钟" "source build, ~5 min")"
+    local _t_xws="$(_t "源码编译, 约 3 分钟" "source build, ~3 min")"
+    if [ "$_apt_n" -gt 0 ]; then
+        lines+=("apt"$'\t'"$(_t "系统软件包升级（可升级 ${_apt_n} 个）" "system packages (${_apt_n} upgradable)")")
+    fi
+    if command -v niri >/dev/null 2>&1 && [ -n "$_niri_remote" ] && [ "$_niri_local" != "$_niri_remote" ]; then
+        lines+=("niri"$'\t'"${_niri_local:-?} -> ${_niri_remote} ($_t_niri)")
+    fi
+    if command -v awww >/dev/null 2>&1; then
+        if [ -n "$_awww_remote" ] && [ "$_awww_local" != "$_awww_remote" ]; then
+            lines+=("awww"$'\t'"${_awww_local:-?} -> ${_awww_remote} ($_t_awww)")
+        elif [ -z "$_awww_remote" ]; then
+            lines+=("awww"$'\t'"${_awww_local:-?} -> $(_t "latest main（无法取得远端版本号）" "latest main (remote version unavailable)")")
+        fi
+    fi
+    if command -v xwayland-satellite >/dev/null 2>&1; then
+        lines+=("xwayland-satellite"$'\t'"${_xws_cur} -> latest ($_t_xws)")
+    fi
+
+    if [ ${#lines[@]} -eq 0 ]; then
+        success "$(_t "全部已是最新 — 无可升级项。" "Everything is already up to date — nothing to update.")"
+        return 0
+    fi
+    info_kv "$(_t "可更新项" "Updatable")" "${#lines[@]}" "$(_t "niri=${_niri_local:-未装} -> ${_niri_remote:-?} | awww=${_awww_local:-未装} -> ${_awww_remote:-?}" "niri=${_niri_local:-absent} -> ${_niri_remote:-?} | awww=${_awww_local:-absent} -> ${_awww_remote:-?}")"
+
+    # --- 4) fzf 多选（无 fzf 退化为编号多选）---
+    local selected=""
+    if command -v fzf >/dev/null 2>&1; then
+        selected=$(printf '%s\n' "${lines[@]}" | fzf_multi "$(_t " 选择要更新的组件（默认全选，TAB 取消勾选，回车确认）" " Select components to update (all selected by default; TAB to unselect) ")") || selected=""
+    else
+        local i=1 _pick
+        echo -e "   ${H_CYAN}[0]${NC} $(_t "全部不更新" "update nothing")"
+        for _desc in "${lines[@]}"; do
+            echo -e "   ${H_CYAN}[$i]${NC} $(echo "$_desc" | tr '\t' ' ')"
+            i=$((i + 1))
+        done
+        echo -e "   ${H_CYAN}[a]${NC} $(_t "全部更新" "update everything")"
+        read -r -t 30 -p "   $(_t "输入编号（逗号分隔，如 1,3；回车=全部更新）: " "enter numbers (comma-separated, e.g. 1,3; enter=all): ")" _pick || _pick="a"
+        case "${_pick:-a}" in
+            0|"") selected="" ;;
+            a|A) selected=$(printf '%s\n' "${lines[@]}") ;;
+            *)
+                local _num _sel_lines=()
+                IFS=',' read -ra _num <<< "$_pick"
+                for _n in "${_num[@]}"; do
+                    _n=$(echo "$_n" | tr -d ' ')
+                    [[ "$_n" =~ ^[0-9]+$ ]] && [ "$_n" -ge 1 ] && [ "$_n" -le ${#lines[@]} ] && _sel_lines+=("${lines[_n-1]}")
+                done
+                [ ${#_sel_lines[@]} -gt 0 ] && selected=$(printf '%s\n' "${_sel_lines[@]}")
+                ;;
+        esac
+    fi
+    if [ -z "$selected" ]; then
+        log "$(_t "未选择任何组件 — 退出更新。" "No components selected — nothing to update.")"
+        return 0
+    fi
+
+    # --- 5) 执行（顺序固定 niri -> awww -> xws）---
+    local EILNIRI_FORCE_UPDATE=1
+    if grep -q '^apt' <<< "$selected"; then
+        log "$(_t "升级系统软件包 (apt upgrade)..." "Upgrading system packages (apt upgrade)...")"
+        local _erc=0
+        exe apt-get upgrade -y 2>>"$LOG_DIR/apt-errors.log" || _erc=$?
+        if [ "$_erc" -ne 0 ] && [ "$_erc" -ne "$DRY_RUN_RC" ]; then
+            warn "$(_t "apt upgrade 部分失败 — 见 " "apt upgrade partially failed — see ") $LOG_DIR/apt-errors.log"
+        fi
+    fi
+    if grep -q '^niri' <<< "$selected"; then
+        log "$(_t "升级 niri: ${_niri_local:-无} -> ${_niri_remote}（后台编译）..." "Updating niri: ${_niri_local:-none} -> ${_niri_remote} (background build)...")"
+        install_niri_binary
+    fi
+    if grep -q '^awww' <<< "$selected"; then
+        log "$(_t "升级 awww: ${_awww_local:-无}（后台编译）..." "Updating awww: ${_awww_local:-none} (background build)...")"
+        install_awww
+    fi
+    if grep -q '^xwayland-satellite' <<< "$selected"; then
+        log "$(_t "升级 xwayland-satellite（前台编译, 约 3 分钟）..." "Updating xwayland-satellite (foreground build, ~3 min)...")"
+        install_xwayland_satellite
+    fi
+
+    # --- 6) 等待后台编译收尾（不碰 restore 断点文件）---
+    stage_wait_builds
+
+    section "$(_t "Update Summary" "Update Summary")" "$(_t "软件更新完成" "software update finished")"
+    info_kv "$(_t "已更新" "Updated")" "${#INSTALLED_PKGS[@]}" "${INSTALLED_PKGS[*]:-}"
+    [ ${#MANUAL_ITEMS[@]} -gt 0 ] && warn "$(_t "以下组件需要手动处理（详见上方日志）:" "Manual follow-up needed (see logs above):") ${MANUAL_ITEMS[*]}"
+    return 0
+}
+
+
 # The stage_dm write only happens while that stage runs, but the niri.desktop session file
 # arrives later (background build). This step re-checks on every run so a late niri build
 # still gets picked up as the DM default session.
@@ -6261,6 +6600,7 @@ Usage:
   ./deb-install.sh restore [--dry-run]      restore desktop on new system (root)
   ./deb-install.sh status                   show background build progress (run from another terminal)
   ./deb-install.sh restore-system           re-enable system components disabled by restore (root)
+  ./deb-install.sh update                   check & update: apt upgrade + rebuild niri/awww/xwayland-satellite if newer (root)
   ./deb-install.sh --help                   show this help
 
 Options:
@@ -6285,7 +6625,7 @@ main() {
     local arg
     for arg in "$@"; do
         case "$arg" in
-            restore|reatore|status|restore-system)
+            restore|reatore|status|restore-system|update)
                 [ "$arg" = reatore ] && arg=restore
                 MODE="$arg"
                 ;;
@@ -6298,6 +6638,7 @@ main() {
     case "$MODE" in
         restore)         do_restore ;;
         status)          do_status ;;
+        update)          do_update ;;
         restore-system)  do_restore_system ;;
         *)               usage; exit 1 ;;
     esac

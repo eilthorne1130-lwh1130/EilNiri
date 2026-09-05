@@ -1,206 +1,214 @@
 # EilNiri
 
-按发行版选对应脚本，即可在新装的 **Arch 系** / **RHEL 系** / **Debian 系**（Debian/Ubuntu）系统上还原完整的 Niri 桌面环境：包安装（内置列表）、niri/awww/satty 预编译或源码构建、waypaper pip 安装、rime-ice 词库部署、**登录管理器（自动替换现有 DM）**、系统服务（内置列表 fzf 勾选）、显示器适配全部自动完成，**无需任何前置配置准备**；仓库已带 niri/waybar/hypr/mako/kitty/satty/fcitx5/waypaper 单元，restore 会一并部署（不部署 copyq 历史）。**RHEL 系（Rocky/Alma/CentOS Stream）会自动启用 EPEL + CRB 仓库**，保证构建依赖可装。**niri/awww 的 cargo 编译自动放到后台并行执行**，期间继续装包、部署配置，最后统一等待收尾，大幅压缩总等待时间。Arch 系与 Fedora 全量预编译安装、零 AUR 构建；Debian/Ubuntu 与 Rocky/Alma/CentOS Stream 上，niri 自动走官方预编译二进制或官方 vendored 源码离线编译。自动适配显示器、输入法中文组件可选、服务自启、字体渲染。
+一键在全新的 Linux 系统上装好并配置 [niri](https://github.com/niri-wm/niri) 平铺式窗口管理器桌面：包安装、niri/awww/satty 等无包组件的安装、登录管理器（自动替换现有 DM）、显示器适配、中文输入法、壁纸、开机自启全部自动完成，**无需任何前置准备**——装完重启，登录界面直接进 niri 桌面。
 
-## 快速开始
+---
+
+## 一、选择你的发行版
+
+| 脚本 | 适用发行版 | 状态 |
+|---|---|---|
+| **`deb-install.sh`** | Debian 12/13、Ubuntu 24.04+、Linux Mint、Pop!_OS，以及任意 Debian 衍生版（脚本自动识别 `/etc/debian_version`：deepin / UOS / Kali / MX / 麒麟等均可） | ✅ **可用（当前主力，完整测试）** |
+| `arch-install.sh` | Arch / Manjaro / EndeavourOS | 🚧 **未完成开发**（WIP，可能无法完整工作，欢迎测试反馈） |
+| `RHEL-install.sh` | Fedora / Rocky / Alma / CentOS Stream / RHEL | 🚧 **未完成开发**（WIP，可能无法完整工作，欢迎测试反馈） |
+
+> **新手请直接用 `deb-install.sh`。** 另外两个脚本保留在仓库中供后续开发使用，尚未达到日用状态。
+
+---
+
+## 二、快速开始（Debian 系）
+
+### 前置要求
+
+| 项目 | 要求 |
+|---|---|
+| 系统 | 推荐 **Debian 13 / Ubuntu 24.04+**（Debian 12 可用，waybar 版本较旧会自动使用精简布局） |
+| 权限 | root（`sudo`） |
+| 网络 | 需要联网下载包与源码（国内网络已内置镜像与代理回退，见[网络](#七网络与镜像)） |
+| 磁盘 | **≥ 6GB 空闲**（niri/awww 走源码编译，需要空间） |
+| 虚拟机 | 显卡必须设为 **Virtio + 3D 加速**，否则 niri 无法运行（见[故障排查](#八故障排查)） |
+
+### 安装步骤
 
 ```bash
-# 1. 把整个 EilNiri 目录拷到新机器 / 或直接在新机器上解压（U盘 / rsync / scp / 局域网共享）
+# 1. 把整个 EilNiri 目录拷到新机器（U盘 / rsync / scp 均可）
+rsync -av EilNiri/ user@新机器:~/EilNiri/
 
-# 2. 按发行版选脚本安装（需要 root；无需任何前置准备：包、niri/awww/satty、输入法词库、登录管理器、服务、配置）
-sudo ./arch-install.sh restore    # Arch / Manjaro / EndeavourOS
-sudo ./RHEL-install.sh restore    # Fedora / Rocky / Alma / CentOS Stream / RHEL
-sudo ./deb-install.sh restore     # Debian / Ubuntu / Mint / Pop
-#    仓库已带 niri/waybar/hypr/mako/kitty/satty/fcitx5/waypaper 单元，restore 会一并部署；不部署 copyq 历史
-#    完成后重启，直接进入登录界面 → niri 桌面
+# 2. 进入目录，运行安装脚本
+cd ~/EilNiri
+sudo ./deb-install.sh restore
 
-# 3. 回滚配置（Arch / RHEL；Debian 脚本已去掉快照回滚）
-sudo ./arch-install.sh rollback   # 或 ./RHEL-install.sh
+# 3. 按提示完成交互（都有默认值，直接回车也能走完）
+#    - 选择目标用户（默认 UID 1000 的用户）
+#    - 是否安装中文输入法（fcitx5 + 雾凇拼音，默认是）
+#    - fzf 界面勾选要装的应用（默认全选，TAB 切换、回车确认）
+#    - fzf 界面勾选要启用的系统服务（bluetooth / libvirtd / power-profiles-daemon）
 
-# 4. 若想重新启用 restore 时被禁用的其他桌面组件（多桌面环境场景）
-sudo ./arch-install.sh restore-system   # 或 ./RHEL-install.sh / ./deb-install.sh
+# 4. 等待完成。niri/awww 的编译在后台进行，可在另一个终端看进度：
+./deb-install.sh status        # 或 watch -n 5 ./deb-install.sh status
+
+# 5. 重启 → 登录界面 → 直接进 niri 桌面
+sudo reboot
 ```
 
-## 命令一览
+> **注意**：脚本会自动安装登录管理器（sddm）并**替换系统现有的 DM**（例如 Ubuntu 预装的 gdm3 会被禁用，不会被卸载）。想保留现有 DM，用 `EILNIRI_KEEP_DM=1 sudo ./deb-install.sh restore`。
+>
+> **断点续跑**：中断后直接重跑同一条命令，已完成的阶段自动跳过、失败的阶段自动重试。删除 `.replicate_progress` 文件可强制全量重跑。
+
+---
+
+## 三、命令一览
 
 | 命令 | 权限 | 说明 |
 |---|---|---|
-| `sudo ./arch-install.sh restore` / `sudo ./RHEL-install.sh restore` / `sudo ./deb-install.sh restore` | root | 显示 Logo → 安装桌面环境（fzf 交互） |
-| `sudo ./arch-install.sh restore --dry-run`（RHEL/deb 同理） | root | 预览模式，只打印不执行 |
-| `./arch-install.sh status`（必须用正在跑 restore 的同一份脚本） | 任意 | **查看后台编译进度**（restore 运行时在另一终端执行，支持 `watch -n 5 ./arch-install.sh status`） |
-| `sudo ./arch-install.sh rollback`（RHEL 同理；**Debian 无此命令**） | root | 从备份（`backups/` tar.gz）恢复配置 |
-| `sudo ./arch-install.sh restore-system`（RHEL/deb 同理） | root | **重新启用 restore 时被禁用的其他桌面组件**（多桌面环境场景，基于 `.system_disabled` 清单） |
-| `./arch-install.sh --help`（RHEL/deb 同理） | - | 查看帮助 |
+| `sudo ./deb-install.sh restore` | root | 完整安装（fzf 交互） |
+| `sudo ./deb-install.sh restore --dry-run` | root | 预览模式：只打印计划，不改动系统 |
+| `./deb-install.sh status` | 任意 | **实时查看后台编译进度**（restore 运行时在另一终端执行，支持 `watch`） |
+| `sudo ./deb-install.sh restore-system` | root | 重新启用 restore 时被禁用的其他桌面组件（多桌面环境场景） |
+| `sudo ./deb-install.sh update` | root | 检查并更新软件：apt 包升级 + niri/awww/xwayland-satellite 源码组件有新版时重编译（fzf 勾选） |
+| `./deb-install.sh --help` | - | 查看帮助 |
 
-## 环境变量
+> Debian 系**没有** `rollback` 命令（配置覆盖前的本地备份以 `.bak-时间戳` 形式保留在原目录）。`rollback` 仅存在于 Arch / RHEL 脚本中。
+
+## 四、环境变量
 
 | 变量 | 作用 |
 |---|---|
-| `EILNIRI_KEEP_DM=1` | 保留现有显示管理器不变，不做替换 |
-| `EILNIRI_KEEP_SYS=1` | restore 跳过禁用其他桌面组件（多桌面环境场景） |
-| `EILNIRI_GH_PROXY` | 空格分隔的 GitHub 代理 URL 列表，覆盖默认代理（见下文"网络"） |
+| `EILNIRI_KEEP_DM=1` | 保留现有显示管理器，不做替换 |
+| `EILNIRI_KEEP_SYS=1` | 跳过禁用其他桌面组件（多桌面环境共存场景） |
+| `EILNIRI_GH_PROXY="https://a/ https://b/"` | 覆盖默认的 GitHub 下载代理列表（空格分隔） |
 
-## 包含内容
+---
 
-### 应用分组（fzf 勾选，默认全选，使用前可选中文组件）
+## 五、安装了什么
 
-| 分组 | 默认 | 内容 |
-|---|---|---|
-| 核心组件 | ✅ | niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh（oh-my-zsh 及插件、starship、eza、bat 由脚本自动安装，见下方说明） |
-| 锁屏/空闲 | ✅ | hyprlock hypridle |
-| 壁纸 | ✅ | awww、waypaper (pip) |
-| 剪贴板/截图 | ✅ | copyq satty grim slurp |
-| 媒体/亮度 | ✅ | playerctl brightnessctl |
-| 音频 | ✅ | pipewire-pulse wireplumber |
-| 输入法 | ✅ | fcitx5 全家 + rime + 雾凇拼音 |
-| 字体 | ✅ | ttf-jetbrains-mono-nerd wqy-zenhei |
-| 密钥环 | ✅ | gnome-keyring |
-| 显示管理器 | ✅ 自动 | 自动安装并**替换现有 DM**：Arch→ly；Debian→sddm（失败再试 gdm3/gdm）；RHEL→gdm（gdm3 兜底） |
-| 系统服务 | 可选 | bluetooth / libvirtd / power-profiles-daemon |
+### 应用分组（fzf 勾选，默认全选）
 
-### 配置目录 `configs/`（可选）
-
-`configs/` **不是必须的**——不放也能直接 `restore`（niri 用默认配置）。若想部署自己的 dotfiles，restore 会部署 `configs/` 里的配置：`configs/.config/` 下的每个目录对应 `~/.config/<name>`（niri、waybar、mako、kitty、hypr、copyq、satty、waypaper、fcitx5、fcitx、environment.d、xdg-desktop-portal、gtk-3.0、gtk-4.0、fontconfig、systemd 等）；`configs/.local/share/` 下的内容会部署到 `~/.local/share/`。把目标桌面所需配置直接放进这些位置即可。
-
-- `configs/.config/systemd/user/` 内的用户单元（如 waypaper 服务）会在 restore 时启用
-- 敏感数据（~/.ssh、keyring、token）不应放进 `configs/`
-- 配置里的参考机绝对路径建议写成 `$HOME` 字面量（restore 时会展开成目标机主目录）
-
-## restore 流程（共 10 步；Debian 无配置快照）
-
-1. **Logo 展示** → **Pre-Flight**：Arch 系（pacman 并行下载 + Reflector CN 镜像优化 + keyring 刷新 + 系统更新）；RHEL 系（dnf upgrade）；Debian 系（apt-get update + 自动开启 Ubuntu universe + upgrade，确保 curl/tar/unzip，并自动 `locale-gen` 生成 `zh_CN.UTF-8`/`en_US.UTF-8`）；**Debian 系自动修复破损的 dpkg 状态**（`dpkg --audit` 发现半完成包即 `dpkg --configure -a`，否则后续所有 apt 安装都会失败且报"unavailable"），**apt 错误统一写入 `~/.local/state/eilNiri/apt-errors.log`** 供排查
-2. **目标用户检测**：默认 UID 1000，30s 超时可选创建新用户
-3. **中文组件选择**：是否装输入法和中文字体 → fzf 应用选择 → 批量安装（失败自动逐个隔离，waypaper 走 pip）；**CN 时区自动启用 cargo/rustup 镜像（rsproxy.cn）**；niri/awww 的 cargo 编译**转入后台**（日志 `~/.local/state/eilNiri/{niri,awww}-build.log`）
-4. **服务启用**：fzf 勾选内置服务（bluetooth / libvirtd / power-profiles-daemon，默认全选）→ `systemctl enable --now`（后台编译同时进行）
-5. **显示管理器**：自动安装脚本选择的 DM 并**替换现有 DM**（Arch→ly；Debian→sddm，失败再试 gdm3/gdm；RHEL→gdm，gdm3 兜底）——现有 DM（如 Ubuntu Desktop 预装 gdm3）会被自动禁用、`display-manager.service` 指向新 DM；**先装新的再禁旧的**，安装失败则保留现有 DM 不动；**默认启动目标自动设为 `graphical.target`**（否则重启只会进纯文本 tty、任何 DM 都不启动）；**gdm 默认会话自动设为 niri**（AccountsService `Session=niri` + 自动清除 `custom.conf` 的 `DefaultSession`/`AutomaticLogin` 覆盖 + 自动装/启 `accountsservice` + 重启 `accounts-daemon`；**每次 restore 幂等重检**——niri 后台构建晚完成也会被补上；否则登录会进系统默认桌面如 GNOME）；niri.desktop 同时安装到 `/usr/share/wayland-sessions/` 和 `/usr/local/share/wayland-sessions/` 确保所有 DM 都能发现；**若 niri.desktop 意外缺失（编译中断等），restore 自动从 GitHub 下载源码轻量修复（仅提取 niri.desktop，无需重新编译）**；`EILNIRI_KEEP_DM=1` 可保留现有 DM——重启后直接进 niri 登录
-6. **配置部署**：已有文件自动备份为 `.bak-时间戳`（仅覆盖前的本地副本，**Debian 不再打 `backups/` 快照、无 rollback**）→ PipeWire 用户服务自启 → **waypaper 用户服务（waypaper.service + 定时换壁纸 timer）自启** → **fcitx5 选中时兜底写入 `~/.config/environment.d/ime.conf`（IME 环境变量；`.pam_environment` 在 Debian 12+/Ubuntu 22.04+ 已默认失效）** → zsh 设为默认 shell → **自动安装 oh-my-zsh 及所需运行时（starship / eza / bat；见下方"zsh / oh-my-zsh"）**
-7. **系统清理（禁用其他桌面组件）**：目标机若有多套桌面环境（如 Ubuntu 预装 GNOME），自动**禁用（不卸载）**其他 DE 的冲突组件——通知 daemon（evolution-alarm-notify / xfce4-notifyd）、GNOME 设置守护（媒体键/电源/声音/剪贴板）、gnome-remote-desktop。机制为写 `~/.config/autostart/*.desktop` 覆盖（`Hidden=true`）+ `systemctl mask`，**只禁用不删除任何包**；每次操作记录到 `$BASE_DIR/.system_disabled` 清单，可用同一份脚本的 `restore-system` 一键重新启用。`EILNIRI_KEEP_SYS=1` 跳过。
-8. **等待后台构建**：轮询 niri/awww 编译进度（每 15s 显示已用时间 + **当前正在编译的 crate**，如 `Compiling smithay v0.4.0`）→ 编译完成后自动安装二进制到 `/usr/local/bin`；失败读取日志尾部进手动报告。**restore 运行时可在另一终端用同一份脚本的 `status` 实时查看每个构建的状态/耗时/当前编译项**（日志：`~/.local/state/eilNiri/{niri,awww}-build.log`，`tail -f` 可实时跟看）
-9. **硬件适配**：自动检测显示器输出名+分辨率 → 修复 niri config → 注释 waybar 硬件 sink → polkit agent 路径按家族改写 → GPU 驱动提示
-10. **装后验证**：包对账 + 配置目录审计 → **NIRI STATUS 单行**（binary/desktop/gdm Session）→ **Boot Environment Check**（若 gdm 无法启动 niri 会打印醒目 `BOOT CHECK FAILED` + 具体原因）→ **汇总报告** → 生成**诊断包** `~/.local/state/eilNiri/diag-<时间戳>.tar.gz`（含各 build 日志、AccountsService、custom.conf、包清单，便于分享排查）→ pacman 缓存清理
-
-## RHEL 系支持
-
-**推荐发行版（优先顺序）**
-
-| 优先级 | 系统 | 说明 |
-|---|---|---|
-| ★ 首选 | **Fedora 41+**（含较新 Fedora） | niri / waybar / hyprlock / hypridle / xwayland-satellite / fcitx5 官方仓都有，几乎零源码构建 |
-| ★ 支持 | **Rocky Linux 10 / AlmaLinux 10 / CentOS Stream 10 / RHEL 10** | 自动启用 EPEL + CRB，并启用 COPR：`alebastr/sway-extras`（waybar/mako/fuzzel/grim/slurp）、`yalter/niri`、`solopasha/hyprland`（hyprlock/hypridle） |
-| △ 不推荐 | EL8 / EL9 / Rocky 8–9 | 多数 Wayland 套件无包，会大量源码编译，不作为目标平台 |
-
-- 包名自动翻译（如 `ttf-jetbrains-mono-nerd` → `jetbrains-mono-nerd-fonts`）
-- 无 RPM 对应包自动走替代安装（awww 源码构建 / satty 预编译 / rime-ice 词库部署 / gdm 登录管理器），只有全部失败才列入手动安装报告
-- waypaper 走 pip3 兜底
-- **Fedora**：官方仓库直接 `dnf` 装，**不会**启用 COPR
-- **Rocky / Alma / CentOS Stream / RHEL 10**：restore 开头启用并刷新 **EPEL + CRB**，安装前验证真实包候选；EPEL 负责 copyq/playerctl/brightnessctl/fcitx5/fcitx5-rime/power-profiles-daemon，waybar/mako/fuzzel/grim/slurp 优先使用 `alebastr/sway-extras` COPR，niri 使用 `yalter/niri`，hyprlock/hypridle 使用 `solopasha/hyprland`。COPR 只是加速路径，若 AlmaLinux 10 没有对应 EL10 chroot、`dnf copr` 插件不可用、元数据/GPG/网络失败或架构不匹配，脚本会记录 `copr.log` 并自动切换源码构建，不会把 COPR 当作硬依赖。所有目标 Wayland 包均保留 CMake/Meson 源码兜底。`fcitx5-configtool`、GTK/Qt 前端按可用候选包动态映射。hyprlock/hypridle 源码构建显式安装 **`pam-devel` + `sdbus-cpp-devel`**
-- **GDM 黑屏修复**：v1.9.26 每次 RHEL restore 都会解除旧版本可能遗留的 `gdm-wayland-session.service`、`gdm-x11-session.service`、`gdm-launch-environment.service` mask；这些 GDM Wayland 会话服务不会加入其他桌面组件禁用列表
-- **AlmaLinux 10 COPR 诊断**：COPR 失败时查看 `~/.local/state/eilNiri/copr.log`、`dnf repolist --enabled` 和 `dnf makecache --refresh` 输出。AlmaLinux 官方建议先启用 `epel-release` 和 CRB；AlmaLinux 10 的 x86-64-v2/v3 架构变体也可能导致第三方 RPM 无匹配架构，因此源码构建是必要保留方案
-- **awww / satty**（全部 RHEL 系）：awww 自动从 Codeberg 源码构建（约 5 分钟）；satty 自动下载官方预编译二进制，不可用时回退 cargo 构建
-- **登录管理器**：自动装并启用 `gdm`（Fedora 仓库有 / gdm3 兜底；装不上会提示并给出 tty 方案）
-
-## Debian 系支持（Debian 12/13 / Ubuntu 24.04+）
-
-- **包名自动翻译**：
-
-| Arch 包名 | Debian/Ubuntu 包名 |
+| 分组 | 内容 |
 |---|---|
-| mako | mako-notifier |
-| fcitx5-configtool | fcitx5-config-qt |
-| fcitx5-gtk | fcitx5-frontend-all |
-| fcitx5-qt | fcitx5-frontend-all |
-| polkit-gnome | policykit-1-gnome（Ubuntu 24.04+/Debian 13+ 已改名；旧发行版自动回退 polkit-gnome） |
-| ttf-jetbrains-mono-nerd | fonts-jetbrains-mono |
-| wqy-zenhei | fonts-wqy-zenhei |
-| libnotify | libnotify-bin |
-| polkit-gnome | polkit-gnome |
+| 核心组件 | niri、waybar、mako（通知）、fuzzel（启动器）、kitty（终端）、polkit 认证代理、xwayland-satellite、xdg-desktop-portal、wl-clipboard、libnotify、zsh + oh-my-zsh（含 autosuggestions / syntax-highlighting 插件、starship 提示符、eza / bat）、gsimplecal、adwaita-icon-theme |
+| 锁屏/空闲 | hyprlock、hypridle |
+| 壁纸 | awww（wayland 壁纸引擎，源码编译）、waypaper（壁纸选择器） |
+| 剪贴板/截图 | copyq、satty、grim、slurp |
+| 媒体/亮度 | playerctl、brightnessctl、btop |
+| 音频 | pipewire-pulse、wireplumber |
+| 输入法（可选） | fcitx5 全家 + rime + 雾凇拼音词库（单击左 Shift 切中英文） |
+| 字体 | JetBrainsMono Nerd Font（waybar 图标）、文泉驿正黑 |
+| 密钥环 | gnome-keyring |
+| 工具 | bluetui（蓝牙 TUI，waybar 蓝牙图标点击打开）、ripgrep、zoxide |
 
-- **Ubuntu universe 自动开启（硬校验）**：fuzzel / mako-notifier / waybar / fcitx5-rime / hyprlock 等全部在 universe 组件。Ubuntu Server / minimal / 云镜像默认不开 universe —— Pre-Flight 自动检测并开启（`add-apt-repository universe`，无该命令时直接改写 deb822 `.sources` 的 `Components` 行），开启后**必须能看到 universe 包才算成功**，否则明确警告并给出手动命令；构建依赖自愈时若发现候选 `-dev` 包不在 apt 列表（如 `libxcb-render-util0-dev` 这类 universe 包），也会自动重试启用 universe 后再装。
-- **Ubuntu 版本**：建议 24.04+。低于 24.04 时 Pre-Flight 会明确警告（22.04 等旧版仓库基本没有 niri 套件包）；26.04+ 的 universe 已自带 hyprlock / hypridle，会直接 apt 装成功
-- **debconf 不卡流程**：Debian 系自动 `DEBIAN_FRONTEND=noninteractive`，apt 安装（如 libvirt）不会弹出交互提示
-- **编译提速（后台并行 + 资源感知）**：niri/awww 的 `cargo build` 转入后台执行，期间脚本继续装服务、DM、配置，最后统一等待——Ubuntu（4 核）总等待从 ~25 分钟降到 ~12-15 分钟。编译并行度按内存自动限制（每任务约 1.5GB，防小 VM OOM；<8GB 内存时 awww 自动等 niri 完成再编译）。编译日志：`~/.local/state/eilNiri/{niri,awww,xwayland-satellite}-build.log`
-- **niri 自动安装（分层策略 + 多项可靠性修复）**：官方仓库无 niri 包。restore 时下载**源码小 tarball（~1MB）**后台 `cargo build --release`（依赖从 crates.io 拉取，rsproxy 镜像兜底；约 10-20 分钟）。**仅当任何 cargo 注册源都不可达时**才额外下载 40MB `vendored-dependencies` 归档离线构建（此路径的 `.cargo/config.toml` 使用绝对路径指向 vendored 目录，修掉了相对路径解析 bug）。构建依赖的按版本改名采用**运行时 `apt-cache policy` 探测 + 回退原名**（不再硬编码猜测，旧版错误的 `libdisplay-info-dev→libdisplay-info0-dev` 映射会让依赖被静默丢弃、编译 15 分钟后才报 `libdisplay-info.pc not found`）；**关键依赖硬校验**（build-essential/cmake/pkg-config/clang/libclang-dev/libwayland-dev/wayland-protocols/libpango1.0-dev/**libdisplay-info-dev/libxkbcommon-dev/libinput-dev**）缺失即明确报错中止，并把真实 apt 错误尾部带进报错信息；niri 的 pipewire 特性依赖 `libspa-sys`（bindgen），因此强制包含 `clang`/`libclang-dev`。**启动构建前做 pkg-config 预检**：一次性验证 build 需要的全部 23 个 `.pc` 文件（libdisplay-info/xkbcommon/wayland-client/libseat/pipewire/dbus/pango/gbm/egl/xcb-*），任一缺失几秒内即报错并进入手动报告，不再等 10-20 分钟。
-- **hyprlock / hypridle 源码编译兜底**：Ubuntu 26.04+ 的 universe 已自带 hyprlock/hypridle（直接 apt 装）；**Debian 13 / 旧版 Ubuntu 无包时，restore 自动从源码构建**。始终钉 C++23 发行 tag（不跟 HEAD：hyprutils master 要 C++26，组件 API 会漂）。clone/cmake 失败会把真实错误写入 `hypr-stack.log`（不再只打空的 `=== name (ref=HEAD) ===`）。栈：`hyprwayland-scanner v0.4.4` → `hyprutils v0.8.4` → `hyprlang v0.6.3` → `hyprland-protocols v0.6.4`；hyprlock 再编 `hyprgraphics v0.1.3`，hyprlock 自身钉 `v0.8.2`。源码构建会写入 `/etc/pam.d/hyprlock`。
-- **awww 自动安装**：无 .deb 也无预编译二进制，且上游已从 GitHub 迁到 Codeberg。restore 自动浅克隆 `codeberg.org/LGFae/awww` → 后台 `cargo build --release`（约 5 分钟）→ 安装 `awww` 与 `awww-daemon` 到 `/usr/local/bin`。
-- **satty 自动安装**：无 .deb，但官方（Satty-org/Satty）发布预编译二进制。restore 直接走 `releases/latest/download` 稳定 URL（免 GitHub API，CN 更稳）下载 `satty-<arch>-unknown-linux-gnu.tar.gz`（x86_64/aarch64）→ 安装到 `/usr/local/bin`，并确保 GTK4/libadwaita/librsvg 运行时库；预编译不可用时回退 `cargo install`。
-- **xwayland-satellite 自动安装**：Debian/Ubuntu 稳定仓库没有（Fedora 有），且**未发布到 crates.io**（已验证 404）。restore 自动装构建依赖（git/clang/libclang-dev/libxcb-cursor-dev）后 `cargo install --git`（官方 GitHub 仓库，约 3 分钟，日志带失败尾部），并顺带装 Xwayland。
-- **polkit agent**：Ubuntu 24.04+/Debian 13+ 的包名已从 polkit-gnome 改为 `policykit-1-gnome`（自动映射，旧版自动回退）；niri 配置里的 agent 启动路径自动按家族改写（Arch `/usr/lib` ↔ Debian/RHEL `/usr/libexec`）。
-- **PEP 668**：waypaper 的 pip 安装自动加 `--break-system-packages`（Debian/Ubuntu 默认阻止系统级 pip）。
-- **服务提供包**：`libvirtd.service` 的提供包按家族映射（Debian 为 `libvirt-daemon-system`）。
-- **rime-ice 雾凇拼音自动部署**：无 .deb/RPM 时使用官方 release zip（`full.zip`）；restore 会先安装并验证 `fcitx5-rime`，RHEL 上依次尝试官方仓库/EPEL/源码，并在需要时先构建 `librime` 再构建 `fcitx5-rime`，成功后下载解压到 `~/.local/share/fcitx5/rime`。Arch 上仍走 archlinuxcn 包，不受影响。
-- **登录管理器自动安装**：Debian 默认 `sddm`（失败再试 gdm3/gdm），RHEL 默认 `gdm`（gdm3 兜底）；现有 DM 被自动禁用替换，`EILNIRI_KEEP_DM=1` 可保留。
-- **Debian 进 niri 黑屏自愈（v1.9.32）**：日志显示 niri 其实已启动。开机 `hyprlock` 会立刻 `locking session`（已注释）。AMD 上硬件 cursor plane 会卡死在左上角并看起来像黑屏——restore 写入 `debug { disable-cursor-plane; disable-direct-scanout; }`（软件光标）。hypridle 的 `lock_cmd` 改为 `pidof hyprlock || hyprlock`。不再写 `mode @60` / `WLR_*` / `LIBGL_ALWAYS_SOFTWARE`。
-- **ly**：仅 Arch 有包（自动安装）；Debian 用 sddm（gdm 兜底），RHEL 用 gdm。
-- **Debian 无快照回滚**：`deb-install.sh` 不写 `backups/`、不提供 `rollback`。覆盖配置时仍会把旧文件改名为 `.bak-时间戳`（只保留一份）。Arch / RHEL 脚本仍保留快照。
-- **apt 镜像源自动换源（404 / 无法下载自愈）**：当 `apt-get update` 失败、或安装时 apt 报 `404`/`无法下载`/`Failed to fetch`（典型：`cn.archive.ubuntu.com` 等镜像同步滞后——索引里已有新版但 pool 里的 .deb 尚未同步，如 Ubuntu 26.04 的 `libudev-dev_259.5-0ubuntu3.3`、`libinput10 1.31.1-1`）时，脚本按 **tuna → 阿里云 → 中科大** 顺序询问并自动换源：备份原源文件（`*.mirror-bak-时间戳`）→ 改写 `.list`/`.sources` 里的 host → `apt-get update` → **用 curl 探测之前 404 的 .deb 是否真被新镜像同步**（只有显式 404 才换下一个候选）→ 换源成功后自动重试关键依赖一轮（带 `--fix-missing`）。fzf 可用时用 fzf 菜单选择，未装时退化为编号提示。手动报告只追加一次。
-- **系统时钟偏差自动检测**：apt 报 `Release 文件已经过期 / expired / Valid-Until` 时（尤其是 `security.ubuntu.com` 这类官方源也报过期）通常不是镜像问题，而是**本地时钟偏快**（VM 常见）。脚本在 `apt-get update` 失败和关键依赖失败时会对比官方源 Last-Modified 与本地时间，偏差 ≥ 3 天即给出校准命令（`sudo timedatectl set-ntp true`），避免"换镜像也没用"的误导。
-- **pkg-config 预检自愈**：启动 niri 后台编译前一次性验证全部 23 个 `.pc` 文件；缺失时（Debian 系）**自动安装对应的 -dev 包**（新旧命名都试，如 `libxcb-icccm4-dev` ↔ `libxcb-icccm-dev`，`apt-cache` 探测哪个存在装哪个），装完重新校验；仍缺则报出**具体缺失清单**，不再等到 15 分钟编译后报 "libdisplay-info.pc not found"。另有 `.pc` **命名分歧自动兼容**（Ubuntu 26.04 的 `libxcb-render-util0-dev` 装的是上游原名 `xcb-renderutil.pc`，与 Debian 系传统命名 `xcb-render-util.pc` 不同——脚本自动补双向符号链接），以及"包已装但 pkg-config 找不到"时自动把 `.pc` 所在目录加入 `PKG_CONFIG_PATH`。
-- **systemd user units 与 ExecStart 路径修复**：niri-session 通过 `systemctl --user start niri.service` 启动会话，源码构建后**必须把 niri 源码 `resources/` 里的 `niri.service` / `niri-shutdown.target` 装到 `/usr/lib/systemd/user/`**（漏装会导致 GDM 登录循环："Unit niri.service not found"）；配置部署时还会**自动修正 `configs/` 里 user unit 的 `ExecStart` 二进制绝对路径**（参考机 Arch 的 `/usr/bin/xxx` ↔ Debian/RHEL 的 `/usr/local/bin` 或 `~/.local/bin`，如 waypaper/hypridle），避免 "Failed at step EXEC spawning ... No such file"。
-- **Rust 工具链版本守卫**：`rustup` 工具链/默认版本缺失时防止静默使用发行版自带的过老 cargo（Debian 12 的 rustc 1.63、Ubuntu 22.04 的 1.75 编译 niri 会报 "edition 2024" 错误）。`ensure_rust` 校验 cargo ≥ 1.85，不足时自动 `rustup update stable` 重试一次，仍不满足则明确报错中止，不再用老工具链硬编译。
+### 系统服务（fzf 可选）
 
-## zsh / oh-my-zsh（桌面终端体验）
+bluetooth（蓝牙，bluetui 依赖）、libvirtd（虚拟机）、power-profiles-daemon（电源性能切换）。
 
-- **自动安装 oh-my-zsh**：Debian/RHEL 的官方仓库都没有 oh-my-zsh 包（[Arch 参考机靠 AUR 才有](https://github.com/ohmyzsh/ohmyzsh)），`configs/.zshrc` 也因此只在 Arch 上生效。restore 在 zsh 选中时自动以目标用户身份 `git clone --depth=1` 官方仓库到 `~/.oh-my-zsh`，跨 Arch/RHEL/Debian 三家一致生效。
-- **OMZ 插件放到 `custom/plugins/`**：`zsh-autosuggestions` / `zsh-syntax-highlighting` 不再走 apt/dnf 包（它们装到 `/usr/share` 或 `/etc/zsh/zshrc.d`，OMZ 的 `plugins=()` 用不上），而是克隆到 `~/.oh-my-zsh/custom/plugins/` 供 .zshrc 插件表识别。
-- **配套运行时自动装**：starship（`configs/.zshrc` 里 `init zsh` 依赖，官方脚本装到 `/usr/local/bin`）、eza（repo 优先，无包则 `cargo install --root /usr/local`）、bat（Debian/Ubuntu 上自动建 `bat`→`batcat` 符号链接）。
-- **`.zshrc` 全防护**：`source $ZSH/oh-my-zsh.sh`、`starship init zsh`、eza/bat/rg 别名均改为"命令存在才加载"，参考机写死的 `/home/eilthorne` 绝对路径改为主目录相对（`$HOME`）；即使某个组件没装上，shell 也不会报错。
-- 每步失败都会进入"手动安装报告"（MANUAL_ITEMS）并给出具体命令，不会静默抛错。
+### 登录管理器（自动）
 
-## 网络（CN 友好）
+自动安装 **sddm** 并设为默认（失败依次回退 gdm3 / gdm），默认会话设为 niri；现有 DM 自动禁用（不卸载）。重启后直接进 niri。
 
-- **GitHub 下载代理回退**：所有源码/预编译 tarball（niri、satty、rime-ice、hyprlock/hypridle 等）优先走 GitHub 官方直连（断点续传 + 重试 + 超时）；**直连失败后自动依次尝试代理**（默认 `https://ghfast.top/`、`https://mirror.ghproxy.com/`），可用 `EILNIRI_GH_PROXY="https://proxyA/ https://proxyB/"` 覆盖。
-- **cargo/rustup 镜像**：CN 时区或 crates.io 不可达时自动启用 **rsproxy.cn**（写入 `~/.cargo/config.toml`，并导出 `RUSTUP_DIST_SERVER`/`RUSTUP_UPDATE_ROOT`，让 rustup 工具链下载也走镜像）。CN 时区下始终预设 rsproxy。
+### 桌面配置
 
-## 硬件自动适配
+- 仓库 `configs/` 内置 niri / waybar / hypr（锁屏）/ mako / kitty / satty / fcitx5 / waypaper / systemd 用户单元等配置，restore 一并部署，已存在的文件自动备份为 `.bak-时间戳`
+- **默认壁纸 = 仓库根目录那张图片**（`QQ图片20260713144149.jpeg`），桌面与锁屏（hyprlock）共用；想换默认壁纸，直接替换仓库根目录的图片文件再跑一次 restore
+- waybar 使用与参考机同步的完整配置（媒体控件 / 折叠抽屉 / 系统更新计数）；旧版 waybar（< 0.10）自动使用兼容布局；**电量模块安装时按提示选择**（自动检测电池预填默认值，台式机选了也会被 waybar 自动隐藏）
+- niri 显示器参数自动检测注入（分辨率来自 DRM 硬件报告）；登录时若显示器未变不会覆盖你手动调过的配置
+- 启动防呆：waybar 单实例守卫（不会出现两条栏）、fcitx5 单实例、CopyQ 主窗口自动隐藏（无托盘环境不再弹出空白窗口）
 
-| 适配项 | 说明 |
+---
+
+## 六、安装过程会发生什么
+
+1. **Pre-Flight**：apt 更新 + 自动开启 Ubuntu universe 源 + 修复破损 dpkg 状态 + 自动生成中文 locale + **VM 图形预检**（QEMU/KVM 下检测显卡/渲染节点并给出黑屏预防指引）+ Mesa 图形运行时安装
+2. **目标用户检测**：默认 UID 1000 用户，30 秒内可选其他/新建
+3. **应用安装**：按 fzf 勾选批量安装；无 .deb 的组件自动走预编译下载或源码编译；**niri / awww 的 cargo 编译转后台并行**，期间继续装包部署配置
+4. **服务启用**：勾选的系统服务 `systemctl enable --now`
+5. **显示管理器**：安装 sddm 并替换现有 DM，默认会话设为 niri，开机目标设为 graphical.target
+6. **配置部署**：部署 `configs/` + 输入法环境变量（environment.d + /etc/environment）+ zsh/oh-my-zsh 运行时 + waybar/壁纸自愈
+7. **系统清理**：自动**禁用（不卸载）**其他桌面环境的冲突组件（GNOME 通知/设置守护等），清单存 `.system_disabled`，可随时用 `restore-system` 恢复
+8. **等待后台编译**：实时显示进度；完成后自动安装 niri/awww 二进制
+9. **硬件适配**：检测所有已连接显示器 → 生成 output 配置（含真实分辨率）→ niri validate 校验，失败自动回滚
+10. **验证收尾**：包对账 + 配置审计 + 启动链自检 + 汇总报告 + 生成诊断包
+
+---
+
+## 七、网络与镜像
+
+- **GitHub 下载代理回退**：niri 源码、satty、bluetui、rime-ice 等下载优先 GitHub 直连，失败自动依次尝试国内代理（ghfast.top 等），可用 `EILNIRI_GH_PROXY` 覆盖
+- **cargo/rustup 镜像**：国内时区自动启用 rsproxy.cn
+- **apt 换源自愈**：apt 404 / 源失效时按 清华 → 阿里云 → 中科大 顺序询问换源，并验证新镜像确实同步了之前 404 的包
+- **系统时钟偏差检测**：apt 报"Release 文件过期"时自动对比时钟，偏差 ≥ 3 天给出校准命令（VM 常见）
+- **Ubuntu universe**：Server/minimal 镜像默认不开 universe（fuzzel/waybar/fcitx5-rime 都在里面），脚本自动开启并硬校验
+
+---
+
+## 八、故障排查
+
+### 登录后黑屏
+
+1. **虚拟机用户**：niri 硬性要求硬件渲染（拒绝 llvmpipe 软渲染），虚拟显卡必须是 **Virtio 且勾选 3D 加速**（virt-manager 勾选，或 virsh 里 `<model type='virtio'><acceleration accel3d='yes'/>`）。登录界面能亮不代表 niri 能跑——greeter 用软渲染就行，niri 不行。脚本运行开头的 **VM Graphics Check** 会列出检测结果。
+2. 切 TTY（`Ctrl+Alt+F3`）登录后查看会话日志：
+   ```bash
+   tail -n 50 ~/.local/state/eilniri/session.log
+   ```
+   niri 的报错（panic 原文）就在文件末尾。
+3. 把诊断包发出来最快：`~/.local/state/eilNiri/diag-<时间戳>.tar.gz`（含编译日志、DM 状态、DRM 设备、journal 相关行、会话日志）。
+
+### 其他常见项
+
+| 现象 | 处理 |
 |---|---|
-| 显示器输出名 | 读 `/sys/class/drm` 检测 → 替换 niri config 的 output 配置 |
-| 分辨率+刷新率 | 读首选 mode → 注入 config |
-| 多余输出 | 多屏配置自动注释为 `/-output` |
-| waybar sink | 硬件 ALSA sink 自动注释 |
-| GPU 检测 | `lspci` → info 显示显卡型号 |
-| niri-session | 修复 `import-environment` 弃用警告 |
+| waybar 出现两条 | 重跑一次 restore（单实例守卫 + systemd 自启链接清理会自动修复） |
+| 输入法候选异常 / Shift 不切换中文 | 确认装了输入法组件；重跑 restore 会重新写入 fcitx5 配置与输入法环境变量 |
+| 壁纸不是仓库那张 | 确认 `~/.local/share/backgrounds/wallpaper.jpg` 存在；awww 编译失败时壁纸由 waypaper.service 在登录时恢复，重跑 restore 重试编译 |
+| 包安装失败 | 看 `~/.local/state/eilNiri/apt-errors.log`（apt 真实报错都在这里） |
+| 编译失败 | 看 `~/.local/state/eilNiri/{niri,awww}-build.log` 尾部；脚本结尾的 Summary 手动项会给出具体命令 |
+
+### 日志位置
+
+| 文件 | 内容 |
+|---|---|
+| `~/.local/state/eilNiri/replicate.log` | 主日志（保留最近 800 行） |
+| `~/.local/state/eilNiri/apt-errors.log` | apt 安装真实报错 |
+| `~/.local/state/eilNiri/{niri,awww}-build.log` | 后台编译日志（`tail -f` 实时看） |
+| `~/.local/state/eilniri/session.log` | niri 会话日志（黑屏排查第一现场） |
+| `~/.local/state/eilNiri/diag-*.tar.gz` | 诊断包（求助于人时直接分享这个） |
+
+---
+
+## 九、自定义配置
+
+- `configs/` **不是必须的**——没有它 restore 也能跑（niri 用内置默认配置）
+- 想用自己的 dotfiles：`configs/.config/` 下的每个目录对应目标机 `~/.config/<name>`；`configs/.local/share/` 对应 `~/.local/share/`
+- 敏感数据（`~/.ssh`、token、keyring）不要放进 `configs/`
+- 配置里的路径建议写成 `$HOME` 字面量（restore 时会展开为实际主目录）
+
+---
+
+## 十、已知限制
+
+- **Debian 系无 `rollback` 命令**（配置备份仅保留覆盖前的 `.bak-时间戳` 单份）
+- **虚拟机必须开 3D 加速**，否则 niri 无法运行（niri 拒绝软件渲染，这是上游设计而非脚本问题）
+- Debian 12 / Ubuntu 24.04 的 waybar 为 0.9.x 旧版，自动使用精简布局（无折叠抽屉/媒体模块）
+- niri / awww 在 Debian 系走源码编译（约 10-20 分钟 + 5 分钟），需要 ≥ 6GB 磁盘与足够内存（编译并发按内存自动限制）
+- `arch-install.sh` 与 `RHEL-install.sh` 为未完成开发状态，暂不提供支持
+
+---
 
 ## 产物结构
 
 ```
 EilNiri/
-├── arch-install.sh
-├── RHEL-install.sh
-├── deb-install.sh
-├── configs/          (已带 niri/waybar/hypr/mako/kitty/satty/fcitx5/waypaper 单元；不部署 copyq 历史)
-├── QQ图片20260713144149.jpeg
-├── backups/          (Arch/RHEL 回滚点 tar.gz；Debian 脚本不使用)
-├── .replicate_progress
-├── .system_disabled  (restore 时禁用的其他桌面组件清单，restore-system 据此恢复)
+├── deb-install.sh      # Debian 系安装脚本（当前主力）
+├── arch-install.sh     # Arch 系（🚧 未完成开发）
+├── RHEL-install.sh     # RHEL 系（🚧 未完成开发）
+├── configs/            # 桌面配置快照（部署到目标机 $HOME）
+├── QQ图片20260713144149.jpeg   # 默认壁纸（桌面 + 锁屏共用）
+├── LICENSE
 └── README.md
+
+# restore 运行后生成的文件（本目录内）
+├── .replicate_progress # 断点续跑进度（删除即强制全量重跑；带版本标记，旧版自动作废）
+└── .system_disabled    # 被禁用的其他桌面组件清单（restore-system 据此恢复）
 ```
-
-## 系统要求
-
-| | Arch 系 | RHEL 系 | Debian 系 |
-|---|---|---|---|
-| 包管理 | pacman | dnf | apt-get |
-| 推荐版本 | 任意 | **Fedora 41+**（首选）；Rocky / Alma / CentOS Stream / **RHEL 10** | **Ubuntu 24.04+** / Debian 13（22.04 会警告） |
-| universe 源 | - | - | Ubuntu 自动开启 |
-| fzf | 自动安装 | 自动安装 | 自动安装 |
-| root | restore/rollback 需要 | restore/rollback 需要 | restore 需要（无 rollback） |
-
-## 注意事项
-
-- **脚本版本**：`--help`、restore 开头都会显示 `v版本号`（Debian 当前 **v1.9.29**）——目标机器上先看版本号确认拷到的是最新脚本（旧进度文件自动作废）
-- **多桌面环境**：restore 会自动禁用（不卸载）其他 DE 的冲突组件（通知/设置守护等），清单存 `.system_disabled`；切回其他 DE 前用同一份脚本的 `sudo ./arch-install.sh restore-system`（或 `./RHEL-install.sh` / `./deb-install.sh`）重新启用，或 `EILNIRI_KEEP_SYS=1` 跳过禁用
-- **诊断**：restore 结尾打印 `NIRI STATUS`（niri 二进制/desktop/gdm Session 三态）+ `Boot Environment Check`（gdm 是否真能启动 niri）+ 生成 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包（各 build 日志 + AccountsService + custom.conf + 包清单），排查时直接分享该包
-- Arch 系与 Fedora 预编译安装，无需 base-devel / yay；Debian/Ubuntu 上 niri 源码编译（约 10-20 分钟）、awww 源码构建（约 5 分钟）均**在后台并行执行**；Rocky/Alma/RHEL **10** 优先 COPR 二进制（niri/waybar/hyprlock），仅 COPR 不可用时才源码编译；satty 走官方预编译二进制（不可用时 cargo 构建）
-- 后台构建进行中若中断脚本，构建会一并终止，下次重跑自动重建（不残留孤儿进程）
-- **Debian/Ubuntu 虚拟机适配**：若 Niri 配置由 `spawn-at-startup "waybar"` 启动 Waybar，restore 会注释 niri 侧启动项，避免登录后出现两个 Waybar；检测到 QEMU/KVM 时启用 Mesa 软件 GL 回退（niri 不是 wlroots，`WLR_*` 无效）。若仍黑屏/拖影，请将虚拟显卡设为 `virtio-gpu` 并开启 3D 加速（`gl=on`），或使用 SPICE。
-- restore 会自动修正 niri config 两处笔误（swww-daemon→awww-daemon、authenntication→authentication），live 配置不受影响
-- 壁纸图片不在 `configs/` 内
-- 中断恢复：重跑自动跳过已完成阶段，删除 `.replicate_progress` 可强制全量重跑；**进度文件带脚本版本标记，旧版本脚本写的进度自动作废**（失败阶段不再标记完成，重跑自动重试，无需手动删文件）
-- dry-run：不对系统做任何改动（唯一例外：fzf 是交互前提，dry-run 下也会实际安装）
-- 临时文件在退出时自动清理（sudoers、构建目录、解包目录）
-- 日志：`~/.local/state/eilNiri/replicate.log`，自动截断保留最近 800 行；**apt 报错单独记在 `~/.local/state/eilNiri/apt-errors.log`**（apt stderr 不再被丢弃，包装不上时能直接看到真实原因）
 
 ## 参考
 
@@ -211,6 +219,5 @@ EilNiri/
 ## 贡献者
 
 - **eilthorne** - 项目创建与维护
-- **Claude** - Debian 12+ 编译修复、系统组件禁用完善、网络弹性改进；niri 依赖探测/硬校验与 pkg-config 预检、oh-my-zsh 并行安装与 .zshrc 防护、pre-flight dpkg 适配修复、apt 错误日志化
 
 在这里向所有贡献者表示感谢
