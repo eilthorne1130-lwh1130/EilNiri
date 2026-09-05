@@ -600,7 +600,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v46"
+PROGRESS_VERSION="v47"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -1001,9 +1001,19 @@ _vm_graphics_probe() {
             warn "$(_t "虚拟显卡是 QXL/std/bochs（纯 2D）— niri 无法使用它们（拒绝 llvmpipe 软渲染），进桌面必黑屏。请在宿主机关机后把显卡改为 Virtio 并开启 3D 加速。" "The VM video device is QXL/std/bochs (2D only) — niri cannot use them (it rejects llvmpipe software rendering) and will black-screen. Power off the VM and switch the video model to Virtio with 3D acceleration.")"
             ;;
         *virtio*|*Virtio*|*virtio-gpu*|"")
-            # virtio 显卡：还差 3D 加速（virgl）。guest 内无法直接探测 virgl 是否启用，
-            # 给出宿主机侧核对步骤 + 黑屏后的取证路径。
-            warn "$(_t "niri 在 VM 里必须开 3D 加速（virgl）：virt-manager → 显示 Virtio → 勾选 3D acceleration；或 virsh edit 把 <video> 改为 <model type='virtio'><acceleration accel3d='yes'/>。注意：登录管理器能用软件渲染点亮，但 niri 拒绝 llvmpipe — greeter 亮不代表 niri 能跑。若已开 3D 仍黑屏：切 TTY（Ctrl+Alt+F3）查看 ~/.local/state/eilniri/session.log，或把 ~/.local/state/eilNiri/ 下的 diag-*.tar.gz 发出来。" "niri REQUIRES 3D acceleration in a VM (virgl): virt-manager → display Virtio → check '3D acceleration'; or virsh edit: <model type='virtio'><acceleration accel3d='yes'/>. Note: the login greeter lights up with software rendering, but niri rejects llvmpipe — a working greeter does NOT mean niri can run. If it still black-screens with 3D on: switch to a TTY (Ctrl+Alt+F3) and check ~/.local/state/eilniri/session.log, or share the diag-*.tar.gz under ~/.local/state/eilNiri/.")"
+            # virtio 显卡：内核 virtio_gpu 驱动在 virgl 3D 真正启用时会打
+            # "virgl 3d acceleration enabled"（DRM_INFO，本次启动的 dmesg/journal 里
+            # 一定有）——据此做确定性判定，而不是只给宿主机侧建议。
+            local _virgl=0
+            if dmesg 2>/dev/null | grep -qi 'virgl 3d acceleration enabled' \
+               || journalctl -k --no-pager 2>/dev/null | grep -qi 'virgl 3d acceleration enabled'; then
+                _virgl=1
+            fi
+            if [ "$_virgl" -eq 1 ]; then
+                success "$(_t "virgl 3D 加速已启用（内核日志确认）— niri 在此 VM 应可正常进入桌面。" "virgl 3D acceleration is ENABLED (confirmed via kernel log) — niri should start fine in this VM.")"
+            else
+                warn "$(_t "内核日志中未见 'virgl 3d acceleration enabled' — 3D 加速大概率未开启，niri 启动会黑屏（greeter 用软渲染能亮，但 niri 拒绝 llvmpipe）。宿主机修复：关机 → virt-manager 显示 Virtio 勾选 3D acceleration；或 virsh edit 改 <model type='virtio'><acceleration accel3d='yes'/>。若确认已开启仍见此提示：切 TTY（Ctrl+Alt+F3）查 ~/.local/state/eilniri/session.log，或分享 ~/.local/state/eilNiri/diag-*.tar.gz。" "No 'virgl 3d acceleration enabled' found in the kernel log — 3D acceleration is most likely OFF and niri will black-screen (the greeter lights up with software rendering, but niri rejects llvmpipe). Host fix: power off, then in virt-manager select the Virtio display and check '3D acceleration'; or virsh edit: <model type='virtio'><acceleration accel3d='yes'/>. If you are sure 3D is on and still see this: switch to a TTY (Ctrl+Alt+F3) and check ~/.local/state/eilniri/session.log, or share ~/.local/state/eilNiri/diag-*.tar.gz.")"
+            fi
             ;;
     esac
 }
@@ -4894,19 +4904,48 @@ install_nerd_font() {
     fi
 }
 
-# QEMU/KVM 虚拟机：安装并启用 spice-vdagent。
-# 解决两个常见问题：① 宿主机↔虚拟机 剪贴板/复制粘贴不通；② 光标在合成器下无硬件
-# cursor plane 时的拖影/残影（spice 提供客户端光标同步）。
+# QEMU/KVM 虚拟机：安装并启用 guest agent（仅 VM 内执行，物理机直接返回）。
+# ① spice-vdagent：宿主机↔虚拟机剪贴板共享 + 客户端光标同步（SPICE 显示协议）；
+# ② qemu-guest-agent：宿主机管理通道（libvirt 获取 IP、优雅关机等）。
 install_vm_agent() {
-    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("spice-vdagent"); return "$DRY_RUN_RC"; }
-    command -v spice-vdagent >/dev/null 2>&1 && return 0
-    log "$(_t "Installing spice-vdagent (VM clipboard + cursor sync)..." "Installing spice-vdagent (VM clipboard + cursor sync)...")"
-    pm_install spice-vdagent 2>/dev/null || { warn "$(_t "spice-vdagent install failed (non-VM?)" "spice-vdagent install failed (non-VM?)")"; return 0; }
-    # 系统 daemon（spice-vdagentd）与用户会话 agent（spice-vdagent）
-    systemctl enable --now spice-vdagentd 2>/dev/null || true
-    as_user systemctl --user enable --now spice-vdagent 2>/dev/null || true
-    INSTALLED_PKGS+=("spice-vdagent")
-    success "$(_t "spice-vdagent installed" "spice-vdagent installed")"
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("spice-vdagent qemu-guest-agent"); return "$DRY_RUN_RC"; }
+    local _virt=""
+    command -v systemd-detect-virt >/dev/null 2>&1 && _virt=$(systemd-detect-virt 2>/dev/null || true)
+    case "$_virt" in
+        qemu|kvm) ;;
+        *) return 0 ;;   # 物理机：静默跳过（不再产生"install failed (non-VM?)"噪音）
+    esac
+    section "$(_t "VM Guest Agents" "VM Guest Agents")" "$(_t "spice-vdagent + qemu-guest-agent" "spice-vdagent + qemu-guest-agent")"
+
+    # --- spice-vdagent ---
+    if command -v spice-vdagent >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("spice-vdagent (already installed)")
+    else
+        log "$(_t "Installing spice-vdagent (VM clipboard + cursor sync)..." "Installing spice-vdagent (VM clipboard + cursor sync)...")"
+        if pm_install spice-vdagent 2>/dev/null; then
+            # 系统 daemon（spice-vdagentd）与用户会话 agent（spice-vdagent）
+            systemctl enable --now spice-vdagentd 2>/dev/null || true
+            as_user systemctl --user enable --now spice-vdagent 2>/dev/null || true
+            INSTALLED_PKGS+=("spice-vdagent")
+            success "$(_t "spice-vdagent installed" "spice-vdagent installed")"
+        else
+            warn "$(_t "spice-vdagent 安装失败 — 剪贴板/光标同步不可用（SPICE 直连场景）。" "spice-vdagent install failed — clipboard/cursor sync unavailable (SPICE direct).")"
+        fi
+    fi
+
+    # --- qemu-guest-agent ---
+    if pkg_installed qemu-guest-agent; then
+        SKIPPED_PKGS+=("qemu-guest-agent (already installed)")
+    else
+        log "$(_t "Installing qemu-guest-agent (host management channel)..." "Installing qemu-guest-agent (host management channel)...")"
+        if pm_install qemu-guest-agent 2>>"$LOG_DIR/apt-errors.log"; then
+            INSTALLED_PKGS+=("qemu-guest-agent")
+        else
+            warn "$(_t "qemu-guest-agent 安装失败 — 宿主机无法获取 VM IP/优雅关机（不影响桌面使用）。" "qemu-guest-agent install failed — the host cannot query VM IP / do graceful shutdown (desktop use unaffected).")"
+        fi
+    fi
+    pkg_installed qemu-guest-agent && systemctl enable --now qemu-guest-agent 2>/dev/null \
+        || log "$(_t "qemu-guest-agent 未启动 — libvirt 未配置 guest agent 通道时属正常（virt-manager 添加硬件 → 通道 → org.qemu.guest_agent.0）。" "qemu-guest-agent not started — normal when libvirt has no guest-agent channel (virt-manager: Add Hardware → Channel → org.qemu.guest_agent.0).")"
 }
 
 stage_apps_install() {

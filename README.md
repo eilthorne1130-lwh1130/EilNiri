@@ -26,16 +26,16 @@
 | 权限 | root（`sudo`） |
 | 网络 | 需要联网下载包与源码（国内网络已内置镜像与代理回退，见[网络](#七网络与镜像)） |
 | 磁盘 | **≥ 6GB 空闲**（niri/awww 走源码编译，需要空间） |
-| 虚拟机 | 显卡必须设为 **Virtio + 3D 加速**，否则 niri 无法运行（见[故障排查](#八故障排查)） |
+| 虚拟机 | 显卡必须设为 **Virtio + 3D 加速**，否则 niri 无法运行（见[虚拟机使用指南](#八虚拟机使用指南)） |
 
 ### 安装步骤
 
 ```bash
-# 1. 把整个 EilNiri 目录拷到新机器（U盘 / rsync / scp 均可）
-rsync -av EilNiri/ user@新机器:~/EilNiri/
+# 1. 在新机器上 clone 仓库（没有 git 时先 sudo apt-get install -y git）
+git clone https://github.com/eilthorne1130-lwh1130/EilNiri.git
+cd EilNiri
 
-# 2. 进入目录，运行安装脚本
-cd ~/EilNiri
+# 2. 运行安装脚本
 sudo ./deb-install.sh restore
 
 # 3. 按提示完成交互（都有默认值，直接回车也能走完）
@@ -140,11 +140,41 @@ bluetooth（蓝牙，bluetui 依赖）、libvirtd（虚拟机）、power-profile
 
 ---
 
-## 八、故障排查
+## 八、虚拟机使用指南
+
+在 QEMU/KVM 虚拟机里体验 niri 完全可行，但对虚拟机配置有硬性要求（niri 拒绝软件渲染）。**脚本会在每次 restore 开头运行 VM Graphics Check 自动检测并给出结论**，无需自己猜。
+
+### 推荐虚拟机配置
+
+| 项目 | 要求 | 说明 |
+|---|---|---|
+| 显卡 | **Virtio + 3D 加速（必需）** | virt-manager：显示 Virtio → 勾选"3D acceleration"；virsh：`<model type='virtio'><acceleration accel3d='yes'/>`。QXL/std/bochs 纯 2D 显卡**无法运行 niri** |
+| 显示协议 | SPICE（virt-manager 默认） | virgl 输出需要 SPICE（配合远程查看器时开启 GL） |
+| 内存 | ≥ 4GB（建议 8GB） | niri/awww 源码编译需要内存，脚本按内存自动限制编译并发 |
+| CPU | ≥ 2 核 | |
+| 磁盘 | ≥ 25GB | 系统本身 + 约 6GB 编译空间 |
+| 蓝牙 | 无控制器 | 属正常：waybar 蓝牙图标不显示、bluetui 报超时都是因为 VM 没有蓝牙硬件，忽略即可 |
+
+### 脚本为 VM 自动做的事
+
+- **VM Graphics Check**：检测显卡型号 / DRM 设备 / 连接器（virtio 显示为 Virtual-1），并读内核日志判定 **virgl 3D 是否真正启用**（绿字=可以装；黄字=先去宿主机开 3D 再装）
+- **Guest agent 自动安装**：spice-vdagent（宿主机↔VM 剪贴板共享、光标同步）+ qemu-guest-agent（宿主机管理通道）；物理机上自动跳过
+- 会话日志：登录异常时切 TTY（`Ctrl+Alt+F3`）看 `~/.local/state/eilniri/session.log`
+
+### VM 黑屏自查清单
+
+1. 脚本开头 VM Graphics Check 是否黄字警告 3D 未启用？→ 宿主机关机开启 3D 后重试
+2. 确认显卡模型是 Virtio（QXL/std/bochs 不行）
+3. 切 TTY 看 `~/.local/state/eilniri/session.log` 末尾的 niri 报错
+4. 把 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包发出来
+
+---
+
+## 九、故障排查
 
 ### 登录后黑屏
 
-1. **虚拟机用户**：niri 硬性要求硬件渲染（拒绝 llvmpipe 软渲染），虚拟显卡必须是 **Virtio 且勾选 3D 加速**（virt-manager 勾选，或 virsh 里 `<model type='virtio'><acceleration accel3d='yes'/>`）。登录界面能亮不代表 niri 能跑——greeter 用软渲染就行，niri 不行。脚本运行开头的 **VM Graphics Check** 会列出检测结果。
+1. **虚拟机用户**：niri 硬性要求硬件渲染（拒绝 llvmpipe 软渲染），虚拟显卡必须是 **Virtio 且勾选 3D 加速**。脚本开头的 **VM Graphics Check** 会读取内核日志**直接判定 virgl 3D 是否启用**（绿字=已启用，黄字=未检测到、大概率黑屏），完整配置要求见[虚拟机使用指南](#八虚拟机使用指南)。
 2. 切 TTY（`Ctrl+Alt+F3`）登录后查看会话日志：
    ```bash
    tail -n 50 ~/.local/state/eilniri/session.log
@@ -174,7 +204,7 @@ bluetooth（蓝牙，bluetui 依赖）、libvirtd（虚拟机）、power-profile
 
 ---
 
-## 九、自定义配置
+## 十、自定义配置
 
 - `configs/` **不是必须的**——没有它 restore 也能跑（niri 用内置默认配置）
 - 想用自己的 dotfiles：`configs/.config/` 下的每个目录对应目标机 `~/.config/<name>`；`configs/.local/share/` 对应 `~/.local/share/`
@@ -183,7 +213,7 @@ bluetooth（蓝牙，bluetui 依赖）、libvirtd（虚拟机）、power-profile
 
 ---
 
-## 十、已知限制
+## 十一、已知限制
 
 - **Debian 系无 `rollback` 命令**（配置备份仅保留覆盖前的 `.bak-时间戳` 单份）
 - **虚拟机必须开 3D 加速**，否则 niri 无法运行（niri 拒绝软件渲染，这是上游设计而非脚本问题）
