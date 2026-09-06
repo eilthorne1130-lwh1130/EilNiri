@@ -881,6 +881,33 @@ _patch_niri_user_units() {
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
 }
 
+# CopyQ 主窗口启动弹窗的根修（CopyQ #3567/#3573）：niri 没有系统托盘，CopyQ 在
+# “无托盘 + hide_main_window 未开启（默认）”时 hideWindow() 会退化成 showMinimized()，
+# 在 wlroots 系合成器（niri/Hyprland）上这会把从未映射过的主窗口直接显示出来
+# （`copyq --start-server` 弹窗、niri config 里追加的 "hide" 参数不生效的共同根源）。
+# 在 ~/.config/copyq/copyq.conf 预置 hide_main_window=true，hide 路径才会走真正的
+# hide()；Super+Ctrl+V（copyq toggle）呼出主窗口走 showWindow()，不受影响。
+# 幂等：只在键缺失/为 false 时改动，不覆盖用户其余配置；CopyQ 未安装时写入无副作用。
+configure_copyq_hidden_window() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _cqconf="$HOME_DIR/.config/copyq/copyq.conf"
+    mkdir -p "$(dirname "$_cqconf")"
+    if [ ! -f "$_cqconf" ]; then
+        printf '[General]\nhide_main_window=true\n' > "$_cqconf"
+        log "$(_t "Created ~/.config/copyq/copyq.conf (hide_main_window=true; no CopyQ window at startup)" "Created ~/.config/copyq/copyq.conf (hide_main_window=true; no CopyQ window at startup)")"
+    elif ! grep -q '^hide_main_window=true' "$_cqconf" 2>/dev/null; then
+        if grep -q '^hide_main_window=' "$_cqconf" 2>/dev/null; then
+            sed -i 's/^hide_main_window=.*/hide_main_window=true/' "$_cqconf" 2>/dev/null || true
+        elif grep -q '^\[General\]' "$_cqconf" 2>/dev/null; then
+            sed -i '0,/^\[General\]/s//&\nhide_main_window=true/' "$_cqconf" 2>/dev/null || true
+        else
+            sed -i '1i [General]\nhide_main_window=true' "$_cqconf" 2>/dev/null || true
+        fi
+        log "$(_t "Set hide_main_window=true in ~/.config/copyq/copyq.conf (no CopyQ window at startup)" "Set hide_main_window=true in ~/.config/copyq/copyq.conf (no CopyQ window at startup)")"
+    fi
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cqconf" 2>/dev/null || true
+}
+
 # Idempotent: strip injected mode "WxH@60", drop software-GL env, point the
 # session desktop at the wrapper. Safe to run on every restore (including
 # machines that already have niri installed from Ubuntu's repo).
@@ -900,9 +927,12 @@ repair_niri_blackscreen() {
         sed -i 's#spawn-at-startup "swww-daemon"#spawn-at-startup "awww-daemon"#' "$cfg" 2>/dev/null || true
         # 首次启动空白窗口修复（两问合一）：
         # 1) CopyQ #3567 — `copyq --start-server` 在无托盘合成器（niri 没有系统托盘）
-        #    且 hide-main-window 配置晚于托盘初始化加载的版本上，主窗口会被显示出来；
-        #    追加 "hide" 让客户端在 server 就绪后立即隐藏主窗口。
+        #    时会弹出主窗口。根修是 configure_copyq_hidden_window 写入的
+        #    hide_main_window=true（否则 hideWindow() 退化为 showMinimized()，
+        #    在 niri/wlroots 上等于把窗口显示出来）；此处追加的 "hide" 参数
+        #    仅作为 15.0.0 加载时序 bug（配置晚于托盘初始化读取）的兜底。
         sed -i 's#^\([[:space:]]*spawn-at-startup "copyq" "--start-server"\)$#\1 "hide"#' "$cfg" 2>/dev/null || true
+        configure_copyq_hidden_window
         # 2) xwaylandvideobridge（Wayland→X 录屏桥）登录时出现的空白窗（niri #2367
         #    同款）——窗口规则设为全透明，不影响其录屏桥接功能。
         if ! grep -q 'xwaylandvideobridge' "$cfg" 2>/dev/null; then
@@ -5590,8 +5620,10 @@ stage_configs() {
             sed -i 's#polkit-gnome-authenntication-agent-1#polkit-gnome-authentication-agent-1#g' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
             sed -i 's#spawn-at-startup "swww-daemon"#spawn-at-startup "awww-daemon"#' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
             # 空白窗口修复：copyq 主窗口隐藏（CopyQ #3567）+ xwaylandvideobridge 透明
-            # （与 repair_niri_blackscreen 同一套幂等补丁，此处覆盖刚部署的快照配置）
+            # （与 repair_niri_blackscreen 同一套幂等补丁，此处覆盖刚部署的快照配置；
+            #   根修 hide_main_window=true 见 configure_copyq_hidden_window）
             sed -i 's#^\([[:space:]]*spawn-at-startup "copyq" "--start-server"\)$#\1 "hide"#' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
+            configure_copyq_hidden_window
             if ! grep -q 'xwaylandvideobridge' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
                 printf '\n// eilNiri: xwaylandvideobridge shows a blank window at startup (opacity 0 = invisible)\nwindow-rule {\n    match app-id="xwaylandvideobridge"\n    opacity 0.0\n}\n' >> "$HOME_DIR/.config/niri/config.kdl"
             fi

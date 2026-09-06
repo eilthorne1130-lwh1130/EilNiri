@@ -1,0 +1,3 @@
+autostart|org.gnome.SettingsDaemon.MediaKeys.desktop
+autostart|org.gnome.SettingsDaemon.Power.desktop
+autostart|org.gnome.SettingsDaemon.Sound.desktop
