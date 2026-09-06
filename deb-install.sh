@@ -1471,28 +1471,53 @@ try_dl() { # $1 = URL, $2 = output file; returns 0 on success
     rc=$?
     if [ "$rc" -eq 33 ]; then
         rm -f "$out"
-        curl "${CURL_DL_FLAGS[@]}" -o "$out" "$url" 2>/dev/null
+        # restart WITHOUT resume: strip the trailing "-C -" pair from CURL_DL_FLAGS
+        # (the old code re-passed the array, so "-C -" was still in effect and the
+        # "fresh start" silently resumed against the just-deleted file).
+        local _n=${#CURL_DL_FLAGS[@]} _clean=()
+        if [ "$_n" -ge 2 ] && [ "${CURL_DL_FLAGS[_n-2]}" = "-C" ] && [ "${CURL_DL_FLAGS[_n-1]}" = "-" ]; then
+            _clean=("${CURL_DL_FLAGS[@]:0:$((_n - 2))}")
+        else
+            _clean=("${CURL_DL_FLAGS[@]}")
+        fi
+        curl "${_clean[@]}" -o "$out" "$url" 2>/dev/null
         rc=$?
     fi
-    [ "$rc" -eq 0 ] && [ -s "$out" ] && archive_is_valid "$out" || return "${rc:-1}"
-}
-
-download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the curl exit code
-    local url="$1" out="$2"
-    if try_dl "$url" "$out"; then
+    # CRITICAL: curl exit 0 does NOT mean we got the real payload — CN proxies and
+    # captive portals happily answer 200 with an HTML error page or an empty body.
+    # The old tail expression `... || return "${rc:-1}"` returned 0 (rc is 0!) when
+    # only archive_is_valid failed, so garbage was treated as a successful download,
+    # niri extraction failed, and the whole install broke. Treat an invalid payload
+    # as a hard failure with a non-zero code.
+    if [ "$rc" -eq 0 ] && [ -s "$out" ] && archive_is_valid "$out"; then
         return 0
     fi
-    local rc=$?
+    [ "$rc" -ne 0 ] || rc=1   # curl OK but payload invalid/empty -> non-zero failure
+    return "$rc"
+}
+
+download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the failure code
+    local url="$1" out="$2" rc=0
+    # NOTE: `try_dl ... || rc=$?` on purpose. `if try_dl; then return 0; fi` +
+    # `local rc=$?` would always capture 0 (an `if` with no else resets $? per
+    # POSIX), making download_gh report SUCCESS for total failures — the root
+    # cause of "niri downloaded garbage / extraction failed" reports.
+    try_dl "$url" "$out" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        return 0
+    fi
     # direct download failed — try mirror proxies (CN-friendly; configurable via EILNIRI_GH_PROXY)
-    log "$(_t "Direct download failed (curl " "Direct download failed (curl ") $rc), trying mirror proxies..."
+    log "$(_t "Direct download failed (code " "Direct download failed (code ") $rc), trying mirror proxies..."
     local proxy prefix
     for proxy in ${EILNIRI_GH_PROXY:-${GH_MIRRORS:-}}; do
         prefix="${proxy%/}"
-        if try_dl "${prefix}/${url}" "$out"; then
+        local _prc=0
+        try_dl "${prefix}/${url}" "$out" || _prc=$?
+        if [ "$_prc" -eq 0 ]; then
             return 0
         fi
     done
-    log "$(_t "Download failed after all proxies (last curl exit code: " "Download failed after all proxies (last curl exit code: ") $rc)"
+    log "$(_t "Download failed after all proxies (last failure code: " "Download failed after all proxies (last failure code: ") $rc)"
     return "$rc"
 }
 
@@ -1991,13 +2016,16 @@ install_niri_binary() {
     
     local _dl_attempts=3 _dl_delay=15 _dlrc=0
     for (( _attempt=1; _attempt<=$_dl_attempts; _attempt++ )); do
-        if download_gh "$url" "$tmp"; then
-            _dlrc=0
+        # `|| _dlrc=$?` (not `if`+`$?`): an if-construct with no else resets $?
+        # to 0, which used to make the guard below never trigger and the build
+        # start from a missing/corrupt tarball.
+        _dlrc=0
+        download_gh "$url" "$tmp" || _dlrc=$?
+        if [ "$_dlrc" -eq 0 ]; then
             break
         fi
-        _dlrc=$?
         if [ "$_attempt" -lt "$_dl_attempts" ]; then
-            log "$(_t "Download attempt $_attempt/$_dl_attempts failed (code $?), retrying in ${_dl_delay}s..." "Download attempt $_attempt/$_dl_attempts failed (code $?), retrying in ${_dl_delay}s...")"
+            log "$(_t "Download attempt $_attempt/$_dl_attempts failed (code $_dlrc), retrying in ${_dl_delay}s..." "Download attempt $_attempt/$_dl_attempts failed (code $_dlrc), retrying in ${_dl_delay}s...")"
             sleep "$_dl_delay"
         fi
     done
@@ -2058,11 +2086,11 @@ install_niri_binary() {
         url="$NIRI_GH/download/v${ver}/niri-${ver}-vendored-dependencies.tar.xz"
         
         for (( _vattempt=1; _vattempt<=$_vdl_attempts; _vattempt++ )); do
-            if download_gh "$url" "$vtmp"; then
-                _vdlrc=0
+            _vdlrc=0
+            download_gh "$url" "$vtmp" || _vdlrc=$?
+            if [ "$_vdlrc" -eq 0 ]; then
                 break
             fi
-            _vdlrc=$?
             if [ "$_vattempt" -lt "$_vdl_attempts" ]; then
                 log "$(_t "Vendored deps download attempt $_vattempt/$_vdl_attempts failed (code $_vdlrc), retrying in ${_vdl_delay}s..." "Vendored deps download attempt $_vattempt/$_vdl_attempts failed (code $_vdlrc), retrying in ${_vdl_delay}s...")"
                 sleep "$_vdl_delay"
@@ -2348,11 +2376,11 @@ install_awww() {
     # 在大陆网络下成功率高得多。仍保留一层重试（clone 半途断连时重来）。
     local _clone_attempts=2 _clone_delay=10 _clonerc=0
     for (( _cattempt=1; _cattempt<=$_clone_attempts; _cattempt++ )); do
-        if git_clone_gh "$AWWW_REPO" "$work/awww"; then
-            _clonerc=0
+        _clonerc=0
+        git_clone_gh "$AWWW_REPO" "$work/awww" || _clonerc=$?
+        if [ "$_clonerc" -eq 0 ]; then
             break
         fi
-        _clonerc=$?
         if [ "$_cattempt" -lt "$_clone_attempts" ]; then
             log "$(_t "Clone attempt $_cattempt/$_clone_attempts failed, retrying in ${_clone_delay}s..." "Clone attempt $_cattempt/$_clone_attempts failed, retrying in ${_clone_delay}s...")"
             sleep "$_clone_delay"
@@ -2371,7 +2399,7 @@ install_awww() {
     awww_cmd="cd '$work/awww' && PKG_CONFIG_PATH='${PKG_CONFIG_PATH:-}' PKG_CONFIG_LIBDIR='${PKG_CONFIG_LIBDIR:-}' WAYLAND_PROTOCOLS_DIR='${WAYLAND_PROTOCOLS_DIR:-}' cargo build --release --workspace -j $(cargo_jobs)"
     ram_mb=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
     if [ "${ram_mb:-0}" -lt 8192 ] && [ ${#BG_JOBS[@]} -gt 0 ]; then
-        niri_pid=$(echo "${BG_JOBS[0]}" | awk '{print $2}')
+        niri_pid=$(echo "${BG_JOBS[0]}" | awk -F'|' '{print $2}')
         awww_cmd="while kill -0 '$niri_pid' 2>/dev/null; do sleep 15; done; $awww_cmd"
         log "$(_t "Low RAM detected: awww build will wait for niri to finish first." "Low RAM detected: awww build will wait for niri to finish first.")"
     fi
@@ -3997,11 +4025,11 @@ install_satty() {
     
     local _satty_attempts=3 _satty_delay=10 _sattyrc=0
     for (( _sattempt=1; _sattempt<=$_satty_attempts; _sattempt++ )); do
-        if download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; then
-            _sattyrc=0
+        _sattyrc=0
+        { download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; } || _sattyrc=$?
+        if [ "$_sattyrc" -eq 0 ]; then
             break
         fi
-        _sattyrc=$?
         if [ "$_sattempt" -lt "$_satty_attempts" ]; then
             log "$(_t "Satty download attempt $_sattempt/$_satty_attempts failed, retrying in ${_satty_delay}s..." "Satty download attempt $_sattempt/$_satty_attempts failed, retrying in ${_satty_delay}s...")"
             sleep "$_satty_delay"
@@ -4194,11 +4222,11 @@ install_rime_ice() {
     _rime_asset=$(github_release_asset iDvel/rime-ice '(^|/)full\.zip$' 2>/dev/null || true)
     [ -n "$_rime_asset" ] && RIME_ICE_ZIP_URL="$_rime_asset"
     for (( _rattempt=1; _rattempt<=$_rime_attempts; _rattempt++ )); do
-        if download_gh "$RIME_ICE_ZIP_URL" "$zipfile"; then
-            _rimerc=0
+        _rimerc=0
+        download_gh "$RIME_ICE_ZIP_URL" "$zipfile" || _rimerc=$?
+        if [ "$_rimerc" -eq 0 ]; then
             break
         fi
-        _rimerc=$?
         if [ "$_rattempt" -lt "$_rime_attempts" ]; then
             log "$(_t "Rime-ice download attempt $_rattempt/$_rime_attempts failed, retrying in ${_rime_delay}s..." "Rime-ice download attempt $_rattempt/$_rime_attempts failed, retrying in ${_rime_delay}s...")"
             sleep "$_rime_delay"
@@ -5026,7 +5054,7 @@ stage_wait_builds() {
     fi
     section "$(_t "Background Builds" "Background Builds")" "$(_t "waiting for cargo builds (niri/awww)" "waiting for cargo builds (niri/awww)")"
     log "$(_t "Run './deb-install.sh status' in another terminal to watch progress live." "Run './deb-install.sh status' in another terminal to watch progress live.")"
-    local entry name pid logfile srcdir rc tailmsg start now prog any_failed=0
+    local entry name pid logfile srcdir rc _irc tailmsg start now prog any_failed=0
     for entry in "${BG_JOBS[@]}"; do
         IFS='|' read -r name pid logfile srcdir <<< "$entry"
         log "$(_t "Waiting for " "Waiting for ") $name $(_t " build..." " build...")"
@@ -5043,11 +5071,21 @@ stage_wait_builds() {
         done
         rc=0
         wait "$pid" 2>/dev/null || rc=$?
+        _irc=0
         if [ "$rc" -eq 0 ]; then
+            # A zero build exit code is NOT enough: the produced binary must
+            # actually install. The old code ignored install_*_from_build's
+            # return value, so a finished-but-unusable build still marked the
+            # apps stage complete — every rerun then printed "App install stage
+            # done, skipping." while niri was never installed.
             case "$name" in
-                niri) install_niri_from_build "$srcdir" "$logfile" ;;
-                awww) install_awww_from_build "$srcdir" "$logfile" ;;
+                niri) install_niri_from_build "$srcdir" "$logfile" || _irc=$? ;;
+                awww) install_awww_from_build "$srcdir" "$logfile" || _irc=$? ;;
             esac
+            if [ "$_irc" -ne 0 ]; then
+                any_failed=1
+                warn "$(_t "Background build finished but installing " "Background build finished but installing ") $name $(_t " failed — the apps stage will be retried on the next run (see log " " failed — the apps stage will be retried on the next run (see log ") $logfile)"
+            fi
         else
             any_failed=1
             tailmsg=$(tail -n 8 "$logfile" 2>/dev/null | tr '\n' ' ')
