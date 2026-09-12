@@ -3,10 +3,12 @@
 # eilNiri - arch-install.sh
 #
 #   One-click niri desktop setup for a fresh Arch / Manjaro / EndeavourOS system.
-#   Packages come from a built-in list and the script installs everything:
-#   niri/awww/satty builds, rime-ice dictionary, display manager (replacing any
-#   existing one), services and config deploy. Desktop config is optional and read
-#   from the repo's configs/.config/ if you choose to ship any.
+#   Packages come from a built-in list: repo packages via pacman, AUR packages via
+#   yay (auto-installed if missing). Also handles the rime-ice dictionary, display
+#   manager (replacing any existing one), services and config deploy. Desktop config
+#   is optional and read from the repo's configs/.config/ if you choose to ship any.
+#   NOTE: configs/ must never contain privacy data (clipboard history, input-method
+#   user data, file-dialog history) — stage_configs enforces a skip-list at deploy.
 #
 #   Usage:
 #     ./arch-install.sh restore [--dry-run]     restore on new system (root)
@@ -27,17 +29,9 @@ BACKUP_DIR="$BASE_DIR/backups"
 declare -a CLEANUP_TEMP_PATHS=()
 register_temp_path() { CLEANUP_TEMP_PATHS+=("$1"); }
 
-# Background cargo build jobs (niri/awww): "name pid logfile srcdir"
+# Background build jobs — kept as an empty stub: on Arch every package (niri/awww
+# included) comes from pacman/AUR, so no cargo builds are spawned anymore.
 BG_JOBS=()
-BG_PENDING_RC=98   # installer return code when the build was spawned in background
-bg_build_start() { # $1=name $2=srcdir $3=logfile $4...=command
-    local name="$1" srcdir="$2" logfile="$3"
-    shift 3
-    log "$(_t "Background build started: " "Background build started: ") $name (log: $logfile)"
-    ( "$@" ) >> "$logfile" 2>&1 &
-    BG_JOBS+=("$name|$!|$logfile|$srcdir")
-    echo "$name|$!|$logfile|$srcdir" >> "$BUILD_STATE_FILE"
-}
 
 cleanup() {
     local rc=$?
@@ -64,7 +58,14 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.26"
+SCRIPT_VERSION="2.0.0"
+
+# GitHub mirror proxies used by download helpers (override with EILNIRI_GH_PROXY)
+GH_MIRRORS="https://ghfast.top https://gh-proxy.com https://ghproxy.net https://gh.llkk.cc"
+# Shared curl flags for the download helpers (bounded so a dead mirror never hangs the install)
+CURL_DL_FLAGS=(--retry 2 --connect-timeout 10 --max-time 1800)
+# No pip fallbacks needed on Arch: every package in GROUP_PKGS is a repo or AUR package.
+declare -A PIP_PKGS=()
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -197,7 +198,7 @@ LOGO
 # 2. Data section — niri suite definition (single source of truth for export/restore)
 # ==============================================================================
 
-GROUP_ORDER=(core lock wallpaper clip media audio ime fonts keyring)
+GROUP_ORDER=(core lock wallpaper clip media audio ime fonts keyring tools)
 
 declare -A GROUP_EN=(
     [core]="Core"
@@ -209,14 +210,17 @@ declare -A GROUP_EN=(
     [ime]="IME"
     [fonts]="Fonts"
     [keyring]="Keyring"
+    [tools]="Tools"
 )
 
+# NOTE: zsh-autosuggestions / zsh-syntax-highlighting are NOT listed here —
+# install_zsh_extras clones them into ~/.oh-my-zsh/custom/plugins/ so oh-my-zsh's
+# plugins=() can find them (works identically on Arch / RHEL / Debian families).
+# NOTE: AUR-only packages (polkit-gnome / awww / rime-ice-pinyin-git, possibly others
+# depending on the repo state) are routed through the AUR helper at install time by
+# probing `pacman -Si` — no hardcoded repo/AUR split needed here.
 declare -A GROUP_PKGS=(
-    # NOTE: zsh-autosuggestions / zsh-syntax-highlighting are NOT listed here —
-    # distro packages install them in /usr/share or /etc/zsh/zshrc.d, which oh-my-zsh's
-    # plugins=() cannot use. install_zsh_extras clones them into ~/.oh-my-zsh/custom/plugins/
-    # (works identically on Arch / RHEL / Debian families).
-    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh"
+    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh neovim gsimplecal zenity pacman-contrib"
     [lock]="hyprlock hypridle"
     [wallpaper]="awww waypaper"
     [clip]="copyq satty grim slurp"
@@ -225,6 +229,7 @@ declare -A GROUP_PKGS=(
     [ime]="fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git"
     [fonts]="ttf-jetbrains-mono-nerd wqy-zenhei"
     [keyring]="gnome-keyring"
+    [tools]="ripgrep zoxide bluetui"
 )
 
 # pkg -> group reverse lookup table (built at runtime)
@@ -364,6 +369,103 @@ pkg_installed() { # $1 = package name
 
 pm_install() { # $@ = package names
     exe pacman -S --noconfirm --needed "$@"
+}
+
+# True when the package exists in a configured sync repo (i.e. NOT an AUR package).
+is_repo_pkg() {
+    pacman -Si "$1" &>/dev/null
+}
+
+AUR_HELPER=""
+
+# Detect yay/paru; if neither exists, build yay from the AUR as the target user.
+# Deps are preinstalled via pacman so the makepkg step never needs root or -s.
+ensure_aur_helper() {
+    if command -v yay &>/dev/null; then AUR_HELPER=yay; return 0; fi
+    if command -v paru &>/dev/null; then AUR_HELPER=paru; return 0; fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        AUR_HELPER=yay
+        log "$(_t "[DRY-RUN] would build and install the AUR helper: yay" "[DRY-RUN] would build and install the AUR helper: yay")"
+        DRY_PKGS+=("yay (AUR helper, makepkg build)")
+        return 0
+    fi
+
+    section "$(_t "AUR Helper" "AUR Helper")" "$(_t "no yay/paru found — building yay (needed for awww/rime-ice etc.)" "no yay/paru found — building yay (needed for awww/rime-ice etc.)")"
+    pm_install base-devel git go || { MANUAL_ITEMS+=("yay — base-devel/git/go install failed; install an AUR helper manually"); return 1; }
+
+    local _src
+    _src=$(mktemp -d /tmp/eilniri-yay-build.XXXXXX)
+    register_temp_path "$_src"
+    if ! git_clone_gh "https://github.com/Jguer/yay.git" "$_src/yay"; then
+        MANUAL_ITEMS+=("yay — git clone failed (GitHub 与镜像均不可达); 手动安装: pacman -S yay 或从 AUR 构建")
+        return 1
+    fi
+    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_src"
+    if ! as_user bash -c "cd '$_src/yay' && makepkg -f --noconfirm" >>"$LOG_DIR/yay-build.log" 2>&1; then
+        MANUAL_ITEMS+=("yay — makepkg build failed (see $LOG_DIR/yay-build.log)")
+        return 1
+    fi
+    local _pkg
+    _pkg=$(find "$_src/yay" -maxdepth 1 -name 'yay-*.pkg.tar.*' | head -n 1)
+    if [ -z "$_pkg" ] || ! exe pacman -U --noconfirm "$_pkg"; then
+        MANUAL_ITEMS+=("yay — pacman -U failed (see $LOG_DIR/yay-build.log)")
+        return 1
+    fi
+    if command -v yay &>/dev/null; then
+        AUR_HELPER=yay
+        INSTALLED_PKGS+=("yay (AUR helper)")
+        success "$(_t "AUR helper ready: yay" "AUR helper ready: yay")"
+        return 0
+    fi
+    MANUAL_ITEMS+=("yay — installed but binary not found on PATH")
+    return 1
+}
+
+# Install AUR packages as the target user (makepkg refuses root). The helper's
+# internal install steps call sudo pacman, so a passwordless-for-pacman sudoers
+# rule is granted for the duration of the call and revoked afterwards.
+aur_install() { # $@ = AUR package names
+    [ -n "$AUR_HELPER" ] || { error "no AUR helper available"; return 1; }
+    local _sudo_file="/etc/sudoers.d/90-eilniri-aur"
+    echo "$TARGET_USER ALL=(ALL) NOPASSWD: /usr/bin/pacman" > "$_sudo_file"
+    chmod 440 "$_sudo_file"
+    if ! visudo -cf "$_sudo_file" >/dev/null 2>&1; then
+        rm -f "$_sudo_file"
+        error "sudoers rule validation failed; skipping AUR install."
+        return 1
+    fi
+    as_user env HOME="$HOME_DIR" "$AUR_HELPER" -S --noconfirm --needed "$@"
+    local rc=$?
+    rm -f "$_sudo_file"
+    return $rc
+}
+
+# Batch-install a queue with per-package isolation on failure.
+# $1 = installer function (pm_install | aur_install), $2 = bookkeeping tag, $3+ = packages
+install_batch() {
+    local installer="$1" tag="$2"; shift 2
+    [ $# -gt 0 ] || return 0
+    local rc=0 p prc
+    if [ "$DRY_RUN" -eq 1 ]; then
+        for p in "$@"; do DRY_PKGS+=("$p ($tag)"); done
+        return "$DRY_RUN_RC"
+    fi
+    "$installer" "$@" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        INSTALLED_PKGS+=("$@")
+        return 0
+    fi
+    warn "$(_t "Batch install failed ($tag), switching to individual installs..." "Batch install failed ($tag), switching to individual installs...")"
+    for p in "$@"; do
+        prc=0
+        "$installer" "$p" || prc=$?
+        if [ "$prc" -eq 0 ]; then
+            INSTALLED_PKGS+=("$p")
+        else
+            FAILED_PKGS+=("$tag:$p")
+        fi
+    done
+    return 0
 }
 
 # Install as many packages of a batch as possible; return non-zero only when one or more
@@ -561,26 +663,41 @@ stage_preflight() {
         log "$(_t "Pre-flight done, skipping (delete .replicate_progress to force rerun)." "Pre-flight done, skipping (delete .replicate_progress to force rerun).")"
         return
     fi
-            # Parallel download speedup
-            sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true
-            # Reflector mirror optimization (CN timezone -> China mirrors, otherwise skip)
-            local tz
-            tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
-            if [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]]; then
-                if command -v reflector &>/dev/null; then
-                    log "$(_t "Detected CN timezone, refreshing CN mirrors..." "Detected CN timezone, refreshing CN mirrors...")"
-                    exe reflector --country China --protocol https --sort rate --save /etc/pacman.d/mirrorlist --latest 10 2>/dev/null || \
-                        warn "$(_t "Reflector failed, using existing mirrors." "Reflector failed, using existing mirrors.")"
-                fi
-            fi
-            exe pacman -Sy --noconfirm archlinux-keyring || warn "$(_t "keyring refresh failed, continuing." "keyring refresh failed, continuing.")"
-            if [ "$DRY_RUN" -eq 1 ]; then
-                log "$(_t "[DRY-RUN] Skipping system upgrade." "[DRY-RUN] Skipping system upgrade.")"
-            elif ! exe pacman -Su --noconfirm; then
-                error "$(_t "System update failed. Check network." "System update failed. Check network.")"
-                exit 1
-            fi
+    # Dry-run must not touch the system at all — print the plan and bail out early
+    # (the old version rewrote /etc/pacman.conf and the mirrorlist even in dry-run).
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$(_t "[DRY-RUN] would: enable pacman ParallelDownloads; refresh CN mirrors via reflector (CN timezone only);" "[DRY-RUN] would: enable pacman ParallelDownloads; refresh CN mirrors via reflector (CN timezone only);")"
+        log "$(_t "[DRY-RUN]   refresh archlinux-keyring; enable en_US/zh_CN locales + locale-gen; full system upgrade (pacman -Su)" "[DRY-RUN]   refresh archlinux-keyring; enable en_US/zh_CN locales + locale-gen; full system upgrade (pacman -Su)")"
         success "$(_t "System ready." "System ready.")"
+        stage_mark preflight
+        return
+    fi
+    # Parallel download speedup
+    sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true
+    # Reflector mirror optimization (CN timezone -> China mirrors, otherwise skip)
+    local tz
+    tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+    if [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]]; then
+        if command -v reflector &>/dev/null; then
+            log "$(_t "Detected CN timezone, refreshing CN mirrors..." "Detected CN timezone, refreshing CN mirrors...")"
+            exe reflector --country China --protocol https --sort rate --save /etc/pacman.d/mirrorlist --latest 10 2>/dev/null || \
+                warn "$(_t "Reflector failed, using existing mirrors." "Reflector failed, using existing mirrors.")"
+        fi
+    fi
+    exe pacman -Sy --noconfirm archlinux-keyring || warn "$(_t "keyring refresh failed, continuing." "keyring refresh failed, continuing.")"
+    # Enable the locales the desktop relies on (zh_CN for UI/IME, en_US fallback).
+    # Without them, LANG=zh_CN.UTF-8 from the shipped configs produces warnings
+    # and garbled text in the session.
+    if [ -f /etc/locale.gen ]; then
+        grep -q '^en_US.UTF-8 UTF-8' /etc/locale.gen 2>/dev/null || sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+        grep -q '^zh_CN.UTF-8 UTF-8' /etc/locale.gen 2>/dev/null || sed -i 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen
+        exe locale-gen || warn "$(_t "locale-gen failed — Chinese text may render as warnings/garbage." "locale-gen failed — Chinese text may render as warnings/garbage.")"
+    fi
+    if ! exe pacman -Su --noconfirm; then
+        error "$(_t "System update failed. Check network." "System update failed. Check network.")"
+        exit 1
+    fi
+    success "$(_t "System ready." "System ready.")"
     stage_mark preflight
 }
 
@@ -670,11 +787,13 @@ stage_apps_select() {
 
 install_arch() {
     local p
-    # --- repo packages: batch install, fall back to per-package isolation on failure ---
-    local queue=()
+    # --- split the selection into repo (pacman) and AUR (helper) queues, then
+    #     batch install each with per-package isolation on failure. The AUR
+    #     helper is only built when the queue actually contains AUR packages. ---
+    local repo_queue=() aur_queue=()
     for p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
         if [ -n "${PIP_PKGS[$p]:-}" ]; then
-            # pip fallback install
+            # pip fallback install (kept for parity with deb/RHEL; empty on Arch)
             if [ "$DRY_RUN" -eq 1 ]; then
                 DRY_PKGS+=("$p (pip)")
                 continue
@@ -691,31 +810,20 @@ install_arch() {
         fi
         if pkg_installed "$p"; then
             SKIPPED_PKGS+=("$p (already installed)")
+        elif is_repo_pkg "$p"; then
+            repo_queue+=("$p")
         else
-            queue+=("$p")
+            aur_queue+=("$p")
         fi
     done
-    if [ ${#queue[@]} -gt 0 ]; then
-        local rc=0
-        pm_install "${queue[@]}" || rc=$?
-        if [ "$rc" -eq 0 ]; then
-            INSTALLED_PKGS+=("${queue[@]}")
-        elif [ "$rc" -eq "$DRY_RUN_RC" ]; then
-            DRY_PKGS+=("${queue[@]}")
-        else
-            warn "$(_t "Batch install failed, switching to individual installs..." "Batch install failed, switching to individual installs...")"
-            for p in "${queue[@]}"; do
-                local prc=0
-                pm_install "$p" || prc=$?
-                if [ "$prc" -eq 0 ]; then
-                    INSTALLED_PKGS+=("$p")
-                elif [ "$prc" -eq "$DRY_RUN_RC" ]; then
-                    DRY_PKGS+=("$p")
-                else
-                    FAILED_PKGS+=("repo:$p")
-                fi
-            done
-        fi
+    if [ ${#repo_queue[@]} -gt 0 ]; then
+        log "$(_t "Installing " "Installing ") ${#repo_queue[@]} $(_t "repo packages..." "repo packages...")"
+        install_batch pm_install "repo" "${repo_queue[@]}"
+    fi
+    if [ ${#aur_queue[@]} -gt 0 ]; then
+        ensure_aur_helper
+        log "$(_t "Installing " "Installing ") ${#aur_queue[@]} $(_t "AUR packages (this may compile for a while)..." "AUR packages (this may compile for a while)...")"
+        install_batch aur_install "AUR" "${aur_queue[@]}"
     fi
 }
 
@@ -789,13 +897,9 @@ download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the cur
     return "$rc"
 }
 
-# Cargo/rustup mirror for CN timezones (builds fetch from crates.io / static.rust-lang.org).
-# Sets CRATES_IO_OK=1 when at least one registry (crates.io or rsproxy) is reachable —
-# install_niri_binary uses it to pick the network build vs the vendored-dependencies offline build.
-CRATES_IO_OK=0
 _ensure_wallpaper() {
     [ "$DRY_RUN" -eq 1 ] && return 0
-    command -v awww >/dev/null 2>&1 || return 0   # awww 缺失由 install_awww 处理
+    command -v awww >/dev/null 2>&1 || return 0   # awww 未安装则跳过（AUR 安装失败的兜底）
 
     local _img="" _cand _ext=""
     # 1) 固定使用仓库根目录的壁纸图（用户放在 script 旁的那张 QQ图片.../wallpaper 图）。
@@ -1046,10 +1150,7 @@ stage_wait_builds() {
         rc=0
         wait "$pid" 2>/dev/null || rc=$?
         if [ "$rc" -eq 0 ]; then
-            case "$name" in
-                niri) install_niri_from_build "$srcdir" "$logfile" ;;
-                awww) install_awww_from_build "$srcdir" "$logfile" ;;
-            esac
+            success "$(_t "Background build finished: " "Background build finished: ") $name"
         else
             any_failed=1
             tailmsg=$(tail -n 8 "$logfile" 2>/dev/null | tr '\n' ' ')
@@ -1226,7 +1327,8 @@ stage_dm() {
     fi
 
     # keep the existing DM on request, or when it already is the chosen one
-    if [ -n "$current" ] && { [ "${EILNIRI_KEEP_DM:-0}" = "1" ] || [ "$current" = "$dm_unit" ]; }; then
+    # (dm_unit may carry a tty specifier, e.g. ly@tty1 — compare the unit name only)
+    if [ -n "$current" ] && { [ "${EILNIRI_KEEP_DM:-0}" = "1" ] || [ "$current" = "${dm_unit%%@*}" ]; }; then
         local reason="already the chosen DM"
         [ "${EILNIRI_KEEP_DM:-0}" = "1" ] && reason="EILNIRI_KEEP_DM=1, keep"
         info_kv "$(_t "DM" "DM")" "$current" "$reason"
@@ -1412,21 +1514,32 @@ install_zsh_extras() {
             "$HOME_DIR/.oh-my-zsh" 2>/dev/null || true
     fi
 
-    # 3) starship (configs/.zshrc evals `starship init zsh`); not packaged on Debian
+    # 3) starship (configs/.zshrc evals `starship init zsh` under a command -v guard).
+    #    Priority: repo package -> AUR helper -> official install script.
     if ! command -v starship >/dev/null 2>&1; then
         log "$(_t "Installing starship..." "Installing starship...")"
-        if exe bash -c 'curl -sSfL https://starship.rs/install.sh | sh -s -- -y -b /usr/local/bin' 2>/dev/null; then
-            INSTALLED_PKGS+=("starship")
-        else
-            MANUAL_ITEMS+=("starship — install failed; run: curl -sSfL https://starship.rs/install.sh | sh -s -- -y")
+        local _starship_done=0
+        if is_repo_pkg starship; then
+            pm_install starship && _starship_done=1
         fi
+        if [ "$_starship_done" -eq 0 ] && [ -n "$AUR_HELPER" ] && command -v "$AUR_HELPER" >/dev/null 2>&1; then
+            aur_install starship && _starship_done=1
+        fi
+        if [ "$_starship_done" -eq 0 ]; then
+            if exe bash -c 'curl -sSfL https://starship.rs/install.sh | sh -s -- -y -b /usr/local/bin' 2>/dev/null; then
+                _starship_done=1
+            else
+                MANUAL_ITEMS+=("starship — install failed; run: curl -sSfL https://starship.rs/install.sh | sh -s -- -y")
+            fi
+        fi
+        [ "$_starship_done" -eq 1 ] && INSTALLED_PKGS+=("starship")
     fi
-    # 保证 .zshrc 有可用的主题美化：即使 starship 没装上、或参考机配置是空主题，
-    # 也把 ZSH_THEME 设为内置主题（agnoster，nerd font 提供 powerline 符号）。
-    # 若 starship 可用，其 eval 在 .zshrc 末尾会覆盖 PROMPT，主题作为兜底。
-    if [ -f "$HOME_DIR/.zshrc" ] && grep -q '^ZSH_THEME=""' "$HOME_DIR/.zshrc" 2>/dev/null; then
+    # starship 没装上时才退回 oh-my-zsh 内置主题（agnoster，nerd font 提供 powerline
+    # 符号），保证 prompt 可用；starship 可用时保持 ZSH_THEME=""（本机同款，prompt
+    # 完全交给 starship + configs/.config/starship.toml）。
+    if ! command -v starship >/dev/null 2>&1 && [ -f "$HOME_DIR/.zshrc" ] && grep -q '^ZSH_THEME=""' "$HOME_DIR/.zshrc" 2>/dev/null; then
         sed -i 's/^ZSH_THEME=""/ZSH_THEME="agnoster"/' "$HOME_DIR/.zshrc" 2>/dev/null || true
-        log "$(_t "Set ZSH_THEME=agnoster (oh-my-zsh beautification)" "Set ZSH_THEME=agnoster (oh-my-zsh beautification)")"
+        log "$(_t "starship unavailable — set ZSH_THEME=agnoster as fallback" "starship unavailable — set ZSH_THEME=agnoster as fallback")"
     fi
 
     # 4) eza (aliased in .zshrc): repo package first, cargo --root /usr/local as fallback
@@ -1459,6 +1572,11 @@ install_zsh_extras() {
             ln -sf /usr/bin/batcat /usr/local/bin/bat
         fi
     fi
+
+    # 6) zoxide (configs/.zshrc evals `zoxide init zsh` under a command -v guard)
+    if ! command -v zoxide >/dev/null 2>&1; then
+        pm_install zoxide 2>/dev/null || MANUAL_ITEMS+=("zoxide — install failed; run: pacman -S zoxide")
+    fi
 }
 
 prune_config_backups() { # $1 = directory, $2 = basename glob
@@ -1475,13 +1593,87 @@ prune_config_backups() { # $1 = directory, $2 = basename glob
 
 deploy_one() { # $1 = source path, $2 = destination path
     local src="$1" dst="$2" ts="$3"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        if [ -e "$dst" ] || [ -L "$dst" ]; then
+            log "$(_t "[DRY-RUN] would backup & replace: " "[DRY-RUN] would backup & replace: ")$dst"
+        else
+            log "$(_t "[DRY-RUN] would deploy: " "[DRY-RUN] would deploy: ")$dst"
+        fi
+        return 0
+    fi
     if [ -e "$dst" ] || [ -L "$dst" ]; then
         log "$(_t "Backup existing: " "Backup existing: ")$dst -> $dst.bak-$ts"
         exe mv "$dst" "$dst.bak-$ts"
         prune_config_backups "$(dirname "$dst")" "$(basename "$dst").bak-*"
     fi
     exe cp -r "$src" "$dst"
+    # Safety net: a top-level directory may legitimately ship while containing
+    # privacy-risk files deeper inside (e.g. fcitx5/cached_layouts). Strip them
+    # from the freshly copied tree only — never from the user's existing data.
+    # Keep this pattern list in sync with is_privacy_risk().
+    find "$dst" -depth \( -name 'copyq.lock' -o -name 'copyq_tab_*' -o -name '*.dat' -o -name '*.log' \
+        -o -name '*.sqlite' -o -name '*.db' -o -name 'QtProject.conf' \
+        -o -name '__pycache__' -o -name 'cached_layouts' -o -name 'rime' \) -exec rm -rf {} + 2>/dev/null || true
     exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dst"
+}
+
+# hyprlock authenticates via its own PAM service file; not every hyprlock package
+# ships one. Without /etc/pam.d/hyprlock the lock screen cannot verify the password.
+ensure_hyprlock_pam() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ -f /etc/pam.d/hyprlock ] && return 0
+    cat > /etc/pam.d/hyprlock <<'PAMEOF'
+# created by eilNiri (the hyprlock package shipped no PAM file)
+auth     required   pam_unix.so try_first_pass nullok
+account  required   pam_unix.so
+PAMEOF
+    log "$(_t "Wrote /etc/pam.d/hyprlock (standard unix auth)" "Wrote /etc/pam.d/hyprlock (standard unix auth)")"
+}
+
+# The shipped niri config spawns the polkit agent path from the reference machine
+# (/usr/lib/polkit-gnome-authentication-agent-1). If that binary is absent but
+# another agent is installed, repoint the spawn-at-startup line at it.
+fix_polkit_agent() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _cfg="$HOME_DIR/.config/niri/config.kdl"
+    [ -f "$_cfg" ] || return 0
+    local _cur
+    _cur=$(grep -oP 'spawn-at-startup\s+"\K[^"]*polkit[^"]*' "$_cfg" | head -n 1)
+    [ -n "$_cur" ] || return 0
+    [ -x "$_cur" ] && return 0   # shipped path is valid, nothing to do
+    local _dir _cand
+    for _dir in /usr/lib /usr/libexec /usr/lib/polkit-gnome /usr/lib/xfce-polkit /usr/lib/mate-polkit /usr/lib/lxpolkit; do
+        [ -d "$_dir" ] || continue
+        for _cand in "$_dir"/*polkit* "$_dir"/lxpolkit; do
+            [ -x "$_cand" ] || continue
+            case "$(basename "$_cand")" in
+                *polkit-gnome-authentication-agent*|*polkit-kde-authentication-agent*|*xfce-polkit|*mate-polkit|lxpolkit) ;;
+                *) continue ;;
+            esac
+            log "$(_t "polkit agent " "polkit agent ") $_cur $(_t "missing -> repointing to " "missing -> repointing to ") $_cand"
+            sed -i "s#\"$_cur\"#\"$_cand\"#" "$_cfg"
+            exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg"
+            return 0
+        done
+    done
+    warn "$(_t "No polkit agent found — GUI privilege prompts (disks, users...) will not appear." "No polkit agent found — GUI privilege prompts (disks, users...) will not appear.")"
+}
+
+# Privacy guard: configs/ ships shareable dotfiles and must never carry clipboard
+# history, input-method user data or other personal traces. Anything matching these
+# patterns is skipped (with a warning) instead of deployed — e.g. CopyQ's
+# copyq_tab_*.dat history database, its lock/log files, fcitx5's cached_layouts and
+# rime user dictionaries, Qt file-dialog history (QtProject.conf).
+is_privacy_risk() { # $1 = path inside configs/
+    local p="$1" b
+    b=$(basename "$p")
+    case "$p" in
+        *copyq*|*QtProject.conf*|*__pycache__*|*cached_layouts*|*/rime/*) return 0 ;;
+    esac
+    case "$b" in
+        copyq.lock|*.dat|*.log|*.sqlite|*.db) return 0 ;;
+    esac
+    return 1
 }
 
 stage_configs() {
@@ -1499,37 +1691,68 @@ stage_configs() {
     local ts
     ts=$(date +%Y%m%d-%H%M%S)
 
+    # Privacy pre-check: surface (and skip) anything in configs/ that looks like
+    # personal data instead of deploying it silently.
+    local _prv
+    _prv=$(find "$snap" -type f \( -path '*copyq*' -o -name 'QtProject.conf' -o -name '*.dat' \
+        -o -name '*.log' -o -name '*.sqlite' -o -name '*.db' -o -path '*__pycache__*' \
+        -o -path '*cached_layouts*' \) 2>/dev/null)
+    if [ -n "$_prv" ]; then
+        warn "$(_t "Privacy-sensitive files found in configs/ — they will NOT be deployed:" "Privacy-sensitive files found in configs/ — they will NOT be deployed:")"
+        echo "$_prv" | sed 's/^/       /'
+    fi
+
     shopt -s nullglob dotglob
     local item name
     # ~/.config/<name>
     for item in "$snap/.config"/*; do
         name=$(basename "$item")
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .config/$name"
+            continue
+        fi
         deploy_one "$item" "$HOME_DIR/.config/$name" "$ts"
     done
     # ~/.local/share/<name> (fixed niri-session etc.)
     for item in "$snap/.local/share"/*; do
         name=$(basename "$item")
         [ -d "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .local/share/$name"
+            continue
+        fi
         mkdir -p "$HOME_DIR/.local/share"
         deploy_one "$item" "$HOME_DIR/.local/share/$name" "$ts"
     done 2>/dev/null
     # ~/.local/share/applications (custom desktop files)
     for item in "$snap/.local/share/applications"/*; do
         [ -f "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") applications/$(basename "$item")"
+            continue
+        fi
         mkdir -p "$HOME_DIR/.local/share/applications"
         deploy_one "$item" "$HOME_DIR/.local/share/applications/$(basename "$item")" "$ts"
     done 2>/dev/null
     # ~/.local/bin (fixed niri-session etc.)
     for item in "$snap/.local/bin"/*; do
         [ -f "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .local/bin/$(basename "$item")"
+            continue
+        fi
         mkdir -p "$HOME_DIR/.local/bin"
         deploy_one "$item" "$HOME_DIR/.local/bin/$(basename "$item")" "$ts"
     done 2>/dev/null
-    # home dotfiles (e.g. .pam_environment)
+    # home dotfiles (e.g. .zshrc)
     for item in "$snap"/.*; do
         name=$(basename "$item")
         [[ "$name" = "." || "$name" = ".." || "$name" = ".config" ]] && continue
         [ -f "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") ~/$name"
+            continue
+        fi
         deploy_one "$item" "$HOME_DIR/$name" "$ts"
     done
     shopt -u nullglob dotglob
@@ -1570,16 +1793,9 @@ stage_configs() {
             done < <(sed -n 's/^ExecStart=//p' "$_sf" 2>/dev/null)
         done
 
-        # waybar 由 GDM/systemd session 启动；niri 中的 spawn-at-startup 会
-        # 产生第二个实例，因此将该启动项注释掉。
-        if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
-            && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
-            sed -i -E 's/^([[:space:]]*)spawn-at-startup[[:space:]]+"waybar"/\1# spawn-at-startup "waybar" (started by GDM\/systemd)/' "$HOME_DIR/.config/niri/config.kdl"
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
-            pkill -u "$TARGET_USER" -x waybar 2>/dev/null || true
-            sleep 1
-            log "$(_t "Disabled niri Waybar startup; GDM/systemd will provide the only instance" "Disabled niri Waybar startup; GDM/systemd will provide the only instance")"
-        fi
+        # NOTE: waybar is started by niri's spawn-at-startup (the shipped config has
+        # no waybar systemd unit) — do NOT comment it out here, or the desktop ends
+        # up without a status bar.
 
         # 光标拖影：QEMU/KVM 虚拟机常因虚拟硬件 cursor plane 与 Niri 不兼容。
         # Keep the environment file for user services, and export the same
@@ -1624,6 +1840,8 @@ stage_configs() {
         # 壁纸自愈：awww 已装则确保有壁纸状态文件（生成默认渐变壁纸 / 修正 waypaper 路径）
         _ensure_wallpaper
         _ensure_waypaper_desktop   # pip 装的 waypaper 无 .desktop → fuzzel 无图标
+        ensure_hyprlock_pam        # hyprlock 包可能不带 PAM 文件 → 锁屏无法验证密码
+        fix_polkit_agent           # niri 配置里的 agent 路径按本机实际安装改写
     fi
 
     # fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
@@ -2082,15 +2300,18 @@ do_restore() {
 # --- 4.10c one-line niri status (printed right before the summary) ---
 print_niri_status() {
     [ "$DRY_RUN" -eq 1 ] && return 0
-    local _bin="MISSING" _desk="MISSING" _sess="unset"
+    local _bin="MISSING" _desk="MISSING" _sess="unset" _dm="?"
     if command -v niri >/dev/null 2>&1 || [ -x /usr/local/bin/niri ]; then _bin="installed"; fi
     if [ -f /usr/local/share/wayland-sessions/niri.desktop ] || [ -f /usr/share/wayland-sessions/niri.desktop ]; then _desk="registered"; fi
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        _dm=$(basename "$(readlink -f /etc/systemd/system/display-manager.service)" .service)
+    fi
     if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
         _sess=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//' )
         [ -z "$_sess" ] && _sess="unset"
     fi
     echo ""
-    info_kv "$(_t "NIRI STATUS" "NIRI STATUS")" "binary=$_bin | desktop=$_desk | gdm Session=$_sess"
+    info_kv "$(_t "NIRI STATUS" "NIRI STATUS")" "binary=$_bin | desktop=$_desk | DM=$_dm | AccountsService Session=$_sess"
 }
 
 # --- 4.10d diagnostic bundle (so a failed run can be shared for offline analysis) ---
@@ -2291,23 +2512,29 @@ boot_env_check() {
     _sessions=$(ls /usr/share/xsessions /usr/local/share/xsessions /usr/share/wayland-sessions /usr/local/share/wayland-sessions 2>/dev/null | sort -u | tr '\n' ' ')
     info_kv "$(_t "Sessions (all)" "Sessions (all)")" "${_sessions:-none}" "$(_t "(niri present if niri.desktop listed)" "(niri present if niri.desktop listed)")"
 
-    # final assertion: will gdm actually boot into niri?
+    # final assertion: will the display manager actually boot into niri?
+    local _dm_name="?"
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        _dm_name=$(basename "$(readlink -f /etc/systemd/system/display-manager.service)" .service)
+    fi
     local _boot_ok=1 _reason=""
     [ -z "$_niri_desktop" ] && { _boot_ok=0; _reason="niri.desktop not registered (build incomplete)"; }
+    # gdm(-like) DMs pick the default session via AccountsService; ly remembers the
+    # last session at the greeter, so only the session registration matters there.
     if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
         local _as
         _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
         if [ "$_as" != "niri" ]; then
             _boot_ok=0
             [ -n "$_reason" ] && _reason="; "
-            _reason="${_reason}gdm AccountsService Session='${_as:-unset}' (expected niri)"
+            _reason="${_reason}AccountsService Session='${_as:-unset}' (expected niri)"
         fi
     fi
     if [ "$_boot_ok" -eq 1 ]; then
-        success "$(_t "Boot check: gdm will start niri after reboot." "Boot check: gdm will start niri after reboot.")"
+        success "$(_t "Boot check:" "Boot check:") ${_dm_name} $(_t "will offer the niri session after reboot." "will offer the niri session after reboot.")"
     else
         echo -e "   ${H_RED}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
-        echo -e "   ${H_RED}┃  BOOT CHECK FAILED: gdm will NOT start niri.                       ┃${NC}"
+        echo -e "   ${H_RED}┃  BOOT CHECK FAILED: login will NOT reach niri.                     ┃${NC}"
         echo -e "   ${H_RED}┃  Reason: $_reason${NC}"
         echo -e "   ${H_RED}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
         write_log "FAIL" "boot check failed: $_reason"
@@ -2493,8 +2720,10 @@ Workflow:
   1. Copy this eilNiri directory to the target machine (USB / network)
   2. On the machine (Arch / Manjaro / EndeavourOS): sudo ./arch-install.sh restore   — no prep required;
      optionally drop your own dotfiles into configs/.config/ and they get deployed
-     - niri/awww compile in background:  ./arch-install.sh status   (live progress)
-     - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
+     (privacy note: clipboard history / input-method user data under configs/ are
+      detected and skipped automatically — they must never be committed here)
+     - repo packages install via pacman, AUR packages via yay (auto-built if missing)
+     - ./arch-install.sh status shows background build progress (usually empty)
   3. Rollback config:            sudo ./arch-install.sh rollback
   4. Re-enable other-DE comps:   sudo ./arch-install.sh restore-system
 EOF

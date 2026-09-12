@@ -9,10 +9,10 @@
 | 脚本 | 适用发行版 | 状态 |
 |---|---|---|
 | **`deb-install.sh`** | Debian 12/13、Ubuntu 24.04+、Linux Mint、Pop!_OS，以及任意 Debian 衍生版（脚本自动识别 `/etc/debian_version`：deepin / UOS / Kali / MX / 麒麟等均可） | ✅ **可用（当前主力，完整测试）** |
-| `arch-install.sh` | Arch / Manjaro / EndeavourOS | 🚧 **未完成开发**（WIP，可能无法完整工作，欢迎测试反馈） |
+| `arch-install.sh` | Arch / Manjaro / EndeavourOS | ⚙️ **可用（新完成，欢迎测试反馈）**：仓库包走 pacman、AUR 包走 yay（缺失时自动编译安装），配置快照与本机同步 |
 | `RHEL-install.sh` | Fedora / Rocky / Alma / CentOS Stream / RHEL | 🚧 **未完成开发**（WIP，可能无法完整工作，欢迎测试反馈） |
 
-> **新手请直接用 `deb-install.sh`。** 另外两个脚本保留在仓库中供后续开发使用，尚未达到日用状态。
+> **新手请直接用 `deb-install.sh`。** `arch-install.sh` 已完成 AUR 支持与配置同步，但测试覆盖尚不及 deb 版；`RHEL-install.sh` 保留在仓库中供后续开发使用。
 
 ---
 
@@ -219,7 +219,7 @@ bluetooth（蓝牙，bluetui 依赖）、libvirtd（虚拟机）、power-profile
 - **虚拟机必须开 3D 加速**，否则 niri 无法运行（niri 拒绝软件渲染，这是上游设计而非脚本问题）
 - Debian 12 / Ubuntu 24.04 的 waybar 为 0.9.x 旧版，自动使用精简布局（无折叠抽屉/媒体模块）
 - niri / awww 在 Debian 系走源码编译（约 10-20 分钟 + 5 分钟），需要 ≥ 6GB 磁盘与足够内存（编译并发按内存自动限制）
-- `arch-install.sh` 与 `RHEL-install.sh` 为未完成开发状态，暂不提供支持
+- `arch-install.sh` 已完成核心功能（pacman + AUR/yay + 配置同步），欢迎测试反馈；`RHEL-install.sh` 仍为未完成开发状态，暂不提供支持
 
 ---
 
@@ -228,7 +228,7 @@ bluetooth（蓝牙，bluetui 依赖）、libvirtd（虚拟机）、power-profile
 ```
 EilNiri/
 ├── deb-install.sh      # Debian 系安装脚本（当前主力）
-├── arch-install.sh     # Arch 系（🚧 未完成开发）
+├── arch-install.sh     # Arch 系（⚙️ 可用：pacman + AUR/yay + 配置同步）
 ├── RHEL-install.sh     # RHEL 系（🚧 未完成开发）
 ├── configs/            # 桌面配置快照（部署到目标机 $HOME）
 ├── QQ图片20260713144149.jpeg   # 默认壁纸（桌面 + 锁屏共用）

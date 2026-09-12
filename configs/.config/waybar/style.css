@@ -27,8 +27,8 @@
    2. Bar Window — glass card
    ═══════════════════════════════════════════════════════════════ */
 window#waybar {
-    margin-top: 4px;
-    margin-left: 60px;
+    margin-top: 16px;
+    margin-left: 64px;
     margin-right: 60px;
     border-radius: 20px;
 
@@ -101,6 +101,9 @@ window#waybar {
 #bluetooth,
 #window,
 #tray,
+#mpris,
+#disk,
+#custom-updates,
 #custom-shutdown,
 #custom-reboot {
 
@@ -120,12 +123,16 @@ window#waybar {
 #bluetooth   { border-left: 2px solid rgba(148, 226, 213, 0.55); }
 #clock       { border-left: 2px solid rgba(203, 166, 247, 0.55); }
 #window           { border-left: 2px solid rgba(137, 180, 250, 0.4); }
+#mpris           { border-left: 2px solid rgba(203, 166, 247, 0.55); }
+#disk            { border-left: 2px solid rgba(137, 180, 250, 0.55); }
+#custom-updates  { border-left: 2px solid rgba(249, 226, 175, 0.55); }
 #custom-shutdown  { border-left: 2px solid rgba(243, 139, 168, 0.55); }
 #custom-reboot    { border-left: 2px solid rgba(249, 226, 175, 0.55); }
 
 /* hover glow */
 #clock:hover, #pulseaudio:hover, #network:hover,
 #cpu:hover, #memory:hover, #bluetooth:hover,
+#mpris:hover, #disk:hover, #custom-updates:hover,
 #custom-shutdown:hover, #custom-reboot:hover {
     background: rgba(69, 71, 90, 0.78);
     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
@@ -147,6 +154,18 @@ window#waybar {
     border-left: 2px solid rgba(203, 166, 247, 0.55);
     box-shadow:
         0 0 16px rgba(137, 180, 250, 0.08);
+}
+
+#mpris {
+    font-size: 13px;
+}
+
+#mpris.playing {
+    color: #a6e3a1;
+}
+
+#mpris.paused {
+    color: #f9e2af;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -190,17 +209,23 @@ window#waybar {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   7. CPU / Memory thresholds
+   7. CPU / Memory / Disk thresholds
    ═══════════════════════════════════════════════════════════════ */
-#cpu.warning, #memory.warning {
+#cpu.warning, #memory.warning, #disk.warning {
     color: #f9e2af;
     background: rgba(249, 226, 175, 0.1);
 }
 
-#cpu.critical, #memory.critical {
+#cpu.critical, #memory.critical, #disk.critical {
     color: #f38ba8;
     background: rgba(243, 139, 168, 0.12);
     animation: blink 800ms infinite;
+}
+
+/* 有可用系统更新时高亮 */
+#custom-updates.warning {
+    color: #f9e2af;
+    background: rgba(249, 226, 175, 0.1);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -218,7 +243,58 @@ window#waybar {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   9. System Tray
+   9. Groups — audio / sys collapsible drawers
+   ═══════════════════════════════════════════════════════════════ */
+#group-audio,
+#group-sys {
+    padding: 0 6px;
+    margin: 3px 0;
+    color: #cdd6f4;
+    background: rgba(49, 50, 68, 0.72);
+    border-radius: 10px;
+    transition: all 200ms ease;
+}
+
+#group-audio {
+    border-left: 2px solid rgba(137, 180, 250, 0.55);
+}
+
+#group-sys {
+    border-left: 2px solid rgba(249, 226, 175, 0.55);
+}
+
+#group-audio:hover,
+#group-sys:hover {
+    background: rgba(69, 71, 90, 0.78);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+
+/* 组内模块共用胶囊底,不重复绘制 */
+#custom-more-audio,
+#custom-more-sys,
+#group-audio #pulseaudio,
+#group-audio #custom-updates,
+#group-audio #bluetooth,
+#group-sys #cpu,
+#group-sys #memory,
+#group-sys #disk {
+    padding: 0 8px;
+    margin: 3px 0;
+    background: transparent;
+    border-left: none;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+/* drawer 子项悬停提示 */
+#group-audio .drawer-child:hover,
+#group-sys .drawer-child:hover {
+    background: rgba(69, 71, 90, 0.5);
+    border-radius: 8px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   10. System Tray
    ═══════════════════════════════════════════════════════════════ */
 #tray {
     background: rgba(49, 50, 68, 0.72);
@@ -238,7 +314,7 @@ window#waybar {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   10. Tooltip
+   11. Tooltip
    ═══════════════════════════════════════════════════════════════ */
 tooltip {
     background: rgba(24, 24, 37, 0.94);
@@ -254,7 +330,7 @@ tooltip label {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   11. Animations
+   12. Animations
    ═══════════════════════════════════════════════════════════════ */
 @keyframes blink {
     0% {
