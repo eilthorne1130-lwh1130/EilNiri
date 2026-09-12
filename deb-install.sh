@@ -692,9 +692,73 @@ detect_target_user() {
     info_kv "$(_t "Target User" "Target User")" "$TARGET_USER" "($HOME_DIR)"
 }
 
+# --- apt/dpkg 锁处理（新装系统常见：开机 unattended-upgrades 自动升级长期持锁，
+#     脚本早期装 fzf / 后续 apt 操作会直接报 "无法获得锁 /var/lib/dpkg/lock-frontend"）---
+
+# 当前 dpkg 前端锁的持有者（输出 "PID 命令名"），无占用则输出空。
+# lslocks（util-linux 核心组件，几乎必在）优先，fuser 兜底。
+_apt_lock_holder() {
+    local out
+    out=$(lslocks -o PID,COMMAND,PATH 2>/dev/null | awk '$3 ~ /lock-frontend/ {print $1, $2; exit}')
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    command -v fuser >/dev/null 2>&1 || return 0
+    local pid
+    pid=$(fuser /var/lib/dpkg/lock-frontend 2>/dev/null | tr -d ' ')
+    [ -n "$pid" ] && printf '%s %s\n' "$pid" "$(ps -p "$pid" -o comm= 2>/dev/null || echo '?')"
+}
+
+# apt 命令行锁超时参数：apt ≥ 1.10 支持 -o DPkg::Lock::Timeout=<秒>（等待锁而非立即
+# 失败）。结果缓存到全局 APT_LOCK_OPTS；老版本 apt 返回空（不附加，避免选项报错）。
+APT_LOCK_OPTS=""
+_apt_lock_opts() {
+    if [ -z "$APT_LOCK_OPTS" ]; then
+        local v maj min
+        v=$(apt-get --version 2>/dev/null | awk 'NR==1{print $2}')
+        maj=${v%%.*}; min=${v#*.}; min=${min%%.*}
+        if [ "${maj:-0}" -ge 2 ] || { [ "${maj:-0}" = 1 ] && [ "${min:-0}" -ge 10 ]; }; then
+            APT_LOCK_OPTS="-o DPkg::Lock::Timeout=120"
+        fi
+    fi
+    printf '%s' "$APT_LOCK_OPTS"
+}
+
+# 主动等待其他 apt/dpkg 进程释放锁（最多 300s）。
+# 持锁者是 unattended-upgrades 且等待超过 45s 时，询问是否临时停止它
+# （重启后自动恢复，是全新装机后的标准做法）。
+_apt_wait_lock() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _holder _waited=0 _asked=0
+    while :; do
+        _holder=$(_apt_lock_holder)
+        [ -z "$_holder" ] && return 0
+        if [ "$_waited" -eq 0 ]; then
+            log "$(_t "apt/dpkg 锁被占用（${_holder}）— 等待其释放（最多 300 秒）..." "apt/dpkg lock is held (${_holder}) — waiting up to 300s for release...")"
+        fi
+        if [ "$_asked" -eq 0 ] && [ "$_waited" -ge 45 ] && [[ "$_holder" == *unattended* ]]; then
+            _asked=1
+            if confirm "$(_t "unattended-upgrades 正在后台自动升级并持有 apt 锁。临时停止它以继续安装？（重启后自动恢复）[Y/n] (default Y, 15s):" "unattended-upgrades is auto-upgrading in the background and holds the apt lock. Temporarily stop it to continue? (resumes after reboot) [Y/n] (default Y, 15s):")" "Y" 15; then
+                log "$(_t "临时停止 unattended-upgrades..." "Temporarily stopping unattended-upgrades...")"
+                systemctl stop unattended-upgrades 2>/dev/null || true
+                sleep 2
+                continue
+            fi
+        fi
+        if [ "$_waited" -ge 300 ]; then
+            warn "$(_t "等待锁超时（300s）— 继续尝试安装，若仍报锁错误请稍后重跑。" "Lock wait timed out (300s) — trying anyway; if the lock error persists, rerun later.")"
+            return 0
+        fi
+        sleep 5
+        _waited=$((_waited + 5))
+    done
+}
+
 ensure_fzf() {
     if command -v fzf &>/dev/null; then return 0; fi
     log "$(_t "Installing interactive menu dependency: fzf ..." "Installing interactive menu dependency: fzf ...")"
+    _apt_wait_lock   # 全新系统开机后 unattended-upgrades 常持锁，直接装会失败（历史故障点）
     local _saved_dry="$DRY_RUN"
     DRY_RUN=0  # fzf is required for interaction, so install it even in --dry-run
     if pm_install fzf; then
