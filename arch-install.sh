@@ -406,18 +406,28 @@ ensure_aur_helper() {
         # --- pre-built binary fallback: download official release tarball ---
         local _arch _ver _yay_dl _yay_tar _yay_exe
         _arch=$(uname -m)
-        _ver=$(curl -s --max-time 15 https://api.github.com/repos/Jguer/yay/releases/latest 2>/dev/null \
-              | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')
+        # Try GitHub API directly, then via GH mirrors (api.github.com is blocked on some CN networks)
+        local _api_url="https://api.github.com/repos/Jguer/yay/releases/latest"
+        _ver=$(curl -s --max-time 10 "$_api_url" 2>/dev/null | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')
         if [ -z "$_ver" ]; then
-            warn "$(_t "Cannot resolve yay latest version from GitHub API" "Cannot resolve yay latest version from GitHub API")"
-        else
-            case "$_arch" in
-                x86_64)        _yay_dl="https://github.com/Jguer/yay/releases/download/v${_ver}/yay_${_ver}_x86_64.tar.gz" ;;
-                aarch64)       _yay_dl="https://github.com/Jguer/yay/releases/download/v${_ver}/yay_${_ver}_aarch64.tar.gz" ;;
-                armv7h|armv7l) _yay_dl="https://github.com/Jguer/yay/releases/download/v${_ver}/yay_${_ver}_armv7h.tar.gz" ;;
-                *)             _yay_dl="" ;;
-            esac
+            local _prox
+            for _prox in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
+                _ver=$(curl -s --max-time 10 "${_prox%/}/$_api_url" 2>/dev/null | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')
+                [ -n "$_ver" ] && break
+            done
         fi
+        # Hardcoded latest-known version as ultimate fallback (update periodically)
+        [ -z "$_ver" ] && _ver="13.0.1"
+        log "$(_t "yay prebuilt version: " "yay prebuilt version: ")v${_ver}"
+        case "$_arch" in
+            x86_64)        _yay_dl="https://github.com/Jguer/yay/releases/download/v${_ver}/yay_${_ver}_x86_64.tar.gz" ;;
+            aarch64)       _yay_dl="https://github.com/Jguer/yay/releases/download/v${_ver}/yay_${_ver}_aarch64.tar.gz" ;;
+            armv7h|armv7l) _yay_dl="https://github.com/Jguer/yay/releases/download/v${_ver}/yay_${_ver}_armv7h.tar.gz" ;;
+            *)
+                warn "$(_t "Unsupported arch for yay prebuilt: " "Unsupported arch for yay prebuilt: ")$_arch"
+                _yay_dl=""
+                ;;
+        esac
         if [ -n "${_yay_dl:-}" ]; then
             _yay_tar="$_src/yay-prebuilt.tar.gz"
             if _dl_gh_bounded "$_yay_dl" "$_yay_tar" 120; then
