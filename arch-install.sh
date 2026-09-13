@@ -604,59 +604,7 @@ fzf_single() {
         --header="$1"
 }
 
-# Resolve the DRM connector at session startup, after GDM has handed the device
-# to the user session. Installation-time detection can see a different connector
-# (or no connector at all) on virtual machines.
-install_niri_output_wrapper() {
-    [ "$DRY_RUN" -eq 1 ] && return 0
-    local _wrapper=/usr/local/bin/eilniri-niri-session
-    cat > "$_wrapper" <<'WRAPEOF'
-#!/usr/bin/env bash
-set -u
-
-cfg="${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl"
-tmp="${cfg}.eilniri-output.$$"
-export WLR_NO_HARDWARE_CURSORS=1
-export WLR_RENDERER_ALLOW_SOFTWARE=1
-out=""; mode=""
-for status in /sys/class/drm/card*-*/status; do
-    [ -f "$status" ] || continue
-    [ "$(<"$status")" = connected ] || continue
-    dir=${status%/status}
-    candidate=${dir##*/}
-    candidate=${candidate#card[0-9]-}
-    candidate_mode=$(sed -n '1p' "$dir/modes" 2>/dev/null || true)
-    [ -n "$candidate" ] && [ -n "$candidate_mode" ] || continue
-    out="$candidate"; mode="$candidate_mode"; break
-done
-
-if [ -n "$out" ] && [ -n "$mode" ] && [ -f "$cfg" ]; then
-    w=${mode%x*}; h=${mode#*x}; mode_line="mode \"${w}x${h}@60\""
-    awk -v output="$out" -v mode_line="$mode_line" '
-        BEGIN { replaced=0; inside=0 }
-        !replaced && $0 ~ /^[[:space:]]*output[[:space:]]+"/ {
-            print "output \"" output "\" {"; print "    " mode_line
-            replaced=1; inside=1; next
-        }
-        inside && $0 ~ /^[[:space:]]*}/ { print "}"; inside=0; next }
-        inside { next }
-        { print }
-    ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
-fi
-
-exec /usr/local/bin/niri-session.real "$@"
-WRAPEOF
-    chmod 755 "$_wrapper"
-}
-
-# --- Debian/Ubuntu apt mirror switch (offered when apt-get update or install fails ---
-# with 404 / 无法下载 / connection errors).  Rewrites the apt host in the source
-# files (both deb-format .list and deb822 .sources) to a selected mirror, backs up
-# the originals, then reruns apt-get update and VERIFIES the previously-missing
-# .deb is actually served by the new mirror (curl probe).
-# NOTE: fzf may not be installed yet at this point (ensure_fzf runs after
-# preflight, and apt being broken can block its install), so this falls back to a
-# plain numbered prompt when fzf is absent.
+# --- 4.1 preflight (pacman settings, mirror refresh, keyring, locales, upgrade) ---
 stage_preflight() {
     section "$(_t "Pre-Flight" "Pre-Flight")" "$(_t "System Update" "System Update")"
     if stage_done preflight; then
@@ -704,6 +652,7 @@ stage_preflight() {
 # --- 4.2 app selection ---
 
 REPO_UNIVERSE=()
+REPO_SEL=()
 
 load_app_universe() {
     # Built-in authoritative package list (no snapshot/pkglist in the snapshot-free mode)
@@ -1591,7 +1540,7 @@ prune_config_backups() { # $1 = directory, $2 = basename glob
     done
 }
 
-deploy_one() { # $1 = source path, $2 = destination path
+deploy_one() { # $1 = source path, $2 = destination path, $3 = timestamp
     local src="$1" dst="$2" ts="$3"
     if [ "$DRY_RUN" -eq 1 ]; then
         if [ -e "$dst" ] || [ -L "$dst" ]; then
@@ -1891,12 +1840,6 @@ IMEEOF
 # is recorded in $BASE_DIR/.system_disabled and is reversible via `restore-system`.
 DISABLE_MANIFEST="$BASE_DIR/.system_disabled"
 
-# Older eilNiri versions masked these GDM helpers, which makes a valid niri
-# Wayland session handoff appear as an immediate black screen. Always remove
-# those stale masks on RHEL-family restores; they are never valid cleanup targets.
-unmask_gdm_wayland() {
-    return 0
-}
 
 stage_disable_system() {
     if stage_done sysdisable; then return; fi
@@ -2270,7 +2213,6 @@ do_restore() {
 
     # update the system first (a fresh machine has a stale package db, so installing fzf directly may fail)
     stage_preflight
-    unmask_gdm_wayland
     ensure_fzf
     detect_target_user
 
@@ -2453,7 +2395,6 @@ EOF
 # dispatch: pick the right mechanism for the DM that actually owns display-manager.service
 ensure_dm_session() {
     [ "$DRY_RUN" -eq 1 ] && return 0
-    [ "$DISTRO_FAMILY" = arch ] && return 0
     local _dm
     if [ -e /etc/systemd/system/display-manager.service ]; then
         _dm=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
@@ -2463,7 +2404,7 @@ ensure_dm_session() {
     fi
     case "$_dm" in
         gdm|gdm3) ensure_gdm_session ;;
-        sddm)     warn "$(_t "sddm default session not supported by this script; login may go to the wrong desktop." "sddm default session not supported by this script; login may go to the wrong desktop.")" ;;
+        ly*|sddm) ;;
         *)        warn "$(_t "Unknown DM '$_dm' — cannot set niri as the default session." "Unknown DM '$_dm' — cannot set niri as the default session.")" ;;
     esac
 }
@@ -2499,14 +2440,18 @@ boot_env_check() {
         info_kv "$(_t "Niri Session" "Niri Session")" "$(_t "NOT registered" "NOT registered")" "$(_t "(niri build incomplete — login goes to the default desktop)" "(niri build incomplete — login goes to the default desktop)")"
     fi
     # gdm / gdm3: AccountsService
-    if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
-        local _as
-        _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
-        if [ -n "$_as" ]; then
-            info_kv "$(_t "gdm Session" "gdm Session")" "AccountsService=$_as" "$(_t "(must be niri)" "(must be niri)")"
-            [ "$_as" != "niri" ] && warn "$(_t "gdm AccountsService Session=$_as — login will not go to niri." "gdm AccountsService Session=$_as — login will not go to niri.")"
-        fi
-    fi
+    case "$_dm_name" in
+        gdm*|gdm3*)
+            if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
+                local _as
+                _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
+                if [ -n "$_as" ]; then
+                    info_kv "$(_t "gdm Session" "gdm Session")" "AccountsService=$_as" "$(_t "(must be niri)" "(must be niri)")"
+                    [ "$_as" != "niri" ] && warn "$(_t "gdm AccountsService Session=$_as — login will not go to niri." "gdm AccountsService Session=$_as — login will not go to niri.")"
+                fi
+            fi
+            ;;
+    esac
     # session files visible to the DM
     local _sessions
     _sessions=$(ls /usr/share/xsessions /usr/local/share/xsessions /usr/share/wayland-sessions /usr/local/share/wayland-sessions 2>/dev/null | sort -u | tr '\n' ' ')
@@ -2521,15 +2466,19 @@ boot_env_check() {
     [ -z "$_niri_desktop" ] && { _boot_ok=0; _reason="niri.desktop not registered (build incomplete)"; }
     # gdm(-like) DMs pick the default session via AccountsService; ly remembers the
     # last session at the greeter, so only the session registration matters there.
-    if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
-        local _as
-        _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
-        if [ "$_as" != "niri" ]; then
-            _boot_ok=0
-            [ -n "$_reason" ] && _reason="; "
-            _reason="${_reason}AccountsService Session='${_as:-unset}' (expected niri)"
-        fi
-    fi
+    case "$_dm_name" in
+        gdm*|gdm3*)
+            if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
+                local _as
+                _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
+                if [ "$_as" != "niri" ]; then
+                    _boot_ok=0
+                    [ -n "$_reason" ] && _reason="; "
+                    _reason="${_reason}AccountsService Session='${_as:-unset}' (expected niri)"
+                fi
+            fi
+            ;;
+    esac
     if [ "$_boot_ok" -eq 1 ]; then
         success "$(_t "Boot check:" "Boot check:") ${_dm_name} $(_t "will offer the niri session after reboot." "will offer the niri session after reboot.")"
     else
@@ -2595,9 +2544,16 @@ do_rollback() {
 
     exe tar xzf "$tgz" -C "$workdir" || { error "$(_t "Failed to extract snapshot." "Failed to extract snapshot.")"; exit 1; }
 
+    local snap_user_dir="$workdir/${HOME_DIR#/}"
+    if [ ! -d "$snap_user_dir" ]; then
+        local _cand_home
+        _cand_home=$(find "$workdir/home" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1)
+        [ -n "$_cand_home" ] && snap_user_dir="$_cand_home"
+    fi
+
     local item name target
     shopt -s nullglob dotglob
-    for item in "$workdir"/home/*/.config/*; do
+    for item in "$snap_user_dir/.config"/*; do
         name=$(basename "$item")
         target="$HOME_DIR/.config/$name"
         if [ -e "$target" ] || [ -L "$target" ]; then
@@ -2608,7 +2564,7 @@ do_rollback() {
         exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
     done
     # restore ~/.local/share/ (fixed niri-session etc.)
-    for item in "$workdir"/home/*/.local/share/*/*; do
+    for item in "$snap_user_dir/.local/share"/*/*; do
         [ -f "$item" ] && continue
         name=$(basename "$item")
         local parent
@@ -2622,7 +2578,7 @@ do_rollback() {
         exe cp -r "$item" "$target"
         exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
     done 2>/dev/null
-    for item in "$workdir"/home/*/.local/share/applications/*; do
+    for item in "$snap_user_dir/.local/share/applications"/*; do
         [ -f "$item" ] || continue
         target="$HOME_DIR/.local/share/applications/$(basename "$item")"
         mkdir -p "$(dirname "$target")"
@@ -2634,9 +2590,9 @@ do_rollback() {
         exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$target"
     done 2>/dev/null
     # home dotfiles
-    for item in "$workdir"/home/*/.*; do
+    for item in "$snap_user_dir"/.*; do
         name=$(basename "$item")
-        [[ "$name" = "." || "$name" = ".." ]] && continue
+        [[ "$name" = "." || "$name" = ".." || "$name" = ".config" || "$name" = ".local" ]] && continue
         target="$HOME_DIR/$name"
         [ -f "$item" ] || continue
         if [ -e "$target" ] || [ -L "$target" ]; then
