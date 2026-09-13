@@ -226,7 +226,7 @@ declare -A GROUP_PKGS=(
     [clip]="copyq satty grim slurp"
     [media]="playerctl brightnessctl btop"
     [audio]="pipewire-pulse wireplumber"
-    [ime]="fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git"
+    [ime]="fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice"
     [fonts]="ttf-jetbrains-mono-nerd wqy-zenhei"
     [keyring]="gnome-keyring"
     [tools]="ripgrep zoxide bluetui"
@@ -427,14 +427,20 @@ ensure_aur_helper() {
 aur_install() { # $@ = AUR package names
     [ -n "$AUR_HELPER" ] || { error "no AUR helper available"; return 1; }
     local _sudo_file="/etc/sudoers.d/90-eilniri-aur"
-    echo "$TARGET_USER ALL=(ALL) NOPASSWD: /usr/bin/pacman" > "$_sudo_file"
+    echo "$TARGET_USER ALL=(ALL) NOPASSWD: ALL" > "$_sudo_file"
     chmod 440 "$_sudo_file"
     if ! visudo -cf "$_sudo_file" >/dev/null 2>&1; then
         rm -f "$_sudo_file"
         error "sudoers rule validation failed; skipping AUR install."
         return 1
     fi
-    as_user env HOME="$HOME_DIR" "$AUR_HELPER" -S --noconfirm --needed "$@"
+    local helper_flags=(--noconfirm --needed)
+    if [ "$AUR_HELPER" = "yay" ]; then
+        helper_flags+=(--answerclean None --answerdiff None --answeredit None --answerupgrade None)
+    elif [ "$AUR_HELPER" = "paru" ]; then
+        helper_flags+=(--skipreview)
+    fi
+    as_user env HOME="$HOME_DIR" PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}" "$AUR_HELPER" -S "${helper_flags[@]}" "$@"
     local rc=$?
     rm -f "$_sudo_file"
     return $rc
@@ -479,7 +485,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v40"
+PROGRESS_VERSION="v48"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -679,7 +685,7 @@ stage_apps_select() {
 
     # Chinese component selection
     if ! confirm "$(_t "Install Chinese IME (fcitx5+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):" "Install Chinese IME (fcitx5+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):")" "Y" 15; then
-        local _cn_exclude=(fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git wqy-zenhei)
+        local _cn_exclude=(fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice rime-ice-pinyin-git wqy-zenhei)
         local _tmp_arr=() _p
         for _p in ${REPO_UNIVERSE[@]+"${REPO_UNIVERSE[@]}"}; do
             local _keep=1 _ex
@@ -773,6 +779,25 @@ install_arch() {
         ensure_aur_helper
         log "$(_t "Installing " "Installing ") ${#aur_queue[@]} $(_t "AUR packages (this may compile for a while)..." "AUR packages (this may compile for a while)...")"
         install_batch aur_install "AUR" "${aur_queue[@]}"
+    fi
+
+    # waypaper fallback via pip if AUR helper failed to install it
+    local _has_waypaper=0
+    for p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        [ "$p" = "waypaper" ] && _has_waypaper=1
+    done
+    if [ "$_has_waypaper" -eq 1 ] && ! pkg_installed waypaper && ! command -v waypaper >/dev/null 2>&1 && [ ! -x "$HOME_DIR/.local/bin/waypaper" ]; then
+        log "$(_t "waypaper AUR install not ready, trying pip fallback..." "waypaper AUR install not ready, trying pip fallback...")"
+        pm_install python-pip python-gobject gtk3 2>/dev/null || true
+        if as_user pip install --user --break-system-packages waypaper 2>/dev/null || as_user pip install --user waypaper 2>/dev/null; then
+            INSTALLED_PKGS+=("waypaper (pip)")
+            _ensure_waypaper_desktop
+            local _new_failed=() _f
+            for _f in ${FAILED_PKGS[@]+"${FAILED_PKGS[@]}"}; do
+                [ "$_f" != "AUR:waypaper" ] && _new_failed+=("$_f")
+            done
+            FAILED_PKGS=(${_new_failed[@]+"${_new_failed[@]}"})
+        fi
     fi
 }
 
@@ -1024,6 +1049,60 @@ install_nerd_font() {
     fi
 }
 
+RIME_ICE_ZIP_URL="https://github.com/iDvel/rime-ice/releases/latest/download/full.zip"
+
+install_rime_ice() {
+    local _has_rime=0 _p
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        case "$_p" in rime-ice|rime-ice-pinyin-git) _has_rime=1; break ;; esac
+    done
+    [ "$_has_rime" -eq 1 ] || return 0
+
+    local dest="$HOME_DIR/.local/share/fcitx5/rime"
+    if [ -f "$dest/rime_ice.schema.yaml" ] || pkg_installed rime-ice || pkg_installed rime-ice-git; then
+        log "$(_t "rime-ice dictionary already present, skipping." "rime-ice dictionary already present, skipping.")"
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("rime-ice (dictionary deploy)")
+        return "$DRY_RUN_RC"
+    fi
+
+    mkdir -p "$dest"
+    log "$(_t "Deploying rime-ice dictionary (official release)..." "Deploying rime-ice dictionary (official release)...")"
+    local zipfile unzipdir
+    zipfile=$(mktemp)
+    unzipdir=$(mktemp -d)
+    register_temp_path "$zipfile"
+    register_temp_path "$unzipdir"
+
+    if _dl_gh_bounded "$RIME_ICE_ZIP_URL" "$zipfile" 120; then
+        if command -v unzip >/dev/null 2>&1; then
+            unzip -q -o "$zipfile" -d "$unzipdir" 2>/dev/null || true
+        else
+            python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$zipfile" "$unzipdir" 2>/dev/null || true
+        fi
+        local rime_root
+        rime_root=$(find "$unzipdir" -type f -name rime_ice.schema.yaml -printf '%h\n' 2>/dev/null | head -n 1)
+        if [ -n "$rime_root" ]; then
+            cp -r "$rime_root"/* "$dest/" 2>/dev/null || true
+            chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dest" 2>/dev/null || true
+            if [ -f "$dest/rime_ice.schema.yaml" ]; then
+                INSTALLED_PKGS+=("rime-ice (dictionary)")
+                success "$(_t "rime-ice dictionary deployed" "rime-ice dictionary deployed")"
+                local _new_failed=() _f
+                for _f in ${FAILED_PKGS[@]+"${FAILED_PKGS[@]}"}; do
+                    [ "$_f" != "AUR:rime-ice" ] && [ "$_f" != "AUR:rime-ice-pinyin-git" ] && _new_failed+=("$_f")
+                done
+                FAILED_PKGS=(${_new_failed[@]+"${_new_failed[@]}"})
+                return 0
+            fi
+        fi
+    fi
+    warn "$(_t "rime-ice dictionary deploy failed (optional); install manually: yay -S rime-ice" "rime-ice dictionary deploy failed (optional); install manually: yay -S rime-ice")"
+    return 1
+}
+
 # QEMU/KVM 虚拟机：安装并启用 spice-vdagent。
 # 解决两个常见问题：① 宿主机↔虚拟机 剪贴板/复制粘贴不通；② 光标在合成器下无硬件
 # cursor plane 时的拖影/残影（spice 提供客户端光标同步）。
@@ -1054,6 +1133,7 @@ stage_apps_install() {
     # baseline failure counts: the stage is only marked complete when nothing new failed
     local _bf=${#FAILED_PKGS[@]} _bm=${#MANUAL_ITEMS[@]}
     install_arch
+    install_rime_ice    # 雾凇拼音词库（AUR 或官方 Release zip 部署）
     install_nerd_font   # waybar 图标字体（Debian/RHEL 的 apt 包不带 Nerd Font 图标）
     install_vm_agent    # QEMU/虚拟机：spice-vdagent（剪贴板桥 + 光标同步）
     # Defer the progress mark while background builds (niri/awww) are still running
@@ -1258,7 +1338,7 @@ stage_dm() {
         fi
     fi
 
-    local known_dms=(gdm3 gdm sddm lxdm ly greetd plasma-login-manager lemurs)
+    local known_dms=(sddm gdm ly greetd lxdm plasma-login-manager lemurs)
     local dm_pkgs dm_unit
     dm_pkgs="ly"; dm_unit="ly@tty1"
 
@@ -1295,8 +1375,8 @@ stage_dm() {
     fi
 
     # --- install the chosen DM first; never disable the current one before the replacement is in place ---
-    local ok=0
-    for tried in "$dm_pkgs|$dm_unit" "gdm3|gdm3" "sddm|sddm"; do
+    local ok=0 tried
+    for tried in "$dm_pkgs|$dm_unit" "sddm|sddm" "gdm|gdm"; do
         local tpkg="${tried%%|*}" tunit="${tried##*|}"
         if pm_install "$tpkg"; then
             dm_pkgs="$tpkg"; dm_unit="$tunit"; ok=1
@@ -1312,26 +1392,26 @@ stage_dm() {
 
     # --- disable every known DM and the display-manager.service entry ---
     local dm
-    for dm in "${known_dms[@]}"; do
+    for dm in "${known_dms[@]}" gdm3 ly@tty1; do
         exe systemctl disable "$dm" 2>/dev/null || true
     done
-    if [ -e /etc/systemd/system/display-manager.service ]; then
+    if [ -e /etc/systemd/system/display-manager.service ] || [ -L /etc/systemd/system/display-manager.service ]; then
         exe systemctl disable display-manager.service 2>/dev/null || rm -f /etc/systemd/system/display-manager.service
+        rm -f /etc/systemd/system/display-manager.service 2>/dev/null || true
     fi
 
     # --- enable the chosen DM ---
     if exe systemctl enable "$dm_unit"; then
-        # verify: the unit must be enabled, and (except ly, which runs on tty1 directly)
-        # display-manager.service must point at the new DM
+        # verify: the unit must be enabled
         local _verify_ok=1
         if ! systemctl is-enabled --quiet "$dm_unit" 2>/dev/null; then
             _verify_ok=0
             warn "$(_t "Verification failed: " "Verification failed: ") $dm_unit $(_t "is not enabled." "is not enabled.")"
         fi
-        if [ "$dm_unit" != "ly@tty1" ] && [ -e /etc/systemd/system/display-manager.service ]; then
+        if [ -e /etc/systemd/system/display-manager.service ]; then
             local _dm_link
             _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
-            if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
+            if [ "$(basename "$_dm_link" .service)" != "${dm_unit%%@*}" ]; then
                 _verify_ok=0
                 warn "$(_t "Verification failed: display-manager.service points to " "Verification failed: display-manager.service points to ") ${_dm_link:-unknown}$(_t ", expected " ", expected ") $dm_unit"
             fi
@@ -1550,6 +1630,7 @@ deploy_one() { # $1 = source path, $2 = destination path, $3 = timestamp
         fi
         return 0
     fi
+    mkdir -p "$(dirname "$dst")"
     if [ -e "$dst" ] || [ -L "$dst" ]; then
         log "$(_t "Backup existing: " "Backup existing: ")$dst -> $dst.bak-$ts"
         exe mv "$dst" "$dst.bak-$ts"
@@ -1654,6 +1735,8 @@ stage_configs() {
     shopt -s nullglob dotglob
     local item name
     # ~/.config/<name>
+    mkdir -p "$HOME_DIR/.config"
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config" 2>/dev/null || true
     for item in "$snap/.config"/*; do
         name=$(basename "$item")
         if is_privacy_risk "$item"; then
@@ -1830,8 +1913,19 @@ IMEEOF
     # oh-my-zsh + starship + eza + bat (the runtime configs/.zshrc needs)
     install_zsh_extras
 
-    success "$(_t "Config deploy complete." "Config deploy complete.")"
-    stage_mark configs
+    local _cfg_missing=0 _d
+    for _d in niri waybar kitty mako hypr; do
+        if [ ! -e "$HOME_DIR/.config/$_d" ]; then
+            _cfg_missing=1
+            break
+        fi
+    done
+    if [ "$_cfg_missing" -eq 0 ]; then
+        success "$(_t "Config deploy complete." "Config deploy complete.")"
+        stage_mark configs
+    else
+        warn "$(_t "Some configs failed to deploy, stage not marked complete. Rerun will retry." "Some configs failed to deploy, stage not marked complete. Rerun will retry.")"
+    fi
 }
 
 # --- 4.7b disable system components from other desktop environments ---
@@ -2134,10 +2228,28 @@ stage_verify() {
 
     # package audit
     local all_sel=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
-    if [ ${#all_sel[@]} -gt 0 ]; then
+    local audit_pkgs=()
+    for p in ${all_sel[@]+"${all_sel[@]}"}; do
+        case "$p" in
+            waypaper)
+                if ! command -v waypaper >/dev/null 2>&1 && [ ! -x "$HOME_DIR/.local/bin/waypaper" ] && ! pkg_installed waypaper; then
+                    missing+=("waypaper")
+                fi
+                ;;
+            rime-ice|rime-ice-pinyin-git)
+                if [ ! -f "$HOME_DIR/.local/share/fcitx5/rime/rime_ice.schema.yaml" ] && ! pkg_installed rime-ice && ! pkg_installed rime-ice-git; then
+                    missing+=("rime-ice")
+                fi
+                ;;
+            *)
+                audit_pkgs+=("$p")
+                ;;
+        esac
+    done
+    if [ ${#audit_pkgs[@]} -gt 0 ]; then
         local m
-        m=$(pacman -T "${all_sel[@]}" 2>/dev/null) && true
-        [ -n "$m" ] && mapfile -t missing <<< "$m"
+        m=$(pacman -T "${audit_pkgs[@]}" 2>/dev/null) && true
+        [ -n "$m" ] && mapfile -t -O "${#missing[@]}" missing <<< "$m"
     fi
     if [ ${#missing[@]} -gt 0 ]; then
         warn "$(_t "Selected packages failed to install:" "Selected packages failed to install:")"
@@ -2156,8 +2268,13 @@ stage_verify() {
             cfg_errors=$((cfg_errors+1))
         fi
     done
-    [ "$cfg_errors" -eq 0 ] && success "$(_t "Config audit passed." "Config audit passed.")" || warn "$cfg_errors critical config directories missing."
-    stage_mark verify
+    if [ "$cfg_errors" -eq 0 ] && [ ${#missing[@]} -eq 0 ]; then
+        success "$(_t "Config audit passed." "Config audit passed.")"
+        stage_mark verify
+    else
+        [ "$cfg_errors" -gt 0 ] && warn "$cfg_errors critical config directories missing."
+        warn "$(_t "Verification has failures; stage not marked complete." "Verification has failures; stage not marked complete.")"
+    fi
 }
 
 # --- 4.10 summary report ---
@@ -2416,17 +2533,32 @@ boot_env_check() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     section "$(_t "Boot Environment Check" "Boot Environment Check")" "$(_t "default target & display manager" "default target & display manager")"
     info_kv "$(_t "Default Target" "Default Target")" "$(systemctl get-default 2>/dev/null || echo unknown)" "$(_t "(must be graphical.target)" "(must be graphical.target)")"
+    local _dm_name=""
     if [ -e /etc/systemd/system/display-manager.service ]; then
         local _dl
         _dl=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo unknown)
-        info_kv "$(_t "Display Manager" "Display Manager")" "$(basename "$_dl")" "display-manager.service → $_dl"
+        _dm_name=$(basename "$_dl" .service)
+        info_kv "$(_t "Display Manager" "Display Manager")" "$_dm_name" "display-manager.service → $_dl"
     else
-        info_kv "$(_t "Display Manager" "Display Manager")" "$(_t "none configured" "none configured")" "$(_t "display-manager.service missing — boot will stay at a tty" "display-manager.service missing — boot will stay at a tty")"
+        local _found_dm=""
+        for _dm in sddm gdm3 gdm ly ly@tty1; do
+            if systemctl is-enabled --quiet "$_dm" 2>/dev/null; then
+                _found_dm="$_dm"
+                _dm_name="${_dm%%@*}"
+                break
+            fi
+        done
+        if [ -n "$_found_dm" ]; then
+            info_kv "$(_t "Display Manager" "Display Manager")" "$_found_dm" "enabled (direct service)"
+        else
+            info_kv "$(_t "Display Manager" "Display Manager")" "$(_t "none configured" "none configured")" "$(_t "display-manager.service missing — boot will stay at a tty" "display-manager.service missing — boot will stay at a tty")"
+        fi
     fi
     local _dm
-    for _dm in sddm gdm3 gdm ly; do
+    for _dm in sddm gdm3 gdm ly ly@tty1; do
         if systemctl is-enabled --quiet "$_dm" 2>/dev/null; then
             info_kv "$(_t "Enabled DM" "Enabled DM")" "$_dm" ""
+            [ -z "$_dm_name" ] && _dm_name="${_dm%%@*}"
             break
         fi
     done
@@ -2458,12 +2590,10 @@ boot_env_check() {
     info_kv "$(_t "Sessions (all)" "Sessions (all)")" "${_sessions:-none}" "$(_t "(niri present if niri.desktop listed)" "(niri present if niri.desktop listed)")"
 
     # final assertion: will the display manager actually boot into niri?
-    local _dm_name="?"
-    if [ -e /etc/systemd/system/display-manager.service ]; then
-        _dm_name=$(basename "$(readlink -f /etc/systemd/system/display-manager.service)" .service)
-    fi
+    [ -z "$_dm_name" ] && _dm_name="?"
     local _boot_ok=1 _reason=""
     [ -z "$_niri_desktop" ] && { _boot_ok=0; _reason="niri.desktop not registered (build incomplete)"; }
+    [ "$_dm_name" = "?" ] && { _boot_ok=0; [ -n "$_reason" ] && _reason="$_reason; "; _reason="${_reason}no display manager enabled"; }
     # gdm(-like) DMs pick the default session via AccountsService; ly remembers the
     # last session at the greeter, so only the session registration matters there.
     case "$_dm_name" in
