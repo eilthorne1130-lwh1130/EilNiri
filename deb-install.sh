@@ -62,7 +62,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.34"
+SCRIPT_VERSION="1.9.35"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -600,7 +600,10 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v47"
+# v48: download/stage-wait fixes — progress files written by the buggy v47 build
+# may contain a wrongly-marked `apps` stage (niri skipped forever); invalidating the
+# old marker forces one clean rerun that re-attempts niri.
+PROGRESS_VERSION="v48"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -945,6 +948,33 @@ _patch_niri_user_units() {
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
 }
 
+# CopyQ 主窗口启动弹窗的根修（CopyQ #3567/#3573）：niri 没有系统托盘，CopyQ 在
+# “无托盘 + hide_main_window 未开启（默认）”时 hideWindow() 会退化成 showMinimized()，
+# 在 wlroots 系合成器（niri/Hyprland）上这会把从未映射过的主窗口直接显示出来
+# （`copyq --start-server` 弹窗、niri config 里追加的 "hide" 参数不生效的共同根源）。
+# 在 ~/.config/copyq/copyq.conf 预置 hide_main_window=true，hide 路径才会走真正的
+# hide()；Super+Ctrl+V（copyq toggle）呼出主窗口走 showWindow()，不受影响。
+# 幂等：只在键缺失/为 false 时改动，不覆盖用户其余配置；CopyQ 未安装时写入无副作用。
+configure_copyq_hidden_window() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _cqconf="$HOME_DIR/.config/copyq/copyq.conf"
+    mkdir -p "$(dirname "$_cqconf")"
+    if [ ! -f "$_cqconf" ]; then
+        printf '[General]\nhide_main_window=true\n' > "$_cqconf"
+        log "$(_t "Created ~/.config/copyq/copyq.conf (hide_main_window=true; no CopyQ window at startup)" "Created ~/.config/copyq/copyq.conf (hide_main_window=true; no CopyQ window at startup)")"
+    elif ! grep -q '^hide_main_window=true' "$_cqconf" 2>/dev/null; then
+        if grep -q '^hide_main_window=' "$_cqconf" 2>/dev/null; then
+            sed -i 's/^hide_main_window=.*/hide_main_window=true/' "$_cqconf" 2>/dev/null || true
+        elif grep -q '^\[General\]' "$_cqconf" 2>/dev/null; then
+            sed -i '0,/^\[General\]/s//&\nhide_main_window=true/' "$_cqconf" 2>/dev/null || true
+        else
+            sed -i '1i [General]\nhide_main_window=true' "$_cqconf" 2>/dev/null || true
+        fi
+        log "$(_t "Set hide_main_window=true in ~/.config/copyq/copyq.conf (no CopyQ window at startup)" "Set hide_main_window=true in ~/.config/copyq/copyq.conf (no CopyQ window at startup)")"
+    fi
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cqconf" 2>/dev/null || true
+}
+
 # Idempotent: strip injected mode "WxH@60", drop software-GL env, point the
 # session desktop at the wrapper. Safe to run on every restore (including
 # machines that already have niri installed from Ubuntu's repo).
@@ -964,9 +994,12 @@ repair_niri_blackscreen() {
         sed -i 's#spawn-at-startup "swww-daemon"#spawn-at-startup "awww-daemon"#' "$cfg" 2>/dev/null || true
         # 首次启动空白窗口修复（两问合一）：
         # 1) CopyQ #3567 — `copyq --start-server` 在无托盘合成器（niri 没有系统托盘）
-        #    且 hide-main-window 配置晚于托盘初始化加载的版本上，主窗口会被显示出来；
-        #    追加 "hide" 让客户端在 server 就绪后立即隐藏主窗口。
+        #    时会弹出主窗口。根修是 configure_copyq_hidden_window 写入的
+        #    hide_main_window=true（否则 hideWindow() 退化为 showMinimized()，
+        #    在 niri/wlroots 上等于把窗口显示出来）；此处追加的 "hide" 参数
+        #    仅作为 15.0.0 加载时序 bug（配置晚于托盘初始化读取）的兜底。
         sed -i 's#^\([[:space:]]*spawn-at-startup "copyq" "--start-server"\)$#\1 "hide"#' "$cfg" 2>/dev/null || true
+        configure_copyq_hidden_window
         # 2) xwaylandvideobridge（Wayland→X 录屏桥）登录时出现的空白窗（niri #2367
         #    同款）——窗口规则设为全透明，不影响其录屏桥接功能。
         if ! grep -q 'xwaylandvideobridge' "$cfg" 2>/dev/null; then
@@ -1505,28 +1538,53 @@ try_dl() { # $1 = URL, $2 = output file; returns 0 on success
     rc=$?
     if [ "$rc" -eq 33 ]; then
         rm -f "$out"
-        curl "${CURL_DL_FLAGS[@]}" -o "$out" "$url" 2>/dev/null
+        # restart WITHOUT resume: strip the trailing "-C -" pair from CURL_DL_FLAGS
+        # (the old code re-passed the array, so "-C -" was still in effect and the
+        # "fresh start" silently resumed against the just-deleted file).
+        local _n=${#CURL_DL_FLAGS[@]} _clean=()
+        if [ "$_n" -ge 2 ] && [ "${CURL_DL_FLAGS[_n-2]}" = "-C" ] && [ "${CURL_DL_FLAGS[_n-1]}" = "-" ]; then
+            _clean=("${CURL_DL_FLAGS[@]:0:$((_n - 2))}")
+        else
+            _clean=("${CURL_DL_FLAGS[@]}")
+        fi
+        curl "${_clean[@]}" -o "$out" "$url" 2>/dev/null
         rc=$?
     fi
-    [ "$rc" -eq 0 ] && [ -s "$out" ] && archive_is_valid "$out" || return "${rc:-1}"
-}
-
-download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the curl exit code
-    local url="$1" out="$2"
-    if try_dl "$url" "$out"; then
+    # CRITICAL: curl exit 0 does NOT mean we got the real payload — CN proxies and
+    # captive portals happily answer 200 with an HTML error page or an empty body.
+    # The old tail expression `... || return "${rc:-1}"` returned 0 (rc is 0!) when
+    # only archive_is_valid failed, so garbage was treated as a successful download,
+    # niri extraction failed, and the whole install broke. Treat an invalid payload
+    # as a hard failure with a non-zero code.
+    if [ "$rc" -eq 0 ] && [ -s "$out" ] && archive_is_valid "$out"; then
         return 0
     fi
-    local rc=$?
+    [ "$rc" -ne 0 ] || rc=1   # curl OK but payload invalid/empty -> non-zero failure
+    return "$rc"
+}
+
+download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the failure code
+    local url="$1" out="$2" rc=0
+    # NOTE: `try_dl ... || rc=$?` on purpose. `if try_dl; then return 0; fi` +
+    # `local rc=$?` would always capture 0 (an `if` with no else resets $? per
+    # POSIX), making download_gh report SUCCESS for total failures — the root
+    # cause of "niri downloaded garbage / extraction failed" reports.
+    try_dl "$url" "$out" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        return 0
+    fi
     # direct download failed — try mirror proxies (CN-friendly; configurable via EILNIRI_GH_PROXY)
-    log "$(_t "Direct download failed (curl " "Direct download failed (curl ") $rc), trying mirror proxies..."
+    log "$(_t "Direct download failed (code " "Direct download failed (code ") $rc), trying mirror proxies..."
     local proxy prefix
     for proxy in ${EILNIRI_GH_PROXY:-${GH_MIRRORS:-}}; do
         prefix="${proxy%/}"
-        if try_dl "${prefix}/${url}" "$out"; then
+        local _prc=0
+        try_dl "${prefix}/${url}" "$out" || _prc=$?
+        if [ "$_prc" -eq 0 ]; then
             return 0
         fi
     done
-    log "$(_t "Download failed after all proxies (last curl exit code: " "Download failed after all proxies (last curl exit code: ") $rc)"
+    log "$(_t "Download failed after all proxies (last failure code: " "Download failed after all proxies (last failure code: ") $rc)"
     return "$rc"
 }
 
@@ -2025,13 +2083,16 @@ install_niri_binary() {
     
     local _dl_attempts=3 _dl_delay=15 _dlrc=0
     for (( _attempt=1; _attempt<=$_dl_attempts; _attempt++ )); do
-        if download_gh "$url" "$tmp"; then
-            _dlrc=0
+        # `|| _dlrc=$?` (not `if`+`$?`): an if-construct with no else resets $?
+        # to 0, which used to make the guard below never trigger and the build
+        # start from a missing/corrupt tarball.
+        _dlrc=0
+        download_gh "$url" "$tmp" || _dlrc=$?
+        if [ "$_dlrc" -eq 0 ]; then
             break
         fi
-        _dlrc=$?
         if [ "$_attempt" -lt "$_dl_attempts" ]; then
-            log "$(_t "Download attempt $_attempt/$_dl_attempts failed (code $?), retrying in ${_dl_delay}s..." "Download attempt $_attempt/$_dl_attempts failed (code $?), retrying in ${_dl_delay}s...")"
+            log "$(_t "Download attempt $_attempt/$_dl_attempts failed (code $_dlrc), retrying in ${_dl_delay}s..." "Download attempt $_attempt/$_dl_attempts failed (code $_dlrc), retrying in ${_dl_delay}s...")"
             sleep "$_dl_delay"
         fi
     done
@@ -2092,11 +2153,11 @@ install_niri_binary() {
         url="$NIRI_GH/download/v${ver}/niri-${ver}-vendored-dependencies.tar.xz"
         
         for (( _vattempt=1; _vattempt<=$_vdl_attempts; _vattempt++ )); do
-            if download_gh "$url" "$vtmp"; then
-                _vdlrc=0
+            _vdlrc=0
+            download_gh "$url" "$vtmp" || _vdlrc=$?
+            if [ "$_vdlrc" -eq 0 ]; then
                 break
             fi
-            _vdlrc=$?
             if [ "$_vattempt" -lt "$_vdl_attempts" ]; then
                 log "$(_t "Vendored deps download attempt $_vattempt/$_vdl_attempts failed (code $_vdlrc), retrying in ${_vdl_delay}s..." "Vendored deps download attempt $_vattempt/$_vdl_attempts failed (code $_vdlrc), retrying in ${_vdl_delay}s...")"
                 sleep "$_vdl_delay"
@@ -2382,11 +2443,11 @@ install_awww() {
     # 在大陆网络下成功率高得多。仍保留一层重试（clone 半途断连时重来）。
     local _clone_attempts=2 _clone_delay=10 _clonerc=0
     for (( _cattempt=1; _cattempt<=$_clone_attempts; _cattempt++ )); do
-        if git_clone_gh "$AWWW_REPO" "$work/awww"; then
-            _clonerc=0
+        _clonerc=0
+        git_clone_gh "$AWWW_REPO" "$work/awww" || _clonerc=$?
+        if [ "$_clonerc" -eq 0 ]; then
             break
         fi
-        _clonerc=$?
         if [ "$_cattempt" -lt "$_clone_attempts" ]; then
             log "$(_t "Clone attempt $_cattempt/$_clone_attempts failed, retrying in ${_clone_delay}s..." "Clone attempt $_cattempt/$_clone_attempts failed, retrying in ${_clone_delay}s...")"
             sleep "$_clone_delay"
@@ -2405,7 +2466,7 @@ install_awww() {
     awww_cmd="cd '$work/awww' && PKG_CONFIG_PATH='${PKG_CONFIG_PATH:-}' PKG_CONFIG_LIBDIR='${PKG_CONFIG_LIBDIR:-}' WAYLAND_PROTOCOLS_DIR='${WAYLAND_PROTOCOLS_DIR:-}' cargo build --release --workspace -j $(cargo_jobs)"
     ram_mb=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
     if [ "${ram_mb:-0}" -lt 8192 ] && [ ${#BG_JOBS[@]} -gt 0 ]; then
-        niri_pid=$(echo "${BG_JOBS[0]}" | awk '{print $2}')
+        niri_pid=$(echo "${BG_JOBS[0]}" | awk -F'|' '{print $2}')
         awww_cmd="while kill -0 '$niri_pid' 2>/dev/null; do sleep 15; done; $awww_cmd"
         log "$(_t "Low RAM detected: awww build will wait for niri to finish first." "Low RAM detected: awww build will wait for niri to finish first.")"
     fi
@@ -4031,11 +4092,11 @@ install_satty() {
     
     local _satty_attempts=3 _satty_delay=10 _sattyrc=0
     for (( _sattempt=1; _sattempt<=$_satty_attempts; _sattempt++ )); do
-        if download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; then
-            _sattyrc=0
+        _sattyrc=0
+        { download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; } || _sattyrc=$?
+        if [ "$_sattyrc" -eq 0 ]; then
             break
         fi
-        _sattyrc=$?
         if [ "$_sattempt" -lt "$_satty_attempts" ]; then
             log "$(_t "Satty download attempt $_sattempt/$_satty_attempts failed, retrying in ${_satty_delay}s..." "Satty download attempt $_sattempt/$_satty_attempts failed, retrying in ${_satty_delay}s...")"
             sleep "$_satty_delay"
@@ -4228,11 +4289,11 @@ install_rime_ice() {
     _rime_asset=$(github_release_asset iDvel/rime-ice '(^|/)full\.zip$' 2>/dev/null || true)
     [ -n "$_rime_asset" ] && RIME_ICE_ZIP_URL="$_rime_asset"
     for (( _rattempt=1; _rattempt<=$_rime_attempts; _rattempt++ )); do
-        if download_gh "$RIME_ICE_ZIP_URL" "$zipfile"; then
-            _rimerc=0
+        _rimerc=0
+        download_gh "$RIME_ICE_ZIP_URL" "$zipfile" || _rimerc=$?
+        if [ "$_rimerc" -eq 0 ]; then
             break
         fi
-        _rimerc=$?
         if [ "$_rattempt" -lt "$_rime_attempts" ]; then
             log "$(_t "Rime-ice download attempt $_rattempt/$_rime_attempts failed, retrying in ${_rime_delay}s..." "Rime-ice download attempt $_rattempt/$_rime_attempts failed, retrying in ${_rime_delay}s...")"
             sleep "$_rime_delay"
@@ -5060,7 +5121,7 @@ stage_wait_builds() {
     fi
     section "$(_t "Background Builds" "Background Builds")" "$(_t "waiting for cargo builds (niri/awww)" "waiting for cargo builds (niri/awww)")"
     log "$(_t "Run './deb-install.sh status' in another terminal to watch progress live." "Run './deb-install.sh status' in another terminal to watch progress live.")"
-    local entry name pid logfile srcdir rc tailmsg start now prog any_failed=0
+    local entry name pid logfile srcdir rc _irc tailmsg start now prog any_failed=0
     for entry in "${BG_JOBS[@]}"; do
         IFS='|' read -r name pid logfile srcdir <<< "$entry"
         log "$(_t "Waiting for " "Waiting for ") $name $(_t " build..." " build...")"
@@ -5077,11 +5138,21 @@ stage_wait_builds() {
         done
         rc=0
         wait "$pid" 2>/dev/null || rc=$?
+        _irc=0
         if [ "$rc" -eq 0 ]; then
+            # A zero build exit code is NOT enough: the produced binary must
+            # actually install. The old code ignored install_*_from_build's
+            # return value, so a finished-but-unusable build still marked the
+            # apps stage complete — every rerun then printed "App install stage
+            # done, skipping." while niri was never installed.
             case "$name" in
-                niri) install_niri_from_build "$srcdir" "$logfile" ;;
-                awww) install_awww_from_build "$srcdir" "$logfile" ;;
+                niri) install_niri_from_build "$srcdir" "$logfile" || _irc=$? ;;
+                awww) install_awww_from_build "$srcdir" "$logfile" || _irc=$? ;;
             esac
+            if [ "$_irc" -ne 0 ]; then
+                any_failed=1
+                warn "$(_t "Background build finished but installing " "Background build finished but installing ") $name $(_t " failed — the apps stage will be retried on the next run (see log " " failed — the apps stage will be retried on the next run (see log ") $logfile)"
+            fi
         else
             any_failed=1
             tailmsg=$(tail -n 8 "$logfile" 2>/dev/null | tr '\n' ' ')
@@ -5654,8 +5725,10 @@ stage_configs() {
             sed -i 's#polkit-gnome-authenntication-agent-1#polkit-gnome-authentication-agent-1#g' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
             sed -i 's#spawn-at-startup "swww-daemon"#spawn-at-startup "awww-daemon"#' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
             # 空白窗口修复：copyq 主窗口隐藏（CopyQ #3567）+ xwaylandvideobridge 透明
-            # （与 repair_niri_blackscreen 同一套幂等补丁，此处覆盖刚部署的快照配置）
+            # （与 repair_niri_blackscreen 同一套幂等补丁，此处覆盖刚部署的快照配置；
+            #   根修 hide_main_window=true 见 configure_copyq_hidden_window）
             sed -i 's#^\([[:space:]]*spawn-at-startup "copyq" "--start-server"\)$#\1 "hide"#' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
+            configure_copyq_hidden_window
             if ! grep -q 'xwaylandvideobridge' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
                 printf '\n// eilNiri: xwaylandvideobridge shows a blank window at startup (opacity 0 = invisible)\nwindow-rule {\n    match app-id="xwaylandvideobridge"\n    opacity 0.0\n}\n' >> "$HOME_DIR/.config/niri/config.kdl"
             fi
