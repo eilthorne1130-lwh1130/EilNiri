@@ -402,7 +402,39 @@ ensure_aur_helper() {
     fi
     chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_src"
     if ! as_user bash -c "cd '$_src/yay' && makepkg -f --noconfirm" >>"$LOG_DIR/yay-build.log" 2>&1; then
-        MANUAL_ITEMS+=("yay — makepkg build failed (see $LOG_DIR/yay-build.log)")
+        warn "$(_t "yay makepkg failed; trying pre-built binary fallback..." "yay makepkg failed; trying pre-built binary fallback...")"
+        # --- pre-built binary fallback: download official release tarball ---
+        local _arch _ver _yay_dl _yay_tar _yay_exe
+        _arch=$(uname -m)
+        _ver=$(curl -s --max-time 15 https://api.github.com/repos/Jguer/yay/releases/latest 2>/dev/null \
+              | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')
+        if [ -z "$_ver" ]; then
+            warn "$(_t "Cannot resolve yay latest version from GitHub API" "Cannot resolve yay latest version from GitHub API")"
+        else
+            case "$_arch" in
+                x86_64)        _yay_dl="https://github.com/Jguer/yay/releases/download/v${_ver}/yay_${_ver}_x86_64.tar.gz" ;;
+                aarch64)       _yay_dl="https://github.com/Jguer/yay/releases/download/v${_ver}/yay_${_ver}_aarch64.tar.gz" ;;
+                armv7h|armv7l) _yay_dl="https://github.com/Jguer/yay/releases/download/v${_ver}/yay_${_ver}_armv7h.tar.gz" ;;
+                *)             _yay_dl="" ;;
+            esac
+        fi
+        if [ -n "${_yay_dl:-}" ]; then
+            _yay_tar="$_src/yay-prebuilt.tar.gz"
+            if _dl_gh_bounded "$_yay_dl" "$_yay_tar" 120; then
+                tar xzf "$_yay_tar" -C "$_src" 2>/dev/null || true
+                _yay_exe=$(find "$_src" -maxdepth 2 -type f -name 'yay' | head -n 1)
+                if [ -n "$_yay_exe" ]; then
+                    install -m 755 "$_yay_exe" /usr/local/bin/yay
+                    if command -v yay &>/dev/null; then
+                        AUR_HELPER=yay
+                        INSTALLED_PKGS+=("yay (AUR helper, prebuilt binary v${_ver})")
+                        success "$(_t "AUR helper ready: yay (pre-built v" "AUR helper ready: yay (pre-built v")${_ver})"
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+        MANUAL_ITEMS+=("yay — makepkg build failed (see $LOG_DIR/yay-build.log) and pre-built binary download also failed; install manually: https://github.com/Jguer/yay/releases")
         return 1
     fi
     local _pkg
@@ -789,14 +821,34 @@ install_arch() {
     if [ "$_has_waypaper" -eq 1 ] && ! pkg_installed waypaper && ! command -v waypaper >/dev/null 2>&1 && [ ! -x "$HOME_DIR/.local/bin/waypaper" ]; then
         log "$(_t "waypaper AUR install not ready, trying pip fallback..." "waypaper AUR install not ready, trying pip fallback...")"
         pm_install python-pip python-gobject gtk3 2>/dev/null || true
-        if as_user pip install --user --break-system-packages waypaper 2>/dev/null || as_user pip install --user waypaper 2>/dev/null; then
-            INSTALLED_PKGS+=("waypaper (pip)")
+        # Detect available pip command (Arch exposes pip or pip3)
+        local _pip=""
+        command -v pip  >/dev/null 2>&1 && _pip="pip"
+        command -v pip3 >/dev/null 2>&1 && _pip="pip3"
+        local _wp_ok=0
+        if [ -n "$_pip" ]; then
+            if as_user env HOME="$HOME_DIR" "$_pip" install --user --break-system-packages waypaper 2>/dev/null \
+            || as_user env HOME="$HOME_DIR" "$_pip" install --user waypaper 2>/dev/null; then
+                _wp_ok=1
+            fi
+        fi
+        # pipx fallback: isolates deps and avoids managed-env restriction
+        if [ "$_wp_ok" -eq 0 ]; then
+            pm_install python-pipx 2>/dev/null || true
+            if command -v pipx >/dev/null 2>&1; then
+                as_user env HOME="$HOME_DIR" pipx install waypaper 2>/dev/null && _wp_ok=1
+            fi
+        fi
+        if [ "$_wp_ok" -eq 1 ]; then
+            INSTALLED_PKGS+=("waypaper (pip/pipx)")
             _ensure_waypaper_desktop
             local _new_failed=() _f
             for _f in ${FAILED_PKGS[@]+"${FAILED_PKGS[@]}"}; do
                 [ "$_f" != "AUR:waypaper" ] && _new_failed+=("$_f")
             done
             FAILED_PKGS=(${_new_failed[@]+"${_new_failed[@]}"})
+        else
+            warn "$(_t "waypaper: AUR + pip/pipx all failed." "waypaper: AUR + pip/pipx all failed.") Manual: pip install waypaper"
         fi
     fi
 }
