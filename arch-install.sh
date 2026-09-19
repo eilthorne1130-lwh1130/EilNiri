@@ -1269,6 +1269,36 @@ RIMEDCEOF
     log "$(_t "Wrote rime default.custom.yaml (schema_list -> rime_ice)" "Wrote rime default.custom.yaml (schema_list -> rime_ice)")"
 }
 
+# --- IME 完备性修复 ---
+# fcitx5 能启动但打不出中文的常见原因：拼音后端（fcitx5-rime/librime/rime 数据）
+# 或图形界面组件（configtool、GTK/Qt 输入法模块）任一缺失。逐项检查并补装。
+ensure_ime_complete() {
+    local _has_ime=0 _p
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        case "$_p" in fcitx5|fcitx5-*) _has_ime=1; break ;; esac
+    done
+    [ "$_has_ime" -eq 1 ] || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("IME deps audit (fcitx5-rime/fcitx5-gtk/fcitx5-qt/configtool/librime)")
+        return "$DRY_RUN_RC"
+    fi
+    local _ime_missing=()
+    for _p in fcitx5 fcitx5-rime fcitx5-gtk fcitx5-qt fcitx5-configtool librime; do
+        pkg_installed "$_p" || _ime_missing+=("$_p")
+    done
+    if [ ${#_ime_missing[@]} -gt 0 ]; then
+        warn "$(_t "IME components missing, repairing: " "IME components missing, repairing: ")${_ime_missing[*]}"
+        install_batch pm_install "ime-repair" "${_ime_missing[@]}"
+    fi
+    # 拼音数据兼底：fcitx5-rime 在而 rime 数据不在 = 只能打英文。install_rime_ice
+    # 现在会检测残缺部署并重部。
+    if [ ! -f "$HOME_DIR/.local/share/fcitx5/rime/rime_ice.schema.yaml" ] \
+        && ! pkg_installed rime-ice-pinyin-git && ! pkg_installed rime-ice && ! pkg_installed rime-ice-git; then
+        warn "$(_t "rime data missing — redeploying rime-ice..." "rime data missing — redeploying rime-ice...")"
+        install_rime_ice || MANUAL_ITEMS+=("rime-ice 数据部署失败 — 无法输入中文；手动: yay -S rime-ice-pinyin-git")
+    fi
+}
+
 # QEMU/KVM 虚拟机：安装并启用 spice-vdagent。
 # 解决两个常见问题：① 宿主机↔虚拟机 剪贴板/复制粘贴不通；② 光标在合成器下无硬件
 # cursor plane 时的拖影/残影（spice 提供客户端光标同步）。
@@ -1300,6 +1330,7 @@ stage_apps_install() {
     local _bf=${#FAILED_PKGS[@]} _bm=${#MANUAL_ITEMS[@]}
     install_arch
     install_rime_ice    # 雾凇拼音词库（AUR 或官方 Release zip 部署）
+    ensure_ime_complete # IME 完备性修复：拼音后端/GTK-Qt 模块/configtool 任一缺失都无法输入中文
     install_nerd_font   # waybar 图标字体（Debian/RHEL 的 apt 包不带 Nerd Font 图标）
     install_vm_agent    # QEMU/虚拟机：spice-vdagent（剪贴板桥 + 光标同步）
     # Defer the progress mark while background builds (niri/awww) are still running
@@ -2510,6 +2541,29 @@ stage_verify() {
         for p in "${missing[@]}"; do echo -e "     ${H_RED}->${NC} ${H_YELLOW}$p${NC}"; done
     else
         success "$(_t "Package audit passed." "Package audit passed.")"
+    fi
+
+    # IME 组件审计：拼音后端（fcitx5-rime/librime/rime 数据）或图形界面组件
+    # （configtool、GTK/Qt 输入法模块）任一缺失，都会“fcitx5 能启动但无法输入中文”。
+    local _ime_sel=0 _p
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        case "$_p" in fcitx5|fcitx5-*) _ime_sel=1; break ;; esac
+    done
+    if [ "$_ime_sel" -eq 1 ]; then
+        local _ime_missing=()
+        for _p in fcitx5 fcitx5-rime fcitx5-gtk fcitx5-qt fcitx5-configtool librime; do
+            pkg_installed "$_p" || _ime_missing+=("$_p")
+        done
+        if [ ! -f "$HOME_DIR/.local/share/fcitx5/rime/rime_ice.schema.yaml" ] \
+            && ! pkg_installed rime-ice-pinyin-git && ! pkg_installed rime-ice && ! pkg_installed rime-ice-git; then
+            _ime_missing+=("rime-data")
+        fi
+        if [ ${#_ime_missing[@]} -gt 0 ]; then
+            warn "$(_t "IME components missing (Chinese input will NOT work): " "IME components missing (Chinese input will NOT work): ")${_ime_missing[*]}"
+            warn "$(_t "  fix: rerun restore, or manually: pacman -S fcitx5-rime fcitx5-gtk fcitx5-qt fcitx5-configtool librime && yay -S rime-ice-pinyin-git" "  fix: rerun restore, or manually: pacman -S fcitx5-rime fcitx5-gtk fcitx5-qt fcitx5-configtool librime && yay -S rime-ice-pinyin-git")"
+        else
+            success "$(_t "IME components complete (fcitx5 + rime backend + GTK/Qt modules)." "IME components complete (fcitx5 + rime backend + GTK/Qt modules).")"
+        fi
     fi
 
     # ~/.local/state 权限审计：waypaper/fcitx5 等登录后要往里写状态目录；若归 root
