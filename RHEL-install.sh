@@ -92,6 +92,14 @@ if [ -n "$_LOG_USER" ] && [ "$_LOG_USER" != "root" ]; then
 fi
 [ -z "$_LOG_HOME" ] && _LOG_HOME="$HOME"
 LOG_DIR="${XDG_STATE_HOME:-$_LOG_HOME/.local/state}/eilNiri"
+# 以 sudo 运行时，mkdir 会在真实用户家目录下创建 ~/.local / ~/.local/state（若尚不存在），
+# 且属主是 root。waypaper 等程序登录后以普通用户身份在其中创建状态目录，属主不对就
+# PermissionError 崩溃 → GUI 打不开、壁纸失效。这里立即把新创建的层级归还给真实用户。
+if [ -n "$_LOG_USER" ] && [ "$_LOG_USER" != "root" ] && [ -d "$_LOG_HOME/.local/state" ]; then
+    chown "$_LOG_USER:$(id -gn "$_LOG_USER" 2>/dev/null || echo "$_LOG_USER")" \
+        "$_LOG_HOME/.local" "$_LOG_HOME/.local/state" 2>/dev/null || true
+    chown -R "$_LOG_USER" "$LOG_DIR" 2>/dev/null || true
+fi
 unset _LOG_USER _LOG_HOME
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 export TEMP_LOG_FILE="$LOG_DIR/replicate.log"
@@ -3114,6 +3122,36 @@ deploy_one() { # $1 = source path, $2 = destination path
     exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dst"
 }
 
+is_privacy_risk() { # $1 = path inside configs/
+    local p="$1" b
+    b=$(basename "$p")
+    case "$p" in
+        *copyq*|*QtProject.conf*|*__pycache__*|*cached_layouts*|*/rime/*) return 0 ;;
+    esac
+    case "$b" in
+        copyq.lock|*.dat|*.log|*.sqlite|*.db) return 0 ;;
+    esac
+    return 1
+}
+
+# --- ~/.local/state 属主自愈 ---
+# 旧版本脚本以 root 在用户家目录下创建 ~/.local/state/eilNiri 后未归还属主，导致
+# ~/.local/state 整棵树归 root；waypaper 等程序登录后无法在其中创建自己的状态目录
+# （waypaper 启动即 PermissionError → GUI 打不开、壁纸失效）。
+fix_home_state_ownership() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _st="$HOME_DIR/.local/state" _ug
+    [ -d "$_st" ] || return 0
+    _ug=$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")
+    local _owner
+    _owner=$(stat -c '%U' "$_st" 2>/dev/null)
+    if [ -n "$_owner" ] && [ "$_owner" != "$TARGET_USER" ]; then
+        chown "$TARGET_USER:$_ug" "$HOME_DIR/.local" "$_st" 2>/dev/null || true
+        chown -R "$TARGET_USER:$_ug" "$_st" 2>/dev/null || true
+        log "$(_t "~/.local/state was root-owned — ownership restored to $TARGET_USER" "~/.local/state was root-owned — ownership restored to $TARGET_USER")"
+    fi
+}
+
 stage_configs() {
     if stage_done configs; then
         log "$(_t "Config deploy stage done, skipping." "Config deploy stage done, skipping.")"
@@ -3129,29 +3167,62 @@ stage_configs() {
     local ts
     ts=$(date +%Y%m%d-%H%M%S)
 
+    # 隐私防线：configs/ 里若混入剪贴板历史等个人数据，拒绝部署而非静默发出。
+    local _prv
+    _prv=$(find "$snap" -type f \( -path '*copyq*' -o -name 'QtProject.conf' -o -name '*.dat' \
+        -o -name '*.log' -o -name '*.sqlite' -o -name '*.db' -o -path '*__pycache__*' \
+        -o -path '*cached_layouts*' \) 2>/dev/null)
+    if [ -n "$_prv" ]; then
+        warn "$(_t "Privacy-sensitive files found in configs/ — they will NOT be deployed:" "Privacy-sensitive files found in configs/ — they will NOT be deployed:")"
+        echo "$_prv" | sed 's/^/       /'
+    fi
+
+    # root 属主的 ~/.local/state 会让 waypaper 等 GUI 启动即 PermissionError
+    fix_home_state_ownership
+    # 截图输出目录：satty 的 --output-filename 不会自动创建父目录
+    mkdir -p "$HOME_DIR/Pictures/Screenshots"
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+        "$HOME_DIR/Pictures" "$HOME_DIR/Pictures/Screenshots" 2>/dev/null || true
+
     shopt -s nullglob dotglob
     local item name
     # ~/.config/<name>
     for item in "$snap/.config"/*; do
         name=$(basename "$item")
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .config/$name"
+            continue
+        fi
         deploy_one "$item" "$HOME_DIR/.config/$name" "$ts"
     done
     # ~/.local/share/<name> (fixed niri-session etc.)
     for item in "$snap/.local/share"/*; do
         name=$(basename "$item")
         [ -d "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .local/share/$name"
+            continue
+        fi
         mkdir -p "$HOME_DIR/.local/share"
         deploy_one "$item" "$HOME_DIR/.local/share/$name" "$ts"
     done 2>/dev/null
     # ~/.local/share/applications (custom desktop files)
     for item in "$snap/.local/share/applications"/*; do
         [ -f "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") applications/$(basename "$item")"
+            continue
+        fi
         mkdir -p "$HOME_DIR/.local/share/applications"
         deploy_one "$item" "$HOME_DIR/.local/share/applications/$(basename "$item")" "$ts"
     done 2>/dev/null
     # ~/.local/bin (fixed niri-session etc.)
     for item in "$snap/.local/bin"/*; do
         [ -f "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .local/bin/$(basename "$item")"
+            continue
+        fi
         mkdir -p "$HOME_DIR/.local/bin"
         deploy_one "$item" "$HOME_DIR/.local/bin/$(basename "$item")" "$ts"
     done 2>/dev/null
@@ -3160,6 +3231,10 @@ stage_configs() {
         name=$(basename "$item")
         [[ "$name" = "." || "$name" = ".." || "$name" = ".config" ]] && continue
         [ -f "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") $name"
+            continue
+        fi
         deploy_one "$item" "$HOME_DIR/$name" "$ts"
     done
     shopt -u nullglob dotglob
@@ -3257,9 +3332,10 @@ stage_configs() {
     fi
 
     # fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
-    # Debian 12+ / Ubuntu 22.04+ (pam_env user_readenv removed), so the IME vars shipped
-    # there never load on modern systems. Write them to environment.d (systemd reads it)
-    # as a fallback when fcitx5 was selected and no ime.conf is already present.
+    # modern distros, so write environment.d (imported by systemd --user). Values MUST
+    # be the same as the niri config.kdl environment block and deb-install.sh:
+    # GTK/QT/SDL use "fcitx"（fcitx5-gtk 的模块注册名）；GLFW 只认 "ibus"（kitty 用它）。
+    # 写 "fcitx5" 会导致 systemd 服务/XDG autostart 拉起的应用无法切换中文。
     if [ "$DRY_RUN" -eq 0 ]; then
         local _has_ime=0
         for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
@@ -3268,16 +3344,38 @@ stage_configs() {
         if [ "$_has_ime" -eq 1 ] && [ -n "$TARGET_USER" ]; then
             local _imed="$HOME_DIR/.config/environment.d"
             mkdir -p "$_imed"
-            if [ ! -f "$_imed/ime.conf" ]; then
-                cat > "$_imed/ime.conf" <<'IMEEOF'
-GTK_IM_MODULE=fcitx5
-QT_IM_MODULE=fcitx5
-XMODIFIERS=@im=fcitx5
-SDL_IM_MODULE=fcitx5
-GLFW_IM_MODULE=fcitx5
+            # 旧版写的是错误值（fcitx5）且文件名 ime.conf 按字母序在 00-ime.conf 之后
+            # （会覆盖正确值）——发现即清除。
+            if [ -f "$_imed/ime.conf" ] && grep -q "fcitx5" "$_imed/ime.conf" 2>/dev/null; then
+                rm -f "$_imed/ime.conf"
+                log "$(_t "Removed stale environment.d/ime.conf (wrong fcitx5 values)" "Removed stale environment.d/ime.conf (wrong fcitx5 values)")"
+            fi
+            if [ ! -f "$_imed/00-ime.conf" ]; then
+                cat > "$_imed/00-ime.conf" <<'IMEEOF'
+# eilNiri: fcitx5 输入法环境变量（覆盖 systemd 用户服务与 XDG autostart 启动的应用）
+GTK_IM_MODULE=fcitx
+QT_IM_MODULE=fcitx
+XMODIFIERS=@im=fcitx
+SDL_IM_MODULE=fcitx
+GLFW_IM_MODULE=ibus
 IMEEOF
-                chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_imed/ime.conf" 2>/dev/null || true
-                log "$(_t "Wrote ~/.config/environment.d/ime.conf (fcitx5 IME vars; .pam_environment is ignored on Debian 12+/Ubuntu 22.04+)" "Wrote ~/.config/environment.d/ime.conf (fcitx5 IME vars; .pam_environment is ignored on Debian 12+/Ubuntu 22.04+)")"
+                chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_imed/00-ime.conf" 2>/dev/null || true
+                log "$(_t "Wrote ~/.config/environment.d/00-ime.conf (fcitx IME vars)" "Wrote ~/.config/environment.d/00-ime.conf (fcitx IME vars)")"
+            fi
+            # /etc/environment：PAM 会话级兑底（DM 直接拉起的会话也拿得到这些变量）
+            if ! grep -q "^# >>> eilNiri IME >>>" /etc/environment 2>/dev/null; then
+                [ -f /etc/environment ] || touch /etc/environment
+                {
+                    echo ""
+                    echo "# >>> eilNiri IME >>>"
+                    echo "GTK_IM_MODULE=fcitx"
+                    echo "QT_IM_MODULE=fcitx"
+                    echo "XMODIFIERS=@im=fcitx"
+                    echo "SDL_IM_MODULE=fcitx"
+                    echo "GLFW_IM_MODULE=ibus"
+                    echo "# <<< eilNiri IME <<<"
+                } >> /etc/environment
+                log "$(_t "Added fcitx IME vars to /etc/environment" "Added fcitx IME vars to /etc/environment")"
             fi
         fi
     fi

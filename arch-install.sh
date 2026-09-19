@@ -2012,9 +2012,11 @@ stage_configs() {
     fi
 
     # fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
-    # Debian 12+ / Ubuntu 22.04+ (pam_env user_readenv removed), so the IME vars shipped
-    # there never load on modern systems. Write them to environment.d (systemd reads it)
-    # as a fallback when fcitx5 was selected and no ime.conf is already present.
+    # modern distros, so write environment.d (imported by systemd --user). Values MUST
+    # be the same as the niri config.kdl environment block and deb-install.sh:
+    # GTK/QT/SDL use "fcitx"（fcitx5-gtk 的模块注册名，gtk-query-immodules 可证；
+    # GLFW 只认 "ibus"——kitty 用它）。写 "fcitx5"/"GLFW_IM_MODULE=fcitx5" 会导致
+    # systemd 服务/XDG autostart 拉起的应用无法切换中文（kitty 输入法直接失效）。
     if [ "$DRY_RUN" -eq 0 ]; then
         local _has_ime=0
         for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
@@ -2023,16 +2025,38 @@ stage_configs() {
         if [ "$_has_ime" -eq 1 ] && [ -n "$TARGET_USER" ]; then
             local _imed="$HOME_DIR/.config/environment.d"
             mkdir -p "$_imed"
-            if [ ! -f "$_imed/ime.conf" ]; then
-                cat > "$_imed/ime.conf" <<'IMEEOF'
-GTK_IM_MODULE=fcitx5
-QT_IM_MODULE=fcitx5
-XMODIFIERS=@im=fcitx5
-SDL_IM_MODULE=fcitx5
-GLFW_IM_MODULE=fcitx5
+            # 旧版写的是错误值（fcitx5）且文件名 ime.conf 按字母序在 00-ime.conf 之后
+            # （会覆盖正确值）——发现即清除。
+            if [ -f "$_imed/ime.conf" ] && grep -q "fcitx5" "$_imed/ime.conf" 2>/dev/null; then
+                rm -f "$_imed/ime.conf"
+                log "$(_t "Removed stale environment.d/ime.conf (wrong fcitx5 values)" "Removed stale environment.d/ime.conf (wrong fcitx5 values)")"
+            fi
+            if [ ! -f "$_imed/00-ime.conf" ]; then
+                cat > "$_imed/00-ime.conf" <<'IMEEOF'
+# eilNiri: fcitx5 输入法环境变量（覆盖 systemd 用户服务与 XDG autostart 启动的应用）
+GTK_IM_MODULE=fcitx
+QT_IM_MODULE=fcitx
+XMODIFIERS=@im=fcitx
+SDL_IM_MODULE=fcitx
+GLFW_IM_MODULE=ibus
 IMEEOF
-                chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_imed/ime.conf" 2>/dev/null || true
-                log "$(_t "Wrote ~/.config/environment.d/ime.conf (fcitx5 IME vars; .pam_environment is ignored on Debian 12+/Ubuntu 22.04+)" "Wrote ~/.config/environment.d/ime.conf (fcitx5 IME vars; .pam_environment is ignored on Debian 12+/Ubuntu 22.04+)")"
+                chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_imed/00-ime.conf" 2>/dev/null || true
+                log "$(_t "Wrote ~/.config/environment.d/00-ime.conf (fcitx IME vars)" "Wrote ~/.config/environment.d/00-ime.conf (fcitx IME vars)")"
+            fi
+            # /etc/environment：PAM 会话级兑底（DM 直接拉起的会话也拿得到这些变量）
+            if ! grep -q "^# >>> eilNiri IME >>>" /etc/environment 2>/dev/null; then
+                [ -f /etc/environment ] || touch /etc/environment
+                {
+                    echo ""
+                    echo "# >>> eilNiri IME >>>"
+                    echo "GTK_IM_MODULE=fcitx"
+                    echo "QT_IM_MODULE=fcitx"
+                    echo "XMODIFIERS=@im=fcitx"
+                    echo "SDL_IM_MODULE=fcitx"
+                    echo "GLFW_IM_MODULE=ibus"
+                    echo "# <<< eilNiri IME <<<"
+                } >> /etc/environment
+                log "$(_t "Added fcitx IME vars to /etc/environment" "Added fcitx IME vars to /etc/environment")"
             fi
         fi
     fi
