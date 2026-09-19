@@ -1,8 +1,0 @@
-super+w打开终端
-super+q关闭一个窗口
-super+alt+L锁屏
-super+shift+S截屏
-super+左右方向键为向左右窗口聚焦
-super+加键或减键可以调节窗口大小
-super+滑动鼠标滚轮可以切换工作区
-第一次进入niri建议先super+z打开应用启动器打开waypaper设置壁纸
