@@ -229,7 +229,7 @@ declare -A GROUP_EN=(
 # depending on the repo state) are routed through the AUR helper at install time by
 # probing `pacman -Si` — no hardcoded repo/AUR split needed here.
 declare -A GROUP_PKGS=(
-    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh neovim gsimplecal zenity pacman-contrib"
+    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh neovim gsimplecal zenity pacman-contrib dbus"
     [lock]="hyprlock hypridle"
     [wallpaper]="awww waypaper"
     [clip]="copyq satty grim slurp"
@@ -1649,46 +1649,66 @@ stage_dm() {
         return   # not marked: rerun retries
     fi
 
-    # --- disable every known DM and the display-manager.service entry ---
-    local dm
-    for dm in "${known_dms[@]}" gdm3 ly@tty1; do
+    # --- dbus：niri 只依赖 seatd 库，不带 dbus；libseat 的 logind 后端需要系统总线。
+    # 缺 dbus（且 seatd.service 未启用）时，niri 从 tty 手动启动也会 panic：
+    # "Failed to open session: Function not implemented (os error 38)"。
+    # 参考机就是 dbus-broker + logind 路线（seatd 服务 disabled），这里保持一致。
+    if [ "$DRY_RUN" -eq 0 ]; then
+        pm_install dbus dbus-broker 2>/dev/null || true
+        exe systemctl enable dbus-broker 2>/dev/null || exe systemctl enable dbus 2>/dev/null || true
+        # 注意：不要启用 seatd.service——seatd 与 logind 会争抢 seat 管理，
+        # 走 logind（ly + dbus-broker）路线时 seatd 必须保持 disabled。
+    fi
+
+    # --- enable the chosen DM FIRST; only disable others after it is verified ---
+    # 顺序修复：旧逻辑先 disable 全部已知 DM 再 enable，一旦 enable 失败，系统一个
+    # DM 都不剩 → 重启直接进 tty（“ly 不见了”）。现在：先启用并验证，成功后才禁
+    # 其它；失败则恢复原 DM 的启用状态。
+    local dm _dm_ok=0 _cand
+    # ly 的 unit 名在不同版本/发行版包里不同（模板实例或单实例），逐个探测：
+    # 脚本默认 ly@tty1，参考机实际用 ly@tty2，也有只带 ly.service 的包。
+    for _cand in "$dm_unit" "${dm_unit%%@*}@tty2" "${dm_unit%%@*}.service"; do
+        systemctl cat "$_cand" >/dev/null 2>&1 || continue
+        if exe systemctl enable "$_cand"; then
+            dm_unit="$_cand"
+            _dm_ok=1
+            break
+        fi
+        warn "$(_t "DM unit enable failed, trying next unit name..." "DM unit enable failed, trying next unit name...") ($_cand)"
+    done
+    if [ "$_dm_ok" -eq 1 ] && ! systemctl is-enabled --quiet "$dm_unit" 2>/dev/null; then
+        warn "$(_t "Verification failed: " "Verification failed: ") $dm_unit $(_t "is not enabled." "is not enabled.")"
+        _dm_ok=0
+    fi
+    if [ "$_dm_ok" -eq 0 ]; then
+        FAILED_PKGS+=("dm:$dm_unit")
+        if [ -n "$current" ]; then
+            # 回滚：把原来的 DM 重新启用，绝不能把系统留在“无 DM”状态
+            exe systemctl enable "$current" 2>/dev/null || true
+            warn "$(_t "DM enable failed; previous DM re-enabled: " "DM enable failed; previous DM re-enabled: ")$current$(_t ". Run niri-session from tty after reboot." ". Run niri-session from tty after reboot.")"
+        else
+            warn "$(_t "DM enable failed; run niri-session from tty after reboot." "DM enable failed; run niri-session from tty after reboot.")"
+        fi
+        return   # not marked: rerun retries
+    fi
+
+    # --- chosen DM verified; now disable every other known DM ---
+    for dm in "${known_dms[@]}" gdm3 "$dm_unit"; do
+        [ "$dm" = "$dm_unit" ] && continue
         exe systemctl disable "$dm" 2>/dev/null || true
     done
     if [ -e /etc/systemd/system/display-manager.service ] || [ -L /etc/systemd/system/display-manager.service ]; then
-        exe systemctl disable display-manager.service 2>/dev/null || rm -f /etc/systemd/system/display-manager.service
-        rm -f /etc/systemd/system/display-manager.service 2>/dev/null || true
+        local _dm_link_now
+        _dm_link_now=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
+        if [ "$(basename "${_dm_link_now%%@*}" .service)" != "${dm_unit%%@*}" ]; then
+            exe systemctl disable display-manager.service 2>/dev/null || rm -f /etc/systemd/system/display-manager.service
+            rm -f /etc/systemd/system/display-manager.service 2>/dev/null || true
+        fi
     fi
 
-    # --- enable the chosen DM ---
-    if exe systemctl enable "$dm_unit"; then
-        # verify: the unit must be enabled
-        local _verify_ok=1
-        if ! systemctl is-enabled --quiet "$dm_unit" 2>/dev/null; then
-            _verify_ok=0
-            warn "$(_t "Verification failed: " "Verification failed: ") $dm_unit $(_t "is not enabled." "is not enabled.")"
-        fi
-        if [ -e /etc/systemd/system/display-manager.service ]; then
-            local _dm_link
-            _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
-            if [ "$(basename "$_dm_link" .service)" != "${dm_unit%%@*}" ]; then
-                _verify_ok=0
-                warn "$(_t "Verification failed: display-manager.service points to " "Verification failed: display-manager.service points to ") ${_dm_link:-unknown}$(_t ", expected " ", expected ") $dm_unit"
-            fi
-        fi
-        if [ "$_verify_ok" -eq 1 ]; then
-            ENABLED_SVCS+=("$dm_unit")
-            success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
-            stage_mark dm
-        else
-            FAILED_PKGS+=("dm:$dm_unit")
-            warn "$(_t "Display manager enable verification failed; run niri-session from tty after reboot." "Display manager enable verification failed; run niri-session from tty after reboot.")"
-            # not marked: rerun retries
-        fi
-    else
-        FAILED_PKGS+=("dm:$dm_unit")
-        warn "$(_t "Display manager enable failed; run niri-session from tty after reboot." "Display manager enable failed; run niri-session from tty after reboot.")"
-        # not marked: rerun retries
-    fi
+    ENABLED_SVCS+=("$dm_unit")
+    success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs ($dm_unit)"
+    stage_mark dm
 }
 
 # --- 4.6 config snapshot (backup before deploy) ---
