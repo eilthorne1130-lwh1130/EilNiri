@@ -93,6 +93,15 @@ if [ -n "$_LOG_USER" ] && [ "$_LOG_USER" != "root" ]; then
 fi
 [ -z "$_LOG_HOME" ] && _LOG_HOME="$HOME"
 LOG_DIR="${XDG_STATE_HOME:-$_LOG_HOME/.local/state}/eilNiri"
+# 以 sudo 运行时，mkdir 会在真实用户家目录下创建 ~/.local / ~/.local/state（若尚不存在），
+# 且属主是 root。waypaper 等程序登录后以普通用户身份在其中创建状态目录（waypaper 启动
+# 即 mkdir ~/.local/state/waypaper），属主不对就直接 PermissionError 崩溃 → GUI 打不开、
+# 壁纸失效。这里立即把新创建出来的层级归还给真实用户。
+if [ -n "$_LOG_USER" ] && [ "$_LOG_USER" != "root" ] && [ -d "$_LOG_HOME/.local/state" ]; then
+    chown "$_LOG_USER:$(id -gn "$_LOG_USER" 2>/dev/null || echo "$_LOG_USER")" \
+        "$_LOG_HOME/.local" "$_LOG_HOME/.local/state" 2>/dev/null || true
+    chown -R "$_LOG_USER" "$LOG_DIR" 2>/dev/null || true
+fi
 unset _LOG_USER _LOG_HOME
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 export TEMP_LOG_FILE="$LOG_DIR/replicate.log"
@@ -1299,6 +1308,68 @@ do_status() {
 
 # --- 4.4 system services (built-in list, fzf selection; snapshot-free mode) ---
 
+# --- ~/.local/state 属主自愈 ---
+# 旧版本脚本以 root 在用户家目录下创建 ~/.local/state/eilNiri 后未归还属主，导致
+# ~/.local/state 整棵树归 root；waypaper 等程序登录后无法在其中创建自己的状态目录
+# （waypaper 启动即 PermissionError: ~/.local/state/waypaper → GUI 打不开、壁纸失效）。
+fix_home_state_ownership() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _st="$HOME_DIR/.local/state" _ug
+    [ -d "$_st" ] || return 0
+    _ug=$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")
+    local _owner
+    _owner=$(stat -c '%U' "$_st" 2>/dev/null)
+    if [ -n "$_owner" ] && [ "$_owner" != "$TARGET_USER" ]; then
+        chown "$TARGET_USER:$_ug" "$HOME_DIR/.local" "$_st" 2>/dev/null || true
+        chown -R "$TARGET_USER:$_ug" "$_st" 2>/dev/null || true
+        log "$(_t "~/.local/state was root-owned — ownership restored to $TARGET_USER" "~/.local/state was root-owned — ownership restored to $TARGET_USER")"
+    fi
+}
+
+# --- 首次登录壁纸竞态修复（同 deb-install.sh）---
+# niri 的 spawn-at-startup 拉起 awww-daemon 与 graphical-session.target 拉起的
+# waypaper.service 之间没有顺序约束；daemon 未就绪时 waypaper 的 `awww img` 静默失败
+# 且无重试，表现为首次登录壁纸空白。给 waypaper 服务插入 ExecStartPre 等待助手。
+install_awww_wait_helper() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _helper=/usr/local/bin/eilniri-wait-awww
+    cat > "$_helper" <<'AWWWWAITEOF'
+#!/usr/bin/env bash
+# eilNiri: wait until awww-daemon is up and answering (max ~15s), then return 0
+# regardless — this is an ExecStartPre guard, never a hard dependency.
+i=0
+while [ "$i" -lt 30 ]; do
+    if pgrep -x awww-daemon >/dev/null 2>&1; then
+        if command -v awww >/dev/null 2>&1 && awww query >/dev/null 2>&1; then
+            exit 0
+        fi
+    fi
+    sleep 0.5
+    i=$((i + 1))
+done
+exit 0
+AWWWWAITEOF
+    chmod 755 "$_helper"
+}
+
+_fix_wallpaper_startup() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _udir="$HOME_DIR/.config/systemd/user" _sf _patched=0
+    [ -d "$_udir" ] || return 0
+    for _sf in "$_udir/waypaper.service" "$_udir/waypaper-random.service"; do
+        [ -f "$_sf" ] || continue
+        grep -q "eilniri-wait-awww" "$_sf" 2>/dev/null && continue
+        install_awww_wait_helper
+        sed -i '/^ExecStart=/a ExecStartPre=/usr/local/bin/eilniri-wait-awww' "$_sf"
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_sf" 2>/dev/null || true
+        _patched=1
+    done
+    if [ "$_patched" -eq 1 ]; then
+        as_user systemctl --user daemon-reload 2>/dev/null || true
+        log "$(_t "waypaper services: added ExecStartPre wait for awww-daemon (first-login wallpaper race fix)" "waypaper services: added ExecStartPre wait for awww-daemon (first-login wallpaper race fix)")"
+    fi
+}
+
 stage_services() {
     if stage_done services; then
         log "$(_t "Service stage done, skipping." "Service stage done, skipping.")"
@@ -1926,9 +1997,11 @@ stage_configs() {
             [ "$_p" = "waypaper" ] && _has_wp=1
         done
         if [ "$_has_wp" -eq 1 ] && [ -f "$HOME_DIR/.config/systemd/user/waypaper.service" ]; then
+            fix_home_state_ownership   # root 属主的 ~/.local/state 会让 waypaper 启动即 PermissionError
             log "$(_t "Enabling waypaper user services..." "Enabling waypaper user services...")"
             as_user systemctl --user daemon-reload 2>/dev/null || true
             as_user systemctl --user enable --now waypaper.service waypaper-random.timer 2>/dev/null || true
+            _fix_wallpaper_startup     # 首次登录壁纸竞态：ExecStartPre 等 awww-daemon 就绪
         fi
 
         # 壁纸自愈：awww 已装则确保有壁纸状态文件（生成默认渐变壁纸 / 修正 waypaper 路径）
@@ -2320,9 +2393,26 @@ stage_verify() {
         success "$(_t "Package audit passed." "Package audit passed.")"
     fi
 
+    # ~/.local/state 权限审计：waypaper/fcitx5 等登录后要往里写状态目录；若归 root
+    # （旧版本脚本遗留），GUI 程序启动即 PermissionError（waypaper 打不开 → 壁纸失效）。
+    local cfg_errors=0
+    if [ -d "$HOME_DIR/.local/state" ]; then
+        if as_user test -w "$HOME_DIR/.local/state" 2>/dev/null; then
+            log "  [OK] $HOME_DIR/.local/state writable by $TARGET_USER"
+        else
+            warn "$HOME_DIR/.local/state 不归属 $TARGET_USER — waypaper 等 GUI 将无法启动，正在修复…"
+            fix_home_state_ownership
+            if as_user test -w "$HOME_DIR/.local/state" 2>/dev/null; then
+                success "$HOME_DIR/.local/state ownership fixed"
+            else
+                cfg_errors=$((cfg_errors+1))
+            fi
+        fi
+    fi
+
     # config audit
-    local cfg_errors=0 d
-    for d in niri waybar kitty mako hypr; do
+    local d
+    for d in niri waybar kitty mako fuzzel hypr; do
         if [ -e "$HOME_DIR/.config/$d" ]; then
             log "  [OK] $HOME_DIR/.config/$d"
         else
