@@ -536,7 +536,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v48"
+PROGRESS_VERSION="v49"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -697,6 +697,14 @@ stage_preflight() {
         grep -q '^en_US.UTF-8 UTF-8' /etc/locale.gen 2>/dev/null || sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
         grep -q '^zh_CN.UTF-8 UTF-8' /etc/locale.gen 2>/dev/null || sed -i 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen
         exe locale-gen || warn "$(_t "locale-gen failed — Chinese text may render as warnings/garbage." "locale-gen failed — Chinese text may render as warnings/garbage.")"
+    fi
+    # 系统 locale 设为中文（与参考机一致）：只 locale-gen 不设 locale.conf，全新安装
+    # 默认 en_US，系统界面会大量英文。已设置为其他语言的用户不覆盖。
+    if [ -f /etc/locale.conf ] && grep -q 'zh_CN.UTF-8' /etc/locale.conf 2>/dev/null; then
+        : # already zh_CN
+    else
+        printf 'LANG=zh_CN.UTF-8\n' > /etc/locale.conf
+        log "$(_t "System locale set to zh_CN.UTF-8 (/etc/locale.conf)" "System locale set to zh_CN.UTF-8 (/etc/locale.conf)")"
     fi
     if ! exe pacman -Su --noconfirm; then
         error "$(_t "System update failed. Check network." "System update failed. Check network.")"

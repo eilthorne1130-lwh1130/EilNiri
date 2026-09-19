@@ -611,7 +611,7 @@ as_user() {
 # v48: download/stage-wait fixes — progress files written by the buggy v47 build
 # may contain a wrongly-marked `apps` stage (niri skipped forever); invalidating the
 # old marker forces one clean rerun that re-attempts niri.
-PROGRESS_VERSION="v48"
+PROGRESS_VERSION="v49"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
