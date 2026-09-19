@@ -90,6 +90,14 @@ if [ -n "$_LOG_USER" ] && [ "$_LOG_USER" != "root" ]; then
 fi
 [ -z "$_LOG_HOME" ] && _LOG_HOME="$HOME"
 LOG_DIR="${XDG_STATE_HOME:-$_LOG_HOME/.local/state}/eilNiri"
+# 以 sudo 运行时，mkdir 会在真实用户家目录下创建 ~/.local / ~/.local/state（若尚不存在），
+# 且属主是 root。waypaper 等程序登录后以普通用户身份在其中创建状态目录，属主不对就
+# PermissionError 崩溃 → GUI 打不开、壁纸失效。这里立即把新创建的层级归还给真实用户。
+if [ -n "$_LOG_USER" ] && [ "$_LOG_USER" != "root" ] && [ -d "$_LOG_HOME/.local/state" ]; then
+    chown "$_LOG_USER:$(id -gn "$_LOG_USER" 2>/dev/null || echo "$_LOG_USER")" \
+        "$_LOG_HOME/.local" "$_LOG_HOME/.local/state" 2>/dev/null || true
+    chown -R "$_LOG_USER" "$LOG_DIR" 2>/dev/null || true
+fi
 unset _LOG_USER _LOG_HOME
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 export TEMP_LOG_FILE="$LOG_DIR/replicate.log"
@@ -5627,6 +5635,36 @@ deploy_one() { # $1 = source path, $2 = destination path
     exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dst"
 }
 
+is_privacy_risk() { # $1 = path inside configs/
+    local p="$1" b
+    b=$(basename "$p")
+    case "$p" in
+        *copyq*|*QtProject.conf*|*__pycache__*|*cached_layouts*|*/rime/*) return 0 ;;
+    esac
+    case "$b" in
+        copyq.lock|*.dat|*.log|*.sqlite|*.db) return 0 ;;
+    esac
+    return 1
+}
+
+# --- ~/.local/state 属主自愈 ---
+# 旧版本脚本以 root 在用户家目录下创建 ~/.local/state/eilNiri 后未归还属主，导致
+# ~/.local/state 整棵树归 root；waypaper 等程序登录后无法在其中创建自己的状态目录
+# （waypaper 启动即 PermissionError → GUI 打不开、壁纸失效）。
+fix_home_state_ownership() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _st="$HOME_DIR/.local/state" _ug
+    [ -d "$_st" ] || return 0
+    _ug=$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")
+    local _owner
+    _owner=$(stat -c '%U' "$_st" 2>/dev/null)
+    if [ -n "$_owner" ] && [ "$_owner" != "$TARGET_USER" ]; then
+        chown "$TARGET_USER:$_ug" "$HOME_DIR/.local" "$_st" 2>/dev/null || true
+        chown -R "$TARGET_USER:$_ug" "$_st" 2>/dev/null || true
+        log "$(_t "~/.local/state was root-owned — ownership restored to $TARGET_USER" "~/.local/state was root-owned — ownership restored to $TARGET_USER")"
+    fi
+}
+
 stage_configs() {
     if stage_done configs; then
         log "$(_t "Config deploy stage done, skipping." "Config deploy stage done, skipping.")"
@@ -5642,6 +5680,24 @@ stage_configs() {
     local ts
     ts=$(date +%Y%m%d-%H%M%S)
 
+    # 隐私防线：configs/ 里若混入剪贴板历史等个人数据，拒绝部署而非静默发出。
+    local _prv
+    _prv=$(find "$snap" -type f \( -path '*copyq*' -o -name 'QtProject.conf' -o -name '*.dat' \
+        -o -name '*.log' -o -name '*.sqlite' -o -name '*.db' -o -path '*__pycache__*' \
+        -o -path '*cached_layouts*' \) 2>/dev/null)
+    if [ -n "$_prv" ]; then
+        warn "$(_t "Privacy-sensitive files found in configs/ — they will NOT be deployed:" "Privacy-sensitive files found in configs/ — they will NOT be deployed:")"
+        echo "$_prv" | sed 's/^/       /'
+    fi
+
+    # root 属主的 ~/.local/state 会让 waypaper 等 GUI 启动即 PermissionError
+    fix_home_state_ownership
+    # 截图输出目录：niri 绑定里 satty 的 --output-filename 指向 ~/Pictures/Screenshots，
+    # satty 不会自动创建父目录，缺目录时保存会失败。
+    mkdir -p "$HOME_DIR/Pictures/Screenshots"
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+        "$HOME_DIR/Pictures" "$HOME_DIR/Pictures/Screenshots" 2>/dev/null || true
+
     shopt -s nullglob dotglob
     local item name
     # ~/.config/<name>
@@ -5649,18 +5705,30 @@ stage_configs() {
         name=$(basename "$item")
         # Stock fcitx5+rime only: do not overlay a custom fcitx5 profile/theme.
         case "$name" in fcitx5|fcitx) continue ;; esac
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .config/$name"
+            continue
+        fi
         deploy_one "$item" "$HOME_DIR/.config/$name" "$ts"
     done
     # ~/.local/share/<name> (fixed niri-session etc.)
     for item in "$snap/.local/share"/*; do
         name=$(basename "$item")
         [ -d "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .local/share/$name"
+            continue
+        fi
         mkdir -p "$HOME_DIR/.local/share"
         deploy_one "$item" "$HOME_DIR/.local/share/$name" "$ts"
     done 2>/dev/null
     # ~/.local/share/applications (custom desktop files)
     for item in "$snap/.local/share/applications"/*; do
         [ -f "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") applications/$(basename "$item")"
+            continue
+        fi
         mkdir -p "$HOME_DIR/.local/share/applications"
         deploy_one "$item" "$HOME_DIR/.local/share/applications/$(basename "$item")" "$ts"
     done 2>/dev/null
@@ -6189,9 +6257,26 @@ stage_verify() {
         success "$(_t "Package audit passed." "Package audit passed.")"
     fi
 
+    # ~/.local/state 权限审计：waypaper/fcitx5 等登录后要往里写状态目录；若归 root
+    # （旧版本脚本遗留），GUI 程序启动即 PermissionError（waypaper 打不开 → 壁纸失效）。
+    local cfg_errors=0
+    if [ -d "$HOME_DIR/.local/state" ]; then
+        if as_user test -w "$HOME_DIR/.local/state" 2>/dev/null; then
+            log "  [OK] $HOME_DIR/.local/state writable by $TARGET_USER"
+        else
+            warn "$HOME_DIR/.local/state 不归属 $TARGET_USER — waypaper 等 GUI 将无法启动，正在修复…"
+            fix_home_state_ownership
+            if as_user test -w "$HOME_DIR/.local/state" 2>/dev/null; then
+                success "$HOME_DIR/.local/state ownership fixed"
+            else
+                cfg_errors=$((cfg_errors+1))
+            fi
+        fi
+    fi
+
     # config audit
-    local cfg_errors=0 d
-    for d in niri waybar kitty mako hypr; do
+    local d
+    for d in niri waybar kitty mako fuzzel hypr; do
         if [ -e "$HOME_DIR/.config/$d" ]; then
             log "  [OK] $HOME_DIR/.config/$d"
         else
