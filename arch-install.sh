@@ -485,14 +485,33 @@ aur_install() { # $@ = AUR package names
         error "sudoers rule validation failed; skipping AUR install."
         return 1
     fi
+    # makepkg/yay 需要在 $HOME/.cache/yay 下构建；若 .cache 归属不对（脚本早期
+    # 版本曾以 root 创建过家目录内容），构建会直接 PermissionError。
+    local _cache="$HOME_DIR/.cache" _ug
+    _ug=$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")
+    if [ -e "$_cache" ] && ! as_user test -w "$_cache" 2>/dev/null; then
+        chown "$TARGET_USER:$_ug" "$_cache" 2>/dev/null || true
+        chown -R "$TARGET_USER:$_ug" "$_cache" 2>/dev/null || true
+        log "$(_t "~/.cache ownership restored to $TARGET_USER (AUR build dir)" "~/.cache ownership restored to $TARGET_USER (AUR build dir)")"
+    fi
     local helper_flags=(--noconfirm --needed)
     if [ "$AUR_HELPER" = "yay" ]; then
         helper_flags+=(--answerclean None --answerdiff None --answeredit None --answerupgrade None)
     elif [ "$AUR_HELPER" = "paru" ]; then
         helper_flags+=(--skipreview)
     fi
-    as_user env HOME="$HOME_DIR" PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}" "$AUR_HELPER" -S "${helper_flags[@]}" "$@"
-    local rc=$?
+    local rc=0 _try _env=(env HOME="$HOME_DIR" PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}")
+    # 透传代理变量（若调用方已设置）：AUR 构建需从 github 等拉取源码，跨网环境必需
+    local _pv
+    for _pv in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do
+        [ -n "${!_pv:-}" ] && _env+=("$_pv=${!_pv}")
+    done
+    # 一次重试：AUR 源站/源码托管（github 等）在跨网环境下偶发超时，先整批后逐包重试
+    for _try in 1 2; do
+        as_user "${_env[@]}" "$AUR_HELPER" -S "${helper_flags[@]}" "$@" && rc=0 || rc=$?
+        [ "$rc" -eq 0 ] && break
+        [ "$_try" -eq 1 ] && { warn "$(_t "AUR install failed (exit $rc), retrying once in 10s..." "AUR install failed (exit $rc), retrying once in 10s...")"; sleep 10; }
+    done
     rm -f "$_sudo_file"
     return $rc
 }
@@ -836,8 +855,39 @@ install_arch() {
     fi
     if [ ${#aur_queue[@]} -gt 0 ]; then
         ensure_aur_helper
+        # 构建依赖完备性：yay/paru 已预装时 ensure_aur_helper 直接返回，base-devel/git
+        # 可能缺失，AUR 构建会因 makedeps 缺失而失败。这里无条件补齐。
+        if [ "$DRY_RUN" -eq 0 ]; then
+            pm_install base-devel git 2>/dev/null || warn "$(_t "base-devel/git install failed — AUR builds may fail." "base-devel/git install failed — AUR builds may fail.")"
+        fi
         log "$(_t "Installing " "Installing ") ${#aur_queue[@]} $(_t "AUR packages (this may compile for a while)..." "AUR packages (this may compile for a while)...")"
         install_batch aur_install "AUR" "${aur_queue[@]}"
+        # 收尾重试：对仍失败的 AUR 包再试一轮（网络抖动/依赖顺序问题常在二轮自愈）
+        if [ "$DRY_RUN" -eq 0 ] && [ ${#FAILED_PKGS[@]} -gt 0 ]; then
+            local _aur_failed=() _f
+            for _f in ${FAILED_PKGS[@]+"${FAILED_PKGS[@]}"}; do
+                [[ "$_f" == AUR:* ]] && _aur_failed+=("${_f#AUR:}")
+            done
+            if [ ${#_aur_failed[@]} -gt 0 ]; then
+                warn "$(_t "Retrying ${#_aur_failed[@]} failed AUR package(s) once more..." "Retrying ${#_aur_failed[@]} failed AUR package(s) once more...")"
+                local _still_failed=() _rf _ok_aur=0
+                for _rf in "${_aur_failed[@]}"; do
+                    if aur_install "$_rf" 2>/dev/null; then
+                        INSTALLED_PKGS+=("$_rf (AUR retry)")
+                        _ok_aur=1
+                    else
+                        _still_failed+=("AUR:$_rf")
+                    fi
+                done
+                # 重建 FAILED_PKGS：移除已重试成功的 AUR 项，保留其它失败项与仍失败项
+                local _new_failed=()
+                for _f in ${FAILED_PKGS[@]+"${FAILED_PKGS[@]}"}; do
+                    [[ "$_f" == AUR:* ]] || _new_failed+=("$_f")
+                done
+                FAILED_PKGS=("${_new_failed[@]}" "${_still_failed[@]}")
+                [ "$_ok_aur" -eq 1 ] && success "$(_t "Some AUR packages succeeded on retry." "Some AUR packages succeeded on retry.")"
+            fi
+        fi
     fi
 
     # waypaper fallback via pip if AUR helper failed to install it

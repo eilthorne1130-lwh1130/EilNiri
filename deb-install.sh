@@ -1369,6 +1369,17 @@ stage_preflight() {
                     exe locale-gen 2>/dev/null || warn "$(_t "locale-gen failed, locale warnings may appear." "locale-gen failed, locale warnings may appear.")"
                 fi
             fi
+    # 系统 locale 设为中文（与参考机一致）：envvars.conf 只覆盖 systemd 用户会话，
+    # DM/tty 的界面语言由 /etc/default/locale（Debian 系 PAM）与 /etc/locale.conf
+    # （systemd）决定；只 locale-gen 不写这两个文件，系统界面仍是英文。
+    # 已设置为其他语言的用户不覆盖。
+    if [ -f /etc/default/locale ] && grep -q 'zh_CN.UTF-8' /etc/default/locale 2>/dev/null; then
+        : # already zh_CN
+    else
+        printf 'LANG=zh_CN.UTF-8\nLANGUAGE=zh_CN:en_US\n' > /etc/default/locale
+        printf 'LANG=zh_CN.UTF-8\n' > /etc/locale.conf
+        log "$(_t "System locale set to zh_CN.UTF-8 (/etc/default/locale, /etc/locale.conf)" "System locale set to zh_CN.UTF-8 (/etc/default/locale, /etc/locale.conf)")"
+    fi
         success "$(_t "System ready." "System ready.")"
     stage_mark preflight
 }
