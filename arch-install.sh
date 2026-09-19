@@ -235,7 +235,7 @@ declare -A GROUP_PKGS=(
     [clip]="copyq satty grim slurp"
     [media]="playerctl brightnessctl btop"
     [audio]="pipewire-pulse wireplumber"
-    [ime]="fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice"
+    [ime]="fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git"
     [fonts]="ttf-jetbrains-mono-nerd wqy-zenhei"
     [keyring]="gnome-keyring"
     [tools]="ripgrep zoxide bluetui"
@@ -1188,8 +1188,16 @@ install_rime_ice() {
     [ "$_has_rime" -eq 1 ] || return 0
 
     local dest="$HOME_DIR/.local/share/fcitx5/rime"
-    if [ -f "$dest/rime_ice.schema.yaml" ] || pkg_installed rime-ice || pkg_installed rime-ice-git; then
+    # 跳过条件必须与部署后的验收一致（schema + 主词库 + 词库目录）：残缺的旧部署
+    # （如下载被截断的 zip）不能跳过，否则重跑 restore 也无法自愈。
+    if [ -f "$dest/rime_ice.schema.yaml" ] && [ -f "$dest/rime_ice.dict.yaml" ] && [ -d "$dest/cn_dicts" ]; then
         log "$(_t "rime-ice dictionary already present, skipping." "rime-ice dictionary already present, skipping.")"
+        _ensure_rime_default_custom
+        return 0
+    fi
+    if pkg_installed rime-ice || pkg_installed rime-ice-git || pkg_installed rime-ice-pinyin-git; then
+        log "$(_t "rime-ice installed via package, skipping zip deploy." "rime-ice installed via package, skipping zip deploy.")"
+        _ensure_rime_default_custom
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -1205,7 +1213,14 @@ install_rime_ice() {
     register_temp_path "$zipfile"
     register_temp_path "$unzipdir"
 
-    if _dl_gh_bounded "$RIME_ICE_ZIP_URL" "$zipfile" 120; then
+    if _dl_gh_bounded "$RIME_ICE_ZIP_URL" "$zipfile" 300; then
+        # zip 完整性校验：full.zip 含全部词库（几十 MB），慢网下载被截断时 unzip 会
+        # 部分解压；不校验就部署会得到缺词库的半残 rime 目录，fcitx5-rime 启动
+        # 部署时报“出现了一个错误”。
+        if ! unzip -t "$zipfile" >/dev/null 2>&1; then
+            warn "$(_t "rime-ice zip integrity check failed (download truncated?)" "rime-ice zip integrity check failed (download truncated?)")"
+            return 1
+        fi
         if command -v unzip >/dev/null 2>&1; then
             unzip -q -o "$zipfile" -d "$unzipdir" 2>/dev/null || true
         else
@@ -1216,9 +1231,11 @@ install_rime_ice() {
         if [ -n "$rime_root" ]; then
             cp -r "$rime_root"/* "$dest/" 2>/dev/null || true
             chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dest" 2>/dev/null || true
-            if [ -f "$dest/rime_ice.schema.yaml" ]; then
+            # 部署完备性验收：schema + 主词库 + 词库目录缺一不可，否则 rime 部署必报错
+            if [ -f "$dest/rime_ice.schema.yaml" ] && [ -f "$dest/rime_ice.dict.yaml" ] && [ -d "$dest/cn_dicts" ]; then
                 INSTALLED_PKGS+=("rime-ice (dictionary)")
                 success "$(_t "rime-ice dictionary deployed" "rime-ice dictionary deployed")"
+                _ensure_rime_default_custom
                 local _new_failed=() _f
                 for _f in ${FAILED_PKGS[@]+"${FAILED_PKGS[@]}"}; do
                     [ "$_f" != "AUR:rime-ice" ] && [ "$_f" != "AUR:rime-ice-pinyin-git" ] && _new_failed+=("$_f")
@@ -1228,8 +1245,28 @@ install_rime_ice() {
             fi
         fi
     fi
-    warn "$(_t "rime-ice dictionary deploy failed (optional); install manually: yay -S rime-ice" "rime-ice dictionary deploy failed (optional); install manually: yay -S rime-ice")"
+    warn "$(_t "rime-ice dictionary deploy failed (optional); install manually: yay -S rime-ice-pinyin-git" "rime-ice dictionary deploy failed (optional); install manually: yay -S rime-ice-pinyin-git")"
     return 1
+}
+
+# default.custom.yaml：把 rime_ice 指定为默认方案（参考机同款）。repo 不随 configs
+# 发（deploy_one 的隐私安全网会剥掉 rime 子目录），由本函数在 rime 数据就绪后写入。
+_ensure_rime_default_custom() {
+    local dest="$HOME_DIR/.local/share/fcitx5/rime" _ts
+    [ -d "$dest" ] || return 0
+    if [ -f "$dest/default.custom.yaml" ] && grep -q "rime_ice" "$dest/default.custom.yaml" 2>/dev/null; then
+        return 0
+    fi
+    _ts=$(date +%Y%m%d-%H%M%S)
+    [ -f "$dest/default.custom.yaml" ] && cp "$dest/default.custom.yaml" "$dest/default.custom.yaml.bak-$_ts"
+    cat > "$dest/default.custom.yaml" <<RIMEDCEOF
+patch:
+  schema_list:
+    - {schema: rime_ice}
+  __include: rime_ice_suggestion:/
+RIMEDCEOF
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dest/default.custom.yaml" 2>/dev/null || true
+    log "$(_t "Wrote rime default.custom.yaml (schema_list -> rime_ice)" "Wrote rime default.custom.yaml (schema_list -> rime_ice)")"
 }
 
 # QEMU/KVM 虚拟机：安装并启用 spice-vdagent。
@@ -2454,8 +2491,8 @@ stage_verify() {
                 fi
                 ;;
             rime-ice|rime-ice-pinyin-git)
-                if [ ! -f "$HOME_DIR/.local/share/fcitx5/rime/rime_ice.schema.yaml" ] && ! pkg_installed rime-ice && ! pkg_installed rime-ice-git; then
-                    missing+=("rime-ice")
+                if [ ! -f "$HOME_DIR/.local/share/fcitx5/rime/rime_ice.schema.yaml" ] && ! pkg_installed rime-ice && ! pkg_installed rime-ice-git && ! pkg_installed rime-ice-pinyin-git; then
+                    missing+=("rime-ice-pinyin-git")
                 fi
                 ;;
             *)
