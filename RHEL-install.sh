@@ -64,7 +64,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.10.1"
+SCRIPT_VERSION="1.10.2"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -648,27 +648,80 @@ ensure_fzf() {
         fi
     fi
     DRY_RUN="$_saved_dry"
-    error "$(_t "fzf install failed, cannot continue." "fzf install failed, cannot continue.")"
-    exit 1
+    # Never abort the whole restore over a UI nicety: every fzf consumer
+    # (fzf_multi/fzf_single) falls back to plain numbered menus when fzf is
+    # absent, so the worst case is a less pretty install, not a dead one.
+    warn "$(_t "fzf unavailable — falling back to plain numbered menus. Install it later with: dnf install fzf" "fzf unavailable — falling back to plain numbered menus. Install it later with: dnf install fzf")"
+    return 1
+}
+
+# Plain numbered menu used when fzf is unavailable. stdin = candidate lines
+# ("col1\tcol2..."), stdout = the selected lines; prompts go to stderr so the
+# command-substitution callers only ever receive the selection.
+_menu_numbered() { # $1 = multi|single, $2 = header
+    local mode="$1" header="$2"
+    local -a lines=()
+    mapfile -t lines || return 1
+    [ ${#lines[@]} -eq 0 ] && return 1
+    local i num tok sel
+    {
+        echo ""
+        echo "  $header"
+        echo "  ------------------------------------------------------------"
+        for i in "${!lines[@]}"; do
+            printf '  %3d) %s\n' "$((i + 1))" "$(printf '%s' "${lines[$i]}" | cut -f1,2 | tr '\t' '  ')"
+        done
+        if [ "$mode" = multi ]; then
+            printf '  输入序号（空格分隔；直接回车=全选）: '
+        else
+            printf '  输入序号（直接回车=1）: '
+        fi
+    } >&2
+    sel=""
+    if { :; } </dev/tty 2>/dev/null; then   # only prompt when a real TTY exists
+        read -r sel </dev/tty || sel=""
+    fi
+    if [ "$mode" = multi ] && [ -z "$sel" ]; then
+        printf '%s\n' "${lines[@]}"
+        return 0
+    fi
+    [ "$mode" = single ] && [ -z "$sel" ] && sel="1"
+    local -a picks=()
+    for tok in $sel; do
+        [[ "$tok" =~ ^[0-9]+$ ]] || continue
+        num=$((tok))
+        (("$num" >= 1 && "$num" <= ${#lines[@]})) || continue
+        picks+=("${lines[$((num - 1))]}")
+    done
+    [ ${#picks[@]} -eq 0 ] && return 1
+    printf '%s\n' "${picks[@]}"
 }
 
 # fzf multi-select (see 99-apps.sh: select all by default / TAB toggle / Ctrl-A select all / Ctrl-D deselect all)
 #  stdin: lines of "field1\tfield2"; stdout: lines selected by the user
 fzf_multi() {
-    fzf --multi --layout=reverse --border=rounded --margin=1,2 \
-        --delimiter=$'\t' --with-nth=1,2 \
-        --bind 'load:select-all' \
-        --bind 'ctrl-a:select-all,ctrl-d:deselect-all,j:down,k:up' \
-        --pointer=">" --marker="* " --ansi \
-        --header="$1"
+    if command -v fzf >/dev/null 2>&1; then
+        fzf --multi --layout=reverse --border=rounded --margin=1,2 \
+            --delimiter=$'\t' --with-nth=1,2 \
+            --bind 'load:select-all' \
+            --bind 'ctrl-a:select-all,ctrl-d:deselect-all,j:down,k:up' \
+            --pointer=">" --marker="* " --ansi \
+            --header="$1"
+    else
+        _menu_numbered multi "$1"
+    fi
 }
 
 # fzf single-select (rollback etc.: nothing preselected, TAB/Ctrl-D meaningless)
 fzf_single() {
-    fzf --layout=reverse --border=rounded --margin=1,2 \
-        --delimiter=$'\t' --with-nth=1,2 \
-        --pointer=">" --marker="" --ansi \
-        --header="$1"
+    if command -v fzf >/dev/null 2>&1; then
+        fzf --layout=reverse --border=rounded --margin=1,2 \
+            --delimiter=$'\t' --with-nth=1,2 \
+            --pointer=">" --marker="" --ansi \
+            --header="$1"
+    else
+        _menu_numbered single "$1"
+    fi
 }
 
 # Resolve the DRM connector at session startup, after GDM has handed the device
@@ -777,6 +830,19 @@ ensure_rhel_repos() {
     if ! dnf config-manager --help >/dev/null 2>&1; then
         dnf install -y dnf-plugins-core 2>/dev/null || true
     fi
+    # *-testing repos (epel-testing, ...) often ship incomplete metadata on fresh
+    # minor releases, and dnf aborts EVERY install while ANY enabled repo fails
+    # to download its metadata ("为仓库 ... 下载元数据失败"). This install never
+    # wants -testing packages — disable them idempotently so a broken testing
+    # mirror can never wedge the whole restore.
+    local _trepo _tdisabled=0
+    for _trepo in $(dnf repolist --all 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /-testing(\/|$)/ {print $1}'); do
+        dnf config-manager setopt "${_trepo}.enabled=0" >/dev/null 2>&1 || true
+        dnf config-manager --set-disabled "$_trepo" >/dev/null 2>&1 || true
+        _tdisabled=1
+        log "$(_t "Disabled -testing repo (avoids dnf metadata failures): " "Disabled -testing repo (avoids dnf metadata failures): ") $_trepo"
+    done
+    [ "$_tdisabled" -eq 1 ] && dnf clean all >/dev/null 2>/dev/null || true
     log "$(_t "Enabling CRB / PowerTools (CodeReady Builder)..." "Enabling CRB / PowerTools (CodeReady Builder)...")"
     # Rocky ships a `crb enable` helper; try it first.
     command -v crb >/dev/null 2>&1 && crb enable >/dev/null 2>&1 || true
