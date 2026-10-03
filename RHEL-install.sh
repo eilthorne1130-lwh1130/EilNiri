@@ -64,7 +64,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.10.2"
+SCRIPT_VERSION="1.10.3"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -328,6 +328,15 @@ declare -A SOURCE_PKGS=(
     [hypridle]="https://github.com/hyprwm/hypridle"
 )
 
+# Source builds pinned to a release tag instead of master. Master chases the
+# newest dependency floors — e.g. fuzzel master needs pixman >= 0.46 while EL10
+# ships 0.43.4 — whereas the 1.11.x releases build fine on old distros
+# (verified against the tag's meson.build: pixman unconstrained,
+# wayland-protocols >= 1.32, fcft 3.x via submodule fallback).
+declare -A SOURCE_TAG=(
+    [fuzzel]=1.11.1
+)
+
 # hyprlock / hypridle system build dependencies (RHEL family names).
 # NOTE: upstream migrated hyprlock/hypridle from Rust to C++/CMake (repos no longer
 # contain a Cargo.toml). On distros where the hypr C++ stack (hyprwayland-scanner/
@@ -361,7 +370,7 @@ SRC_DEPS_WAYBAR=(gtkmm30-devel gtkmm4.0-devel gtk-layer-shell-devel jsoncpp-deve
     pulseaudio-libs-devel pipewire-devel wireplumber-devel bluez-libs-devel
     libdbusmenu-gtk3-devel libmpdclient-devel upower-devel)
 SRC_DEPS_COPYQ=(qt6-qtbase-devel qt6-qtdeclarative-devel qt6-qtsvg-devel
-    qt6-qttools-devel qt6-qtwayland-devel libXtst-devel)
+    qt6-qttools-devel qt6-qtwayland-devel qt6-qtmultimedia-devel libXtst-devel libX11-devel)
 SRC_DEPS_PLAYERCTL=(glib2-devel gobject-introspection-devel)
 FCITX5_RIME_REPO="https://github.com/fcitx/fcitx5-rime"
 LIBRIME_REPO="https://github.com/rime/librime"
@@ -780,7 +789,10 @@ WRAPEOF
 _rhel_refresh_enablerepo() {
     RHEL_DNF_ENABLEREPO=()
     local _ids _id
-    _ids=$(dnf repolist --all 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /(^epel|crb|powertools|codeready|copr)/ {print $1}')
+    # repolist WITHOUT --all: only ENABLED repos. Using --all resurrected repos
+    # we deliberately disabled (epel-testing) as explicit --enablerepo= flags,
+    # re-triggering their metadata failures on every single dnf call.
+    _ids=$(dnf repolist 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /(^epel|crb|powertools|codeready|copr)/ {print $1}')
     for _id in $_ids; do
         RHEL_DNF_ENABLEREPO+=("--enablerepo=$_id")
     done
@@ -1088,6 +1100,13 @@ install_rhel() {
             install_rime_ice
             continue
         fi
+        # EL has no fcitx5 packages at all (not in EPEL, no COPR epel-10 chroot —
+        # verified 2026-10). Short-circuit BEFORE per-candidate resolution so the
+        # whole family lands in MANUAL guidance instead of FAILED entries.
+        if [[ "$p" =~ ^fcitx5 ]] && [ "$DISTRO_ID" != fedora ]; then
+            MANUAL_ITEMS+=("$p — EL10 系无 fcitx5 RPM（未进 EPEL）。可选: 1) 保持现状用 ibus: dnf install ibus-libpinyin; 2) 换 Fedora 系（fcitx5 在官方仓库）; 3) 自行从 Fedora 源编译。桌面其余功能不受影响。")
+            continue
+        fi
         if [ -n "${RHEL_MANUAL[$p]:-}" ]; then
             MANUAL_ITEMS+=("$p — ${RHEL_MANUAL[$p]}")
             continue
@@ -1178,11 +1197,6 @@ install_rhel() {
                 install_source_package "$p" "${SOURCE_PKGS[$p]}"
             elif [ "$p" = "ttf-jetbrains-mono-nerd" ]; then
                 log "$(_t "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead." "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead.")"
-            elif [[ "$p" =~ ^fcitx5 ]] && [ "$DISTRO_ID" != fedora ]; then
-                # fcitx5 has no EPEL builds and no COPR with an epel-10 chroot
-                # (verified 2026-10) — give actionable advice instead of a bare
-                # failure entry. Everything else on the desktop is unaffected.
-                MANUAL_ITEMS+=("$p — EL10 系无 fcitx5 RPM（未进 EPEL）。可选: 1) 保持现状用 ibus: dnf install ibus-libpinyin; 2) 换 Fedora 系（fcitx5 在官方仓库）; 3) 自行从 Fedora 源编译。桌面其余功能不受影响。")
             elif [ -n "${RHEL_FAIL_HINT[$p]:-}" ]; then
                 MANUAL_ITEMS+=("$name — not available in repo. ${RHEL_FAIL_HINT[$p]}")
             else
@@ -1280,11 +1294,13 @@ _git_clone_submodules() { # $1 = repo dir
 # Clone a GitHub repo, falling back to the CN mirror proxies when direct git fails
 # (git smart-HTTP works through ghfast.top and friends; verified with git ls-remote).
 # Bounded so a blocked GitHub never hangs the install (git has no default timeout).
-git_clone_gh() { # $1 = github repo URL, $2 = dest dir; returns 0 on success
-    local repo="$1" dest="$2" prox full
+git_clone_gh() { # $1 = github repo URL, $2 = dest dir, [$3 = branch/tag ref]; returns 0 on success
+    local repo="$1" dest="$2" ref="${3:-}" prox full
+    local -a _br=()
+    [ -n "$ref" ] && _br=(--branch "$ref")
     [ -n "$repo" ] && [ -n "$dest" ] || return 1
     if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
-        clone --depth 1 "$repo" "$dest" >/dev/null 2>&1; then
+        clone --depth 1 ${_br[@]+"${_br[@]}"} "$repo" "$dest" >/dev/null 2>&1; then
         _git_clone_submodules "$dest"
         return 0
     fi
@@ -1292,7 +1308,7 @@ git_clone_gh() { # $1 = github repo URL, $2 = dest dir; returns 0 on success
         full="${prox%/}/$repo"
         rm -rf "$dest"
         if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
-            clone --depth 1 "$full" "$dest" >/dev/null 2>&1; then
+            clone --depth 1 ${_br[@]+"${_br[@]}"} "$full" "$dest" >/dev/null 2>&1; then
             _git_clone_submodules "$dest"
             return 0
         fi
@@ -2220,6 +2236,16 @@ RIME_ICE_ZIP_URL="https://github.com/iDvel/rime-ice/releases/latest/download/ful
 install_fcitx5_rime_source() {
     [ "$DISTRO_FAMILY" = rhel ] || return 1
     [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
+    # Bail out EARLY when the fcitx5 headers are unobtainable (EL10: no fcitx5
+    # RPM in any repo). The old order installed the dep batch, spent 10+ minutes
+    # building librime, and only THEN discovered fcitx5-devel was missing.
+    if ! pkg-config --exists fcitx5 2>/dev/null \
+        && ! { find /usr/lib64/cmake /usr/lib/cmake /usr/local/lib64/cmake /usr/local/lib/cmake \
+            -iname '*Fcitx5*Config.cmake' -o -iname '*Fcitx5*config.cmake' 2>/dev/null | grep -q .; } \
+        && ! dnf repoquery --available fcitx5-devel >/dev/null 2>&1; then
+        warn "$(_t "fcitx5-devel is unavailable on this release; fcitx5-rime source build cannot continue." "fcitx5-devel is unavailable on this release; fcitx5-rime source build cannot continue.")"
+        return 1
+    fi
     local work logf="$LOG_DIR/fcitx5-rime-build.log"
     work=$(mktemp -d)
     register_temp_path "$work"
@@ -2267,6 +2293,15 @@ install_rime_ice() {
     if [ -z "$TARGET_USER" ] || [ -z "$HOME_DIR" ]; then
         MANUAL_ITEMS+=("rime-ice — target user not detected yet, deploy manually: git clone $RIME_ICE_REPO -> $dest")
         return 1
+    fi
+    # rime-ice is input data for the fcitx5-rime engine — without the engine it
+    # is dead weight. EL10 has no fcitx5 RPM at all (see the IME guidance), so
+    # skip cleanly instead of failing a doomed librime/fcitx5-rime source build.
+    if ! pkg_installed fcitx5-rime && ! command -v fcitx5 >/dev/null 2>&1 \
+        && [ "$DISTRO_ID" != fedora ]; then
+        warn "$(_t "rime-ice skipped — no fcitx5 engine on this system (EL has no fcitx5 package); the dictionary alone is useless." "rime-ice skipped — no fcitx5 engine on this system (EL has no fcitx5 package); the dictionary alone is useless.")"
+        MANUAL_ITEMS+=("rime-ice — 已跳过（系统无 fcitx5 引擎；将来装好 fcitx5 后重跑 restore 可自动补齐词典）")
+        return 0
     fi
 
     # fcitx5-rime must exist for this to be useful — try to install it first, since
@@ -2441,14 +2476,17 @@ build_hypr_stack() {
         return 1
     }
 
-    # Skip a component when the packaged -devel is already available:
+    # Skip a component when it is already resolvable:
     #   hyprwayland-scanner  -> `hyprwayland-scanner` binary on PATH
-    #   hyprutils/hyprlang/...-> its cmake config under /usr/lib{,64}/cmake/<name>/
+    #   others               -> pkg-config module (hyprland-protocols is
+    #                           pc-only, lives in /usr/share/pkgconfig) or its
+    #                           cmake config under /usr/lib{,64}/cmake/<name>/
     _hypr_ok() { # $1 = name (also the cmake config dir basename)
         local n="$1" d
         case "$n" in
             hyprwayland-scanner) command -v hyprwayland-scanner >/dev/null 2>&1 && return 0 ;;
             *)
+                pkg-config --exists "$n" 2>/dev/null && return 0
                 for d in /usr/lib/cmake/"$n" /usr/lib64/cmake/"$n" /usr/local/lib/cmake/"$n" /usr/local/lib64/cmake/"$n"; do
                     [ -d "$d" ] && find "$d" -maxdepth 1 -iname '*.cmake' 2>/dev/null | grep -qi . && return 0
                 done
@@ -2457,8 +2495,11 @@ build_hypr_stack() {
         return 1
     }
 
-    # Strict dependency order. hyprcursor is not required by hyprlock/hypridle builds,
-    # so don't force it (keeps the chain shorter and less likely to fail).
+    # Strict dependency order. hyprcursor is not required by hyprlock/hypridle
+    # builds, so don't force it (keeps the chain shorter and less likely to
+    # fail). hyprland-protocols is pc-only (required by hypridle, not by
+    # hyprlock) and has no build-time deps of its own, so it goes first.
+    _hypr_ok hyprland-protocols || _build_hypr_one hyprland-protocols || return 1
     _hypr_ok hyprwayland-scanner "hyprwayland" || _build_hypr_one hyprwayland-scanner || return 1
     _hypr_ok hyprutils "hyprutils" || _build_hypr_one hyprutils || return 1
     _hypr_ok hyprlang "hyprlang" || _build_hypr_one hyprlang || return 1
@@ -2585,11 +2626,14 @@ install_source_package() { # $1 = package, $2 = upstream repository
     # that feature); remember what is still missing so the failure report below
     # can name the real cause instead of a bare log path.
     BDEPS_MISSING=()
-    local _extra=()
+    local _extra=() _meson_args=()
     case "$pkg" in
         waybar)    _extra=("${SRC_DEPS_WAYBAR[@]}") ;;
         copyq)     _extra=("${SRC_DEPS_COPYQ[@]}") ;;
-        playerctl) _extra=("${SRC_DEPS_PLAYERCTL[@]}") ;;
+        playerctl) _extra=("${SRC_DEPS_PLAYERCTL[@]}")
+                   # playerctl's meson wants gtk-doc to render the API docs; the
+                   # runtime binary does not need them and gtk-doc is absent on EL.
+                   _meson_args=(-Dgtk-doc=false) ;;
     esac
     if [ ${#_extra[@]} -gt 0 ]; then
         dnf_install_tolerant "${_extra[@]}" || true
@@ -2598,15 +2642,17 @@ install_source_package() { # $1 = package, $2 = upstream repository
     work=$(mktemp -d)
     register_temp_path "$work"
     logf="$LOG_DIR/$pkg-build.log"
-    if ! git_clone_gh "$repo" "$work/$pkg"; then
+    # SOURCE_TAG pins known-EL-hostile projects (fuzzel) to a release that
+    # builds against the distro's older libraries instead of master.
+    if ! git_clone_gh "$repo" "$work/$pkg" "${SOURCE_TAG[$pkg]:-}"; then
         MANUAL_ITEMS+=("$pkg — source clone failed (GitHub 与 CN 镜像均不可达); 可设 EILNIRI_GH_PROXY 重试: $repo")
         return 1
     fi
     export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
     export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
-    if ! build_source_project "$pkg" "$repo" "$work" "$logf"; then
+    if ! build_source_project "$pkg" "$repo" "$work" "$logf" ${_meson_args[@]+"${_meson_args[@]}"}; then
         local _why
-        _why=$(tail -n 4 "$logf" 2>/dev/null | tr '\n' ' ')
+        _why=$(tail -n 8 "$logf" 2>/dev/null | tr '\n' ' ')
         MANUAL_ITEMS+=("$pkg — source build failed; 缺失依赖: ${_missing_deps:-（见日志）}; 依赖包需 CRB/EPEL 仓库（dnf config-manager --set-enabled crb）。日志尾部: ${_why:-empty} (full: $logf)")
         return 1
     fi
@@ -2615,17 +2661,23 @@ install_source_package() { # $1 = package, $2 = upstream repository
 }
 
 build_source_project() {
-    local pkg="$1" _repo="$2" work="$3" logf="$4" src="$work/$1"
+    local pkg="$1" _repo="$2" work="$3" logf="$4"; shift 4
+    local -a _margs=("$@")
+    local src="$work/$pkg"
     if [ -f "$src/CMakeLists.txt" ]; then
         ( cd "$src" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
             && cmake --build build -j"$(nproc)" && cmake --install build ) >"$logf" 2>&1
     elif [ -f "$src/meson.build" ]; then
         ( cd "$src" && meson setup build --prefix=/usr --libdir=lib64 --buildtype=release \
+            ${_margs[@]+"${_margs[@]}"} \
             && meson compile -C build -j"$(nproc)" && meson install -C build ) >"$logf" 2>&1
     elif [ -f "$src/Makefile" ]; then
-        # Plain-Makefile projects (e.g. brightnessctl): most honor PREFIX/DESTDIR.
-        ( cd "$src" && make -j"$(nproc)" && make install PREFIX=/usr ) >"$logf" 2>&1
+        # Plain-Makefile projects (e.g. brightnessctl): run ./configure first when
+        # present — it generates config.mk, and bare make dies with "You need to
+        # run ./configure first". PREFIX=/usr overrides the configure default.
+        ( cd "$src" && { [ ! -x ./configure ] || ./configure; } \
+            && make -j"$(nproc)" && make install PREFIX=/usr ) >"$logf" 2>&1
     else
         return 1
     fi
@@ -2866,7 +2918,10 @@ stage_services() {
             fi
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
                 local _svcerr
-                _svcerr=$(tail -n 2 "$LOG_DIR/dnf-errors.log" 2>/dev/null | tr '\n' ' ')
+                # Prefer lines about THIS provider — the shared dnf-errors.log
+                # tail often belongs to an unrelated earlier failure.
+                _svcerr=$(grep -F "$provider" "$LOG_DIR/dnf-errors.log" 2>/dev/null | tail -n 2 | tr '\n' ' ')
+                [ -z "$_svcerr" ] && _svcerr=$(tail -n 2 "$LOG_DIR/dnf-errors.log" 2>/dev/null | tr '\n' ' ')
                 FAILED_PKGS+=("svc-provider:$provider (${_svcerr:-见 $LOG_DIR/dnf-errors.log})")
                 any_failed=1
                 continue
@@ -3108,11 +3163,13 @@ install_zsh_extras() {
     # git is needed for the clones; not guaranteed present on a minimal install.
     command -v git >/dev/null 2>&1 || pm_install git 2>/dev/null || true
 
-    # 1) oh-my-zsh itself (official repo first; gitee mirror fallback for CN networks)
+    # 1) oh-my-zsh itself (official repo -> gitee mirror -> CN proxy clones).
+    #    A bare GitHub clone dies on CN networks, so never rely on it alone.
     if [ ! -d "$HOME_DIR/.oh-my-zsh" ]; then
         log "$(_t "Installing oh-my-zsh..." "Installing oh-my-zsh...")"
         if as_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null \
-            || as_user git clone --depth=1 https://gitee.com/mirrors/oh-my-zsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null; then
+            || as_user git clone --depth=1 https://gitee.com/mirrors/oh-my-zsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null \
+            || git_clone_gh https://github.com/ohmyzsh/ohmyzsh.git "$HOME_DIR/.oh-my-zsh"; then
             INSTALLED_PKGS+=("oh-my-zsh")
         else
             MANUAL_ITEMS+=("oh-my-zsh — clone failed (GitHub 与 gitee 镜像均不可达); 手动: git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git $HOME_DIR/.oh-my-zsh")
@@ -3133,9 +3190,11 @@ install_zsh_extras() {
                     zsh-syntax-highlighting) _plug_url="https://github.com/zsh-users/zsh-syntax-highlighting" ;;
                 esac
                 log "$(_t "Installing oh-my-zsh plugin: " "Installing oh-my-zsh plugin: ") $_plugin"
-                as_user git clone --depth=1 "$_plug_url" \
-                    "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" 2>/dev/null \
-                    || MANUAL_ITEMS+=("oh-my-zsh plugin $_plugin — clone failed")
+                # git_clone_gh adds the CN mirror-proxy fallback — a direct
+                # GitHub clone from CN usually dies. It clones as root; the
+                # chown -R below hands the tree back to the target user.
+                git_clone_gh "$_plug_url" "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" \
+                    || MANUAL_ITEMS+=("oh-my-zsh plugin $_plugin — clone failed (GitHub 与镜像均不可达)")
             fi
         done
         chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
