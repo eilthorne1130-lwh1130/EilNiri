@@ -64,7 +64,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.26"
+SCRIPT_VERSION="1.10.0"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -224,7 +224,7 @@ declare -A GROUP_PKGS=(
     # distro packages install them in /usr/share or /etc/zsh/zshrc.d, which oh-my-zsh's
     # plugins=() cannot use. install_zsh_extras clones them into ~/.oh-my-zsh/custom/plugins/
     # (works identically on Arch / RHEL / Debian families).
-    [core]="niri waybar mako fuzzel kitty polkit-gnome xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh"
+    [core]="niri waybar mako fuzzel kitty polkit-agent xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh"
     [lock]="hyprlock hypridle"
     [wallpaper]="awww waypaper"
     [clip]="copyq satty grim slurp"
@@ -268,22 +268,24 @@ declare -A RHEL_CANDIDATES=(
     [fcitx5-configtool]="fcitx5-configtool fcitx5-config-qt"
     [fcitx5-gtk]="fcitx5-gtk fcitx5-frontend-gtk3 fcitx5-frontend-all"
     [fcitx5-qt]="fcitx5-qt fcitx5-frontend-qt5 fcitx5-frontend-all"
+    # Standalone polkit authentication agent. polkit-gnome is retired upstream and
+    # packaged by neither Fedora nor EPEL; lxpolkit was merged into lxsession. Both
+    # mates below are actively maintained and built for Fedora AND EPEL.
+    [polkit-agent]="mate-polkit polkit-kde"
 )
-# Wayland extras that Fedora ships in official repos but Rocky/Alma/CentOS
-# Stream 10 only have via COPR. Fedora never hits this path (dnf succeeds first).
+# COPR usage on the RHEL family — chroot support verified against
+# copr.fedorainfracloud.org (the #1 cause of "dnf copr enable" failures on EL is
+# mapping packages to projects that never built an epel chroot):
+#   yalter/niri              builds fedora-* AND epel-10-*  -> the only usable one
+#   alebastr/sway-extras     builds fedora-* ONLY           -> "Chroot not found" on EL
+#   solopasha/hyprland       builds fedora-rawhide ONLY, owner warns against using it
+# waybar/mako/fuzzel/grim/slurp/copyq/playerctl/brightnessctl therefore go
+# official repo -> EPEL retry -> source build (SOURCE_PKGS); hyprlock/hypridle go
+# official repo (Fedora) -> source build via build_hypr_stack (EL).
+# Fedora never hits this path: everything ships in Fedora official repos.
 declare -A RHEL_COPR_PKG=(
-    [waybar]=alebastr/sway-extras
-    [mako]=alebastr/sway-extras
-    [fuzzel]=alebastr/sway-extras
-    [grim]=alebastr/sway-extras
-    [slurp]=alebastr/sway-extras
-    [xwayland-satellite]=yalter/niri
     [niri]=yalter/niri
-    [hyprlock]=solopasha/hyprland
-    [hypridle]=solopasha/hyprland
-    [copyq]=alebastr/sway-extras
-    [playerctl]=alebastr/sway-extras
-    [brightnessctl]=alebastr/sway-extras
+    [xwayland-satellite]=yalter/niri
 )
 # Packages expected from EPEL on EL10 (Fedora has them in the base repo).
 # After a failed dnf, retry with --enablerepo=epel* before COPR/source.
@@ -302,8 +304,8 @@ declare -A RHEL_MANUAL=(
 # RHEL family: extra hint when dnf install fails (available in Fedora official repo, but not on Rocky/Alma/CentOS Stream)
 # (xwayland-satellite falls back to cargo install automatically)
 declare -A RHEL_FAIL_HINT=(
-    [hyprlock]="Available in the Fedora official repo (dnf install hyprlock); on Rocky/Alma/CentOS try EPEL / Copr, or install the RPM from the Fedora repo manually"
-    [hypridle]="Available in the Fedora official repo (dnf install hypridle); on Rocky/Alma/CentOS try EPEL / Copr, or install the RPM from the Fedora repo manually"
+    [hyprlock]="Available in the Fedora official repo (dnf install hyprlock); on Rocky/Alma/CentOS the script builds it from source automatically (needs CRB/EPEL -devel packages)"
+    [hypridle]="Available in the Fedora official repo (dnf install hypridle); on Rocky/Alma/CentOS the script builds it from source automatically (needs CRB/EPEL -devel packages)"
 )
 # Packages installable via pip as a fallback (common to Arch/RHEL/Debian)
 declare -A PIP_PKGS=(
@@ -326,15 +328,13 @@ declare -A SOURCE_PKGS=(
     [hypridle]="https://github.com/hyprwm/hypridle"
 )
 
-# hyprlock / hypridle system build dependencies (Debian/Ubuntu names).
+# hyprlock / hypridle system build dependencies (RHEL family names).
 # NOTE: upstream migrated hyprlock/hypridle from Rust to C++/CMake (repos no longer
-# contain a Cargo.toml), so the list covers BOTH the old Rust build and the new CMake
-# build. On distros where the hypr C++ stack (hyprwayland-scanner/hyprutils/hyprlang/
-# hyprgraphics/hyprcursor) is NOT packaged (Rocky/Alma/CentOS Stream), those deps are
-# absent and build_hypr_stack() compiles them from source in dependency order first.
-# Missing entries are tolerated (apt_install_tolerant / dnf_install_tolerant), so a
-# package absent on an older release never aborts the whole build-deps step.
-# hyprlock / hypridle system build dependencies (RHEL family names)
+# contain a Cargo.toml). On distros where the hypr C++ stack (hyprwayland-scanner/
+# hyprutils/hyprlang/hyprgraphics/hyprcursor) is NOT packaged (Rocky/Alma/CentOS
+# Stream), those deps are absent and build_hypr_stack() compiles them from source
+# in dependency order first. Missing entries are tolerated (dnf_install_tolerant),
+# so a package absent on an older release never aborts the whole build-deps step.
 HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git wayland-devel wayland-protocols-devel
     pango-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel libdrm-devel libxkbcommon-devel libxcb-devel
     cairo-gobject-devel cairo-devel pam-devel libpam-devel pixman-devel libjpeg-turbo-devel libwebp-devel
@@ -430,7 +430,6 @@ DRY_PKGS=() DRY_SVCS=()  # items "that would be executed" in dry-run mode; kept 
 DISTRO_FAMILY=""   # arch | rhel | debian
 DISTRO_ID=""       # os-release ID (e.g. ubuntu, debian, arch)
 DISTRO_ID_LIKE=""  # os-release ID_LIKE (detect Ubuntu-derived distros like openkylin/deepin)
-UBUNTU_VER_NUM=0   # numeric Ubuntu version (e.g. 2404), 0 = not Ubuntu
 TARGET_USER=""
 HOME_DIR=""
 
@@ -474,23 +473,8 @@ pm_install() { # $@ = package names
 
 # Install as many packages of a batch as possible; return non-zero only when one or more
 # names are genuinely unavailable. Used for build-deps batches that must be resilient to a
-# few absent names (so a single renamed -dev package no longer aborts the whole build).
+# few absent names (so a single renamed -devel package no longer aborts the whole build).
 BDEPS_MISSING=()
-apt_install_tolerant() {
-    BDEPS_MISSING=()
-    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$@"); return "$DRY_RUN_RC"; }
-    if exe apt-get install -y "$@" 2>>"$LOG_DIR/apt-errors.log"; then
-        return 0   # whole batch installed
-    fi
-    local p erc
-    for p in "$@"; do
-        erc=0
-        exe apt-get install -y "$p" 2>>"$LOG_DIR/apt-errors.log" || erc=$?
-        [ "$erc" -ne 0 ] && BDEPS_MISSING+=("$p")
-    done
-    [ ${#BDEPS_MISSING[@]} -eq 0 ]
-}
-
 dnf_install_tolerant() {
     BDEPS_MISSING=()
     [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$@"); return "$DRY_RUN_RC"; }
@@ -513,7 +497,7 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v41"
+PROGRESS_VERSION="v49"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -788,8 +772,22 @@ ensure_rhel_repos() {
     fi
 }
 
-# Enable the COPRs that carry Wayland extras on EL10. Idempotent: already-enabled
-# COPRs succeed quickly. Missing chroots (EL8/9) fail quietly; callers fall back.
+# COPR chroot for the running system: epel-<major>-<arch> on the RHEL family,
+# nothing on Fedora (COPR is never used there — official repos cover everything).
+rhel_copr_chroot() {
+    [ "${DISTRO_ID:-}" = fedora ] && return 0
+    local _maj _arch
+    _maj=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
+    _arch=$(uname -m)
+    [ -n "$_maj" ] && [ -n "$_arch" ] && printf 'epel-%s-%s\n' "$_maj" "$_arch"
+}
+
+# Enable the COPRs that carry packages missing from base/EPEL on EL. Idempotent:
+# already-enabled COPRs succeed quickly. Before touching dnf, every candidate is
+# probed over HTTP for THIS system's chroot (e.g. epel-10-x86_64) — a 404 means
+# the project never built for it, and we skip cleanly instead of letting
+# `dnf copr enable` die with "Chroot not found" (the classic EL failure). The
+# explicit chroot is also passed to dnf so its auto-detection can never guess wrong.
 ensure_rhel_coprs() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     if ! dnf copr --help >/dev/null 2>&1; then
@@ -799,11 +797,21 @@ ensure_rhel_coprs() {
         warn "$(_t "dnf copr not available — EL packages missing from base/EPEL will fall back to source builds." "dnf copr not available — EL packages missing from base/EPEL will fall back to source builds.")"
         return 1
     fi
-    local _copr _copr_log="$LOG_DIR/copr.log"
-    for _copr in alebastr/sway-extras yalter/niri solopasha/hyprland; do
-        log "$(_t "Enabling COPR " "Enabling COPR ") $_copr ..."
-        if dnf -y copr enable "$_copr" >>"$_copr_log" 2>&1 || dnf copr enable -y "$_copr" >>"$_copr_log" 2>&1; then
-            log "$(_t "COPR enabled: " "COPR enabled: ") $_copr"
+    local _copr _copr_log="$LOG_DIR/copr.log" _chroot _probe_url
+    _chroot=$(rhel_copr_chroot)
+    if [ -z "$_chroot" ]; then
+        warn "$(_t "Cannot determine the EPEL COPR chroot for this system — skipping COPR; source fallback will be used." "Cannot determine the EPEL COPR chroot for this system — skipping COPR; source fallback will be used.")"
+        return 1
+    fi
+    for _copr in yalter/niri; do
+        _probe_url="https://copr.fedorainfracloud.org/coprs/${_copr}/repo/${_chroot}/dnf.repo"
+        if ! curl -fsSL --connect-timeout 10 --max-time 30 -o /dev/null "$_probe_url" 2>/dev/null; then
+            warn "$(_t "COPR " "COPR ") $_copr $(_t "has no " "has no ") $_chroot $(_t "chroot (or copr.fedorainfracloud.org is unreachable) — skipping; source-build fallback will be used." "chroot (or copr.fedorainfracloud.org is unreachable) — skipping; source-build fallback will be used.")"
+            continue
+        fi
+        log "$(_t "Enabling COPR " "Enabling COPR ") $_copr $(_t "(chroot " "(chroot ") $_chroot) ..."
+        if dnf -y copr enable "$_copr" "$_chroot" >>"$_copr_log" 2>&1 || dnf copr enable -y "$_copr" "$_chroot" >>"$_copr_log" 2>&1; then
+            log "$(_t "COPR enabled: " "COPR enabled: ") $_copr ($_chroot)"
         else
             warn "$(_t "COPR enable failed; source fallback will be used: " "COPR enable failed; source fallback will be used: ") $_copr"
         fi
@@ -861,14 +869,6 @@ load_app_universe() {
             REPO_UNIVERSE+=("$raw")
         done
     done
-    if [ "$DISTRO_FAMILY" != arch ]; then
-        local _filtered=() _pkg
-        for _pkg in "${REPO_UNIVERSE[@]}"; do
-            [ "$_pkg" = zsh ] && continue
-            _filtered+=("$_pkg")
-        done
-        REPO_UNIVERSE=("${_filtered[@]}")
-    fi
 }
 
 group_tag() { # $1 = pkg
@@ -1008,13 +1008,13 @@ install_rhel() {
             }
             name="$resolved"
         fi
-        # EL10 Wayland extras are published by COPR rather than EPEL. Prefer
-        # the matching COPR before an EPEL retry, then retain the normal dnf
-        # path as a fallback for Fedora/RHEL variants that package them.
-        if [ -n "${RHEL_COPR_PKG[$p]:-}" ] \
-            && [[ "$p" =~ ^(waybar|mako|fuzzel|grim|slurp|niri|xwayland-satellite|hyprlock|hypridle)$ ]]; then
+        # EL-only COPR shortcut for niri/xwayland-satellite (yalter/niri is the one
+        # project that builds an epel-10 chroot). Fedora ships both in official
+        # repos, so COPR is never attempted there — attempting it on a chroot the
+        # project never built is exactly what made `dnf copr enable` blow up.
+        if [ "$DISTRO_ID" != fedora ] && [ -n "${RHEL_COPR_PKG[$p]:-}" ]; then
             local _copr_first=0
-            install_rhel_copr_pkg "$name" "${RHEL_COPR_PKG[$p]}" || _copr_first=$?
+            install_rhel_copr_pkg "$name" "${RHEL_COPR_PKG[$p]}" "$(rhel_copr_chroot)" || _copr_first=$?
             if [ "$_copr_first" -eq 0 ]; then
                 INSTALLED_PKGS+=("$name (COPR)")
                 continue
@@ -1037,9 +1037,9 @@ install_rhel() {
                 exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$name" || erc=$?
             fi
         fi
-        if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ -n "${RHEL_COPR_PKG[$p]:-}" ]; then
+        if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ "$DISTRO_ID" != fedora ] && [ -n "${RHEL_COPR_PKG[$p]:-}" ]; then
             local _crc=0
-            install_rhel_copr_pkg "$name" "${RHEL_COPR_PKG[$p]}" || _crc=$?
+            install_rhel_copr_pkg "$name" "${RHEL_COPR_PKG[$p]}" "$(rhel_copr_chroot)" || _crc=$?
             if [ "$_crc" -eq 0 ]; then
                 INSTALLED_PKGS+=("$name (COPR)")
                 continue
@@ -1065,8 +1065,6 @@ install_rhel() {
                 install_source_package "$p" "${SOURCE_PKGS[$p]}"
             elif [ "$p" = "ttf-jetbrains-mono-nerd" ]; then
                 log "$(_t "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead." "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead.")"
-            elif [ "$p" = "polkit-gnome" ]; then
-                log "$(_t "polkit-gnome not in dnf — niri config already uses /usr/libexec; skipping." "polkit-gnome not in dnf — niri config already uses /usr/libexec; skipping.")"
             elif [ -n "${RHEL_FAIL_HINT[$p]:-}" ]; then
                 MANUAL_ITEMS+=("$name — not available in repo. ${RHEL_FAIL_HINT[$p]}")
             else
@@ -1078,8 +1076,8 @@ install_rhel() {
 
 # Enable a COPR and install one package. Best-effort: missing copr plugin or
 # missing chroot for this EL version returns 1 quickly (caller falls back).
-install_rhel_copr_pkg() { # $1=pkg $2=copr (owner/name)
-    local _pkg="$1" _copr="$2"
+install_rhel_copr_pkg() { # $1=pkg $2=copr (owner/name) [$3=chroot, e.g. epel-10-x86_64]
+    local _pkg="$1" _copr="$2" _chroot="${3:-}"
     [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$_pkg (COPR $_copr)"); return "$DRY_RUN_RC"; }
     if ! dnf copr --help >/dev/null 2>&1; then
         dnf install -y dnf-plugins-core 2>/dev/null || true
@@ -1087,7 +1085,13 @@ install_rhel_copr_pkg() { # $1=pkg $2=copr (owner/name)
     if ! dnf copr --help >/dev/null 2>&1; then
         return 1
     fi
-    if ! exe dnf -y copr enable "$_copr" && ! exe dnf copr enable -y "$_copr"; then
+    # An explicit chroot avoids dnf's auto-detection ("Chroot not found" on EL
+    # derivatives); without one the historical dnf4/dnf5 argument orders are tried.
+    if [ -n "$_chroot" ]; then
+        if ! exe dnf -y copr enable "$_copr" "$_chroot" && ! exe dnf copr enable -y "$_copr" "$_chroot"; then
+            return 1
+        fi
+    elif ! exe dnf -y copr enable "$_copr" && ! exe dnf copr enable -y "$_copr"; then
         return 1
     fi
     _rhel_refresh_enablerepo
@@ -1110,7 +1114,7 @@ install_niri_copr() {
         log "$(_t "yalter/niri COPR builds only for EL10 (this is EL$_maj) — skipping COPR path." "yalter/niri COPR builds only for EL10 (this is EL$_maj) — skipping COPR path.")"
         return 1
     fi
-    install_rhel_copr_pkg niri yalter/niri
+    install_rhel_copr_pkg niri yalter/niri "$(rhel_copr_chroot)"
 }
 
 # --- GitHub download (official direct; resume + retries + timeouts) ---
@@ -1237,35 +1241,11 @@ EOF
     log "$(_t "CN timezone detected: cargo/rustup mirror enabled (rsproxy.cn)" "CN timezone detected: cargo/rustup mirror enabled (rsproxy.cn)")"
 }
 
-# --- niri install (common to Debian family and non-Fedora RHEL family; these repos have no niri) ---
+# --- niri install (common to the non-Fedora RHEL family; these repos have no niri) ---
 # Strategy: 1) official prebuilt binary (if this release provides it) 2) offline cargo build from the official vendored source archive 3) manual report
 # Fedora's official repo already has niri, so dnf succeeds and this is never reached
 NIRI_GH="https://github.com/niri-wm/niri/releases"
 
-# niri system build dependencies (Debian/Ubuntu names, per the official niri Packaging docs)
-NIRI_BUILD_DEPS=(build-essential cmake pkg-config curl tar clang libclang-dev \
-    libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev wayland-protocols \
-    libinput-dev libdisplay-info-dev libudev-dev libseat-dev \
-    libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
-    libpango1.0-dev \
-    libpipewire-0.3-dev libdbus-1-dev \
-    libxcb-composite0-dev libxcb-ewmh-dev libxcb-icccm4-dev libxcb-randr0-dev \
-    libxcb-xfixes0-dev libxcb-present-dev libxcb-render-util0-dev libxcb-res0-dev \
-    libxcb-shape0-dev libxcb-util-dev libxcb-xkb-dev libxcb-xinerama0-dev)
-# Debian/Ubuntu version-specific package name mappings for niri build deps
-# (different Debian/Ubuntu versions use different package names for the same library)
-#
-# NOTE: mappings are only a *first try* — install_niri_binary re-verifies each
-# mapped name with apt-cache and falls back to the original name when the mapped
-# one does not exist.  Do NOT hardcode guessed names here (the old
-# libdisplay-info-dev -> libdisplay-info0-dev entry was wrong on Debian 12:
-# display-info 0.1.x ships libdisplay-info-dev / libdisplay-info1, so the mapped
-# package never existed and the build died with "libdisplay-info.pc not found"
-# after 10-20 min of compiling).
-declare -A DEB_NIRI_BDEPS_MAP=(
-    [libhyprutils-dev]=""                         # optional, only in newer versions
-    [libhyprlang-dev]=""                          # optional, only in newer versions
-)
 # niri system build dependencies (RHEL/Fedora names; some need EPEL/CRB — fall back to the manual report when missing)
 NIRI_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config curl tar clang libclang-devel \
     libxkbcommon-devel libxkbcommon-x11-devel libwayland-devel wayland-protocols-devel \
@@ -1459,13 +1439,10 @@ ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_ST
             fi
         done
         [ ${#PC_STILL_MISSING[@]} -eq 0 ] && return 0
-        # 仍缺且 (a) apt 报镜像/源故障特征，或 (b) 候选包根本不在 apt 列表（universe 缺失/
-        # 源列表陈旧，apt 无报错）→ 先查时钟，再换源重试一轮（最多一次）
         break
     done
-    # 失败原因说明（按发行版系生成，避免在 RHEL/Arch 上误报 Debian 专属的 universe/apt 提示）
-    local _perr _hint
-    _perr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
+    # 失败原因说明（RHEL 系：通常是 -devel 包不在 base 仓库，需 EPEL/CRB）
+    local _hint
     _hint="dnf 里没有提供该 .pc 的 -devel 包（xcb-cursor 对应 xcb-util-cursor-devel；需 EPEL/CRB）。可运行 'dnf install --enablerepo=epel,crb xcb-util-cursor-devel' 后重跑"
     PC_FAIL_HINT="$_hint"
     [ ${#PC_STILL_MISSING[@]} -eq 0 ]
@@ -1698,107 +1675,16 @@ EOF
     fi
     
     local bdeps_rc=0
-    if [ "$DISTRO_FAMILY" = debian ]; then
-        # --- Debian: apply version-specific package name mapping ---
-        # Each mapped name is verified at runtime with apt-cache: if the mapped
-        # package does not exist in this release, the ORIGINAL name is used instead.
-        # (A wrong hardcoded mapping used to silently drop libdisplay-info-dev and
-        # make the build die with "libdisplay-info.pc not found" after 10-20 min.)
-        local _debian_deps=() _pkg_name _mapped
-        for _pkg_name in "${NIRI_BUILD_DEPS[@]}"; do
-            _mapped="${DEB_NIRI_BDEPS_MAP[$_pkg_name]:-}"
-            if [ -n "$_mapped" ] && apt-cache policy "$_mapped" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
-                _debian_deps+=("$_mapped")
-            else
-                _debian_deps+=("$_pkg_name")
-            fi
-        done
-        
-        log "$(_t "Installing niri build dependencies (Debian/Ubuntu)..." "Installing niri build dependencies (Debian/Ubuntu)...")"
-        apt_install_tolerant "${_debian_deps[@]}" || bdeps_rc=$?
-        
-        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some niri build deps unavailable:" "Some niri build deps unavailable:") ${BDEPS_MISSING[*]}"
-        fi
-        
-        # --- Debian: hard verification of critical build deps ---
-        # These are absolutely required; cargo will fail with obscure errors if missing.
-        # libdisplay-info-dev is included because a missing display-info produces the
-        # confusing "libdisplay-info.pc not found" build-script error after a long build.
-        local _crit_deps=(build-essential cmake pkg-config clang libclang-dev \
-            libwayland-dev wayland-protocols libpango1.0-dev libdisplay-info-dev \
-            libxkbcommon-dev libinput-dev)
-        local _crit _missing_crit=0 _tried_mirror=0 _last_crit=""
-        # 关键依赖校验（带"换源后自动重试"）：当 apt 报 404 / 无法下载 / Failed to fetch
-        # （典型：cn.archive.ubuntu.com 镜像同步滞后，索引有新版本但 pool 里 .deb 404）
-        # 时，按 tuna → aliyun → ustc 顺序自动尝试换源；每个候选源换完会用 curl 探测
-        # 之前 404 的 .deb 是否真的被新镜像同步（显式 404 才换下一个），换源成功则重试
-        # 整轮校验。MANUAL 报告只在最终失败时追加一次。
-        while :; do
-            _missing_crit=0
-            for _crit in "${_crit_deps[@]}"; do
-                if ! pkg_installed "$_crit"; then
-                    warn "$(_t "Critical build dep missing, retrying: " "Critical build dep missing, retrying: ") $_crit"
-                    # apt 建议的 --fix-missing 一并带上：镜像缺个别 .deb 时能跳过继续
-                    if [ "$DISTRO_FAMILY" = debian ] && command -v apt-get >/dev/null 2>&1; then
-                        exe apt-get install -y --fix-missing "$_crit" 2>>"$LOG_DIR/apt-errors.log" || true
-                    fi
-                    pm_install "$_crit" 2>>"$LOG_DIR/apt-errors.log" || true
-                    if ! pkg_installed "$_crit"; then
-                        # Surface the REAL apt error (broken dpkg, unreachable repos,
-                        # missing package) instead of a generic "unavailable" message.
-                        local _aperr
-                        _aperr=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
-                        error "$(_t "Critical build dependency NOT installed: " "Critical build dependency NOT installed: ") $_crit (apt error: $_aperr)"
-                        _missing_crit=1
-                        _last_crit="$_crit"
-                    fi
-                fi
-            done
-            # 命中镜像源故障特征（404 / 无法下载 / Failed to fetch / Hash Sum mismatch /
-            # Release 过期）且尚未换过源 → 先查时钟，再依次尝试 tuna / aliyun / ustc，成功后重试一轮
-            if [ "$_missing_crit" -eq 1 ] && [ "$_tried_mirror" -eq 0 ] \
-                && grep -qiE '404|无法下载|Failed to fetch|Unable to fetch|Hash Sum mismatch|Release 文件已经过期|expired|Valid-Until' "$LOG_DIR/apt-errors.log" 2>/dev/null; then
-                check_clock_drift   # 时钟偏快会让所有源报过期，换镜像无效——先提示
-                warn "$(_t "apt 错误疑似镜像源问题（404 / 无法下载 / Release 过期）——自动尝试换源..." "apt 错误疑似镜像源问题（404 / 无法下载 / Release 过期）——自动尝试换源...")"
-                local _m _switched=0
-                for _m in tuna aliyun ustc; do
-                    if confirm "$(_t "Try mirror $_m? [Y/n] (default Y):" "Try mirror $_m? [Y/n] (default Y):")" "Y" 10 2>/dev/null; then
-                        if set_debian_mirror "$_m"; then
-                            _switched=1
-                            break
-                        fi
-                    fi
-                done
-                if [ "$_switched" -eq 1 ]; then
-                    _tried_mirror=1
-                    log "$(_t "Retrying critical build deps after mirror switch..." "Retrying critical build deps after mirror switch...")"
-                    continue
-                fi
-                _tried_mirror=1   # 用户全部拒绝 / 所有候选源都未同步，不再重试
-            fi
-            break
-        done
-        if [ "$_missing_crit" -eq 1 ]; then
-            local _aperr_final
-            _aperr_final=$(tail -n 3 "$LOG_DIR/apt-errors.log" 2>/dev/null | tr '\n' ' ')
-            MANUAL_ITEMS+=("niri — critical build dependency '${_last_crit:-?}' failed to install (apt error: $_aperr_final); 源镜像可能滞后/未同步——已尝试换源仍失败：检查网络与代理 (如 198.18.x.x TUN)，手动换 tuna/aliyun 源或运行 'sudo apt-get update' / 'sudo dpkg --configure -a' 后重跑: $NIRI_GH")
-            return 1
-        fi
-    else
-        dnf_install_tolerant "${NIRI_BUILD_DEPS_RHEL[@]}" || bdeps_rc=$?
-    fi
-    
-    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
+    dnf_install_tolerant "${NIRI_BUILD_DEPS_RHEL[@]}" || bdeps_rc=$?
+    if [ "$bdeps_rc" -ne 0 ]; then
         MANUAL_ITEMS+=("niri — build dependencies install failed, build manually: $NIRI_GH")
         return 1
     fi
 
-    # pkg-config pre-check (Debian + RHEL families): verify every .pc file the
-    # build needs actually exists BEFORE starting the 10-20 min background build.
-    # A missing .pc surfaces as "The system library X required by crate Y was not
-    # found" only at the end of the build — this catches it in seconds instead.
-    # Debian 系缺失时自动安装对应的 -dev 包（见全局 ensure_pc_deps）。
+    # pkg-config pre-check: verify every .pc file the build needs actually exists
+    # BEFORE starting the 10-20 min background build. A missing .pc surfaces as
+    # "The system library X required by crate Y was not found" only at the end of
+    # the build — this catches it in seconds instead.
     if ! ensure_pc_deps libdisplay-info xkbcommon wayland-client \
             libinput libseat libpipewire-0.3 dbus-1 pango gbm egl \
             xcb-composite xcb-ewmh xcb-icccm xcb-randr xcb-xfixes \
@@ -1883,40 +1769,25 @@ install_awww() {
     fi
 
     # build deps: wayland protocol XML via pkg-config is required by upstream;
-    # the `common` crate links lz4 (needs the -dev package providing liblz4.pc);
+    # the `common` crate links lz4 (needs the -devel package providing liblz4.pc);
     # dav1d/lz4 runtime libs are best effort.
     local bdeps_rc=0
-    if [ "$DISTRO_FAMILY" = debian ]; then
-        apt_install_tolerant git libwayland-dev wayland-protocols liblz4-dev \
-            libxkbcommon-dev libdav1d-dev || bdeps_rc=$?
-        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
-        fi
-        exe apt-get install -y libdav1d6 2>/dev/null || true
-        # pkg-config 预检 + 自愈：wayland-client / xkbcommon / liblz4 / dav1d 缺哪个自动装哪个
-        # （注意 lz4 的 .pc 文件名是 liblz4.pc，lz4-sys 探测的也是 liblz4）
-        if ! ensure_pc_deps wayland-client xkbcommon liblz4 dav1d; then
-            MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -dev 包后重跑: $AWWW_REPO")
-            return 1
-        fi
-    else
-        # RHEL: awww's common crate links xkbcommon + lz4 (mandatory); dav1d is an
-        # optional runtime codec, so only lz4/xkbcommon are hard pre-checks. Tolerant
-        # so a missing name (e.g. dav1d-devel on older EL) never aborts the batch.
-        dnf_install_tolerant git wayland-devel wayland-protocols-devel lz4-devel \
-            libxkbcommon-devel dav1d-devel libdrm-devel mesa-libgbm-devel || bdeps_rc=$?
-        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
-        fi
-        exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} dav1d lz4 2>/dev/null || true
-        # pkg-config 预检（RHEL 只校验不自愈）：wayland-client / xkbcommon / liblz4
-        # 必装；dav1d 可选，缺了不阻塞（awww 仍能编译/运行）。
-        if ! ensure_pc_deps wayland-client xkbcommon liblz4; then
-            MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -devel 包后重跑: $AWWW_REPO")
-            return 1
-        fi
+    # RHEL: awww's common crate links xkbcommon + lz4 (mandatory); dav1d is an
+    # optional runtime codec, so only lz4/xkbcommon are hard pre-checks. Tolerant
+    # so a missing name (e.g. dav1d-devel on older EL) never aborts the batch.
+    dnf_install_tolerant git wayland-devel wayland-protocols-devel lz4-devel \
+        libxkbcommon-devel dav1d-devel libdrm-devel mesa-libgbm-devel || bdeps_rc=$?
+    if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+        warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
     fi
-    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ] && [ ${#BDEPS_MISSING[@]} -gt 0 ] && [ ${#PC_STILL_MISSING[@]} -gt 0 ]; then
+    exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} dav1d lz4 2>/dev/null || true
+    # pkg-config 预检（只校验不自愈）：wayland-client / xkbcommon / liblz4
+    # 必装；dav1d 可选，缺了不阻塞（awww 仍能编译/运行）。
+    if ! ensure_pc_deps wayland-client xkbcommon liblz4; then
+        MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -devel 包后重跑: $AWWW_REPO")
+        return 1
+    fi
+    if [ "$bdeps_rc" -ne 0 ] && [ ${#BDEPS_MISSING[@]} -gt 0 ] && [ ${#PC_STILL_MISSING[@]} -gt 0 ]; then
         MANUAL_ITEMS+=("awww — build dependencies install failed, build manually: $AWWW_REPO")
         return 1
     fi
@@ -2136,11 +2007,7 @@ install_satty() {
     esac
 
     # runtime libraries the prebuilt binary links against (best effort)
-    if [ "$DISTRO_FAMILY" = debian ]; then
-        exe apt-get install -y libgtk-4-1 libadwaita-1-0 librsvg2-2 || warn "$(_t "satty runtime libraries failed to install; the binary may not start." "satty runtime libraries failed to install; the binary may not start.")"
-    else
-        exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} gtk4 libadwaita librsvg2 || warn "$(_t "satty runtime libraries failed to install; the binary may not start." "satty runtime libraries failed to install; the binary may not start.")"
-    fi
+    exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} gtk4 libadwaita librsvg2 || warn "$(_t "satty runtime libraries failed to install; the binary may not start." "satty runtime libraries failed to install; the binary may not start.")"
 
     # --- Strategy 1: official prebuilt binary ---
     # Direct "latest/download" URL (no API call), GitHub direct
@@ -2193,15 +2060,8 @@ install_satty() {
 
     # --- Strategy 2: cargo install (crates.io) ---
     local bdeps_rc=0
-    if [ "$DISTRO_FAMILY" = debian ]; then
-        apt_install_tolerant build-essential pkg-config libgtk-4-dev libadwaita-1-dev librsvg2-dev || bdeps_rc=$?
-        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some satty build deps unavailable (continuing):" "Some satty build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
-        fi
-    else
-        dnf_install_tolerant gcc pkgconf-pkg-config gtk4-devel libadwaita-devel librsvg2-devel || bdeps_rc=$?
-    fi
-    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ]; then
+    dnf_install_tolerant gcc pkgconf-pkg-config gtk4-devel libadwaita-devel librsvg2-devel || bdeps_rc=$?
+    if [ "$bdeps_rc" -ne 0 ]; then
         MANUAL_ITEMS+=("satty — build dependencies install failed, install manually: $SATTY_GH")
         return 1
     fi
@@ -2289,7 +2149,7 @@ install_rime_ice() {
         fi
     fi
     if ! pkg_installed fcitx5-rime; then
-    if [ "$DISTRO_FAMILY" = rhel ] && install_fcitx5_rime_source; then
+        if [ "$DISTRO_FAMILY" = rhel ] && install_fcitx5_rime_source; then
             log "$(_t "fcitx5-rime built from source; continuing with rime-ice." "fcitx5-rime built from source; continuing with rime-ice.")"
         else
             MANUAL_ITEMS+=("rime-ice — fcitx5-rime not installed and source build failed; see $LOG_DIR/fcitx5-rime-build.log")
@@ -2368,36 +2228,24 @@ install_xwayland_satellite() {
     if ! command -v Xwayland >/dev/null 2>&1; then
         pm_install xwayland 2>/dev/null || warn "$(_t "xwayland package not available; xwayland-satellite needs Xwayland at runtime." "xwayland package not available; xwayland-satellite needs Xwayland at runtime.")"
     fi
-    # build deps: upstream needs clang (bindgen) + xcb-cursor dev headers + git (cargo --git);
-    # wayland-client / xkbcommon / xcb-util .pc 也由下面的 ensure_pc_deps 兜底
+    # build deps: upstream needs clang (bindgen) + xcb-cursor dev headers + git
+    # (cargo --git); wayland-client / xkbcommon / xcb-util .pc 也由下面的
+    # ensure_pc_deps 兜底
     local bdeps_rc=0
-    if [ "$DISTRO_FAMILY" = debian ]; then
-        apt_install_tolerant git clang libclang-dev libxcb-cursor-dev \
-            libwayland-dev wayland-protocols libxkbcommon-dev libxcb-util-dev || bdeps_rc=$?
-        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some xwayland-satellite build deps unavailable (continuing):" "Some xwayland-satellite build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
-        fi
-        # pkg-config 预检 + 自愈：wayland-client / xkbcommon / xcb-cursor 缺哪个自动装哪个
-        if ! ensure_pc_deps wayland-client xkbcommon xcb-cursor; then
-            MANUAL_ITEMS+=("xwayland-satellite — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -dev 包后重跑: $XWS_REPO")
-            return 1
-        fi
-    else
-        # RHEL: also need the wayland/xkbcommon/xcb-util dev headers for the .pc the
-        # build links against; tolerant so a missing name never aborts the batch.
-        dnf_install_tolerant git clang libclang-devel xcb-util-cursor-devel \
-            wayland-devel wayland-protocols-devel libxkbcommon-devel xcb-util-devel \
-            xcb-util-wm-devel libxcb-devel libdrm-devel mesa-libgbm-devel || bdeps_rc=$?
-        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some xwayland-satellite build deps unavailable (continuing):" "Some xwayland-satellite build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
-        fi
-        # pkg-config 预检（RHEL 只校验不自愈）
-        if ! ensure_pc_deps wayland-client xkbcommon xcb-cursor; then
-            MANUAL_ITEMS+=("xwayland-satellite — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -devel 包后重跑: $XWS_REPO")
-            return 1
-        fi
+    # RHEL: also need the wayland/xkbcommon/xcb-util dev headers for the .pc the
+    # build links against; tolerant so a missing name never aborts the batch.
+    dnf_install_tolerant git clang libclang-devel xcb-util-cursor-devel \
+        wayland-devel wayland-protocols-devel libxkbcommon-devel xcb-util-devel \
+        xcb-util-wm-devel libxcb-devel libdrm-devel mesa-libgbm-devel || bdeps_rc=$?
+    if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+        warn "$(_t "Some xwayland-satellite build deps unavailable (continuing):" "Some xwayland-satellite build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
     fi
-    if [ "$bdeps_rc" -ne 0 ] && [ "$DISTRO_FAMILY" != debian ] && [ ${#PC_STILL_MISSING[@]} -gt 0 ]; then
+    # pkg-config 预检（只校验不自愈）
+    if ! ensure_pc_deps wayland-client xkbcommon xcb-cursor; then
+        MANUAL_ITEMS+=("xwayland-satellite — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -devel 包后重跑: $XWS_REPO")
+        return 1
+    fi
+    if [ "$bdeps_rc" -ne 0 ] && [ ${#PC_STILL_MISSING[@]} -gt 0 ]; then
         MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (git/clang/xcb-util-cursor-devel); install manually: $XWS_REPO")
         return 1
     fi
@@ -2492,7 +2340,7 @@ build_hypr_stack() {
 # the build system: older versions are Rust (cargo build), current ones are
 # C++/CMake (cmake -B build; the repos no longer ship a Cargo.toml). Installs the
 # binary to /usr/local/bin. For hyprlock it also writes /etc/pam.d/hyprlock (the
-# apt package ships one, but a source build does not — without it hyprlock cannot
+# distro package ships one, but a source build does not — without it hyprlock cannot
 # authenticate).
 install_hypr_source() { # $1 = pkg name, $2 = repo URL
     local pkg="$1" repo="$2"
@@ -2507,23 +2355,16 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
 
     # build deps (tolerant: many hypr deps are absent on older releases / Rocky/Alma)
     local _brc=0
-    if [ "$DISTRO_FAMILY" = debian ]; then
-        apt_install_tolerant "${HYPR_BUILD_DEPS_DEB[@]}" || _brc=$?
-        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
-        fi
-    else
-        dnf_install_tolerant "${HYPR_BUILD_DEPS_RHEL[@]}" || _brc=$?
-        if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
-            warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
-        fi
-        # EL names pam-devel (not libpam-devel). Force it so hyprlock's
-        # find_library(PAM) / pkg_check_modules(PAM) succeeds.
-        dnf_install_tolerant pam-devel sdbus-cpp-devel || true
-        if [ ! -f /usr/include/security/pam_appl.h ] && [ ! -f /usr/include/pam/pam_appl.h ]; then
-            MANUAL_ITEMS+=("$pkg — pam-devel missing (libpam not found); install: dnf install pam-devel, then rerun")
-            return 1
-        fi
+    dnf_install_tolerant "${HYPR_BUILD_DEPS_RHEL[@]}" || _brc=$?
+    if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+        warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+    fi
+    # EL names pam-devel (not libpam-devel). Force it so hyprlock's
+    # find_library(PAM) / pkg_check_modules(PAM) succeeds.
+    dnf_install_tolerant pam-devel sdbus-cpp-devel || true
+    if [ ! -f /usr/include/security/pam_appl.h ] && [ ! -f /usr/include/pam/pam_appl.h ]; then
+        MANUAL_ITEMS+=("$pkg — pam-devel missing (libpam not found); install: dnf install pam-devel, then rerun")
+        return 1
     fi
     local work
     work=$(mktemp -d)
@@ -2576,7 +2417,7 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     INSTALLED_PKGS+=("$pkg (source build)")
     success "$(_t "$pkg built from source" "$pkg built from source")"
 
-    # hyprlock needs a PAM config to authenticate; the apt package ships one, a source build does not.
+    # hyprlock needs a PAM config to authenticate; the distro package ships one, a source build does not.
     if [ "$pkg" = hyprlock ] && [ ! -f /etc/pam.d/hyprlock ]; then
         local _pam_src="$work/$pkg/pam/hyprlock"
         mkdir -p /etc/pam.d
@@ -3099,6 +2940,151 @@ stage_backup() {
 # collected .zshrc only ever worked on the Arch reference machine.  Runs only
 # when zsh was selected; every step is best-effort with a MANUAL_ITEMS note on
 # failure (the .zshrc itself is tolerant of missing pieces).
+install_zsh_extras() {
+    local _has_zsh=0 _p
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        [ "$_p" = "zsh" ] && _has_zsh=1
+    done
+    [ "$_has_zsh" -eq 1 ] || return 0
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("oh-my-zsh (git clone) starship eza bat zoxide")
+        return "$DRY_RUN_RC"
+    fi
+
+    # git is needed for the clones; not guaranteed present on a minimal install.
+    command -v git >/dev/null 2>&1 || pm_install git 2>/dev/null || true
+
+    # 1) oh-my-zsh itself (official repo first; gitee mirror fallback for CN networks)
+    if [ ! -d "$HOME_DIR/.oh-my-zsh" ]; then
+        log "$(_t "Installing oh-my-zsh..." "Installing oh-my-zsh...")"
+        if as_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null \
+            || as_user git clone --depth=1 https://gitee.com/mirrors/oh-my-zsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null; then
+            INSTALLED_PKGS+=("oh-my-zsh")
+        else
+            MANUAL_ITEMS+=("oh-my-zsh — clone failed (GitHub 与 gitee 镜像均不可达); 手动: git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git $HOME_DIR/.oh-my-zsh")
+        fi
+    else
+        log "$(_t "oh-my-zsh already present, skipping." "oh-my-zsh already present, skipping.")"
+    fi
+
+    # 2) the two plugins listed in configs/.zshrc — must live in $ZSH_CUSTOM/plugins
+    #    for oh-my-zsh's plugins=() to find them (distro packages don't).
+    if [ -d "$HOME_DIR/.oh-my-zsh" ]; then
+        mkdir -p "$HOME_DIR/.oh-my-zsh/custom/plugins"
+        local _plugin _plug_url
+        for _plugin in zsh-autosuggestions zsh-syntax-highlighting; do
+            if [ ! -d "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" ]; then
+                case "$_plugin" in
+                    zsh-autosuggestions)   _plug_url="https://github.com/zsh-users/zsh-autosuggestions" ;;
+                    zsh-syntax-highlighting) _plug_url="https://github.com/zsh-users/zsh-syntax-highlighting" ;;
+                esac
+                log "$(_t "Installing oh-my-zsh plugin: " "Installing oh-my-zsh plugin: ") $_plugin"
+                as_user git clone --depth=1 "$_plug_url" \
+                    "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" 2>/dev/null \
+                    || MANUAL_ITEMS+=("oh-my-zsh plugin $_plugin — clone failed")
+            fi
+        done
+        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+            "$HOME_DIR/.oh-my-zsh" 2>/dev/null || true
+    fi
+
+    # 3) starship (configs/.zshrc evals `starship init zsh` under a command -v guard).
+    #    Fedora ships starship in the official repos; EL has no package, so use the
+    #    official install script there.
+    if ! command -v starship >/dev/null 2>&1; then
+        log "$(_t "Installing starship..." "Installing starship...")"
+        local _starship_done=0
+        if dnf -q list available starship >/dev/null 2>&1 && pm_install starship; then
+            _starship_done=1
+        fi
+        if [ "$_starship_done" -eq 0 ]; then
+            if exe bash -c 'curl -sSfL https://starship.rs/install.sh | sh -s -- -y -b /usr/local/bin' 2>/dev/null; then
+                _starship_done=1
+            else
+                MANUAL_ITEMS+=("starship — install failed; run: curl -sSfL https://starship.rs/install.sh | sh -s -- -y")
+            fi
+        fi
+        [ "$_starship_done" -eq 1 ] && INSTALLED_PKGS+=("starship")
+    fi
+    # starship 没装上时才退回 oh-my-zsh 内置主题（agnoster，nerd font 提供 powerline
+    # 符号），保证 prompt 可用；starship 可用时保持 ZSH_THEME=""（本机同款，prompt
+    # 完全交给 starship + configs/.config/starship.toml）。
+    if ! command -v starship >/dev/null 2>&1 && [ -f "$HOME_DIR/.zshrc" ] && grep -q '^ZSH_THEME=""' "$HOME_DIR/.zshrc" 2>/dev/null; then
+        sed -i 's/^ZSH_THEME=""/ZSH_THEME="agnoster"/' "$HOME_DIR/.zshrc" 2>/dev/null || true
+        log "$(_t "starship unavailable — set ZSH_THEME=agnoster as fallback" "starship unavailable — set ZSH_THEME=agnoster as fallback")"
+    fi
+
+    # 4) eza (aliased in .zshrc): Fedora has it in the official repos; on EL it
+    #    lives in EPEL. cargo build is the last resort.
+    if ! command -v eza >/dev/null 2>&1; then
+        log "$(_t "Installing eza..." "Installing eza...")"
+        pm_install eza 2>/dev/null || true
+        if ! command -v eza >/dev/null 2>&1; then
+            if ! rpm -q epel-release >/dev/null 2>&1; then
+                log "$(_t "eza not in base repos — enabling EPEL and retrying..." "eza not in base repos — enabling EPEL and retrying...")"
+                pm_install epel-release 2>/dev/null || true
+                pm_install eza 2>/dev/null || true
+            fi
+            if ! command -v eza >/dev/null 2>&1; then
+                if command -v cargo >/dev/null 2>&1 && exe cargo install --locked --root /usr/local eza 2>/dev/null; then
+                    INSTALLED_PKGS+=("eza (cargo build)")
+                else
+                    MANUAL_ITEMS+=("eza — no repo package and cargo build failed; install manually (dnf --enablerepo=epel install eza / cargo install eza)")
+                fi
+            fi
+        fi
+    fi
+
+    # 5) bat (aliased in .zshrc): Fedora/EPEL name the binary `bat`; keep the
+    #    batcat symlink guard anyway in case a differently-named build shows up.
+    if ! command -v bat >/dev/null 2>&1; then
+        pm_install bat 2>/dev/null || true
+        if ! command -v bat >/dev/null 2>&1 && command -v batcat >/dev/null 2>&1; then
+            ln -sf /usr/bin/batcat /usr/local/bin/bat
+        fi
+    fi
+
+    # 6) zoxide (configs/.zshrc evals `zoxide init zsh` under a command -v guard)
+    if ! command -v zoxide >/dev/null 2>&1; then
+        pm_install zoxide 2>/dev/null || MANUAL_ITEMS+=("zoxide — install failed; run: sudo dnf install zoxide (Fedora/EPEL), or cargo install zoxide")
+    fi
+}
+
+# The shipped niri config spawns the polkit agent path from the reference machine
+# (/usr/lib/polkit-gnome-authentication-agent-1 — retired upstream, packaged by
+# neither Fedora nor EPEL). If that binary is absent but another agent is
+# installed (mate-polkit / polkit-kde / ...), repoint the spawn-at-startup line.
+# Fedora keeps 64-bit agents under /usr/lib64, so those globs are mandatory here.
+fix_polkit_agent() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _cfg="$HOME_DIR/.config/niri/config.kdl"
+    [ -f "$_cfg" ] || return 0
+    local _cur
+    _cur=$(grep -oP 'spawn-at-startup\s+"\K[^"]*polkit[^"]*' "$_cfg" 2>/dev/null | head -n 1)
+    [ -n "$_cur" ] || return 0
+    [ -x "$_cur" ] && return 0   # shipped path is valid, nothing to do
+    local _cand _found=""
+    for _cand in \
+        /usr/lib/*polkit*authentication-agent* \
+        /usr/lib64/*polkit*authentication-agent* \
+        /usr/libexec/*polkit*authentication-agent* \
+        /usr/lib/xfce-polkit /usr/lib64/xfce-polkit /usr/libexec/xfce-polkit \
+        /usr/lib/mate-polkit* /usr/lib64/mate-polkit* /usr/libexec/mate-polkit* \
+        /usr/lib/lxpolkit /usr/lib64/lxpolkit /usr/libexec/lxpolkit; do
+        [ -x "$_cand" ] || continue
+        _found="$_cand"
+        break
+    done
+    if [ -z "$_found" ]; then
+        warn "$(_t "No polkit agent found — GUI privilege prompts (disks, users...) will not appear." "No polkit agent found — GUI privilege prompts (disks, users...) will not appear.")"
+        return 0
+    fi
+    log "$(_t "polkit agent " "polkit agent ") $_cur $(_t "missing -> repointing to " "missing -> repointing to ") $_found"
+    sed -i "s#\"$_cur\"#\"$_found\"#" "$_cfg"
+    exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg"
+}
+
 prune_config_backups() { # $1 = directory, $2 = basename glob
     local dir="$1" pattern="$2" backup
     [ -d "$dir" ] || return 0
@@ -3275,16 +3261,9 @@ stage_configs() {
             done < <(sed -n 's/^ExecStart=//p' "$_sf" 2>/dev/null)
         done
 
-        # waybar 由 GDM/systemd session 启动；niri 中的 spawn-at-startup 会
-        # 产生第二个实例，因此将该启动项注释掉。
-        if [ -f "$HOME_DIR/.config/niri/config.kdl" ] \
-            && grep -q 'spawn-at-startup.*"waybar"' "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null; then
-            sed -i -E 's/^([[:space:]]*)spawn-at-startup[[:space:]]+"waybar"/\1# spawn-at-startup "waybar" (started by GDM\/systemd)/' "$HOME_DIR/.config/niri/config.kdl"
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/niri/config.kdl" 2>/dev/null || true
-            pkill -u "$TARGET_USER" -x waybar 2>/dev/null || true
-            sleep 1
-            log "$(_t "Disabled niri Waybar startup; GDM/systemd will provide the only instance" "Disabled niri Waybar startup; GDM/systemd will provide the only instance")"
-        fi
+        # waybar 由 niri 的 spawn-at-startup 启动（configs/ 里没有任何 waybar
+        # systemd unit，GDM 也不会拉起它）——注释掉会导致状态栏彻底消失，
+        # 因此这里不做任何改动（与 arch-install.sh 保持一致）。
 
         # 光标拖影：QEMU/KVM 虚拟机常因虚拟硬件 cursor plane 与 Niri 不兼容。
         # Keep the environment file for user services, and export the same
@@ -3329,6 +3308,7 @@ stage_configs() {
         # 壁纸自愈：awww 已装则确保有壁纸状态文件（生成默认渐变壁纸 / 修正 waypaper 路径）
         _ensure_wallpaper
         _ensure_waypaper_desktop   # pip 装的 waypaper 无 .desktop → fuzzel 无图标
+        fix_polkit_agent           # niri 配置里的 agent 路径按本机实际安装改写
     fi
 
     # fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
@@ -3379,6 +3359,18 @@ IMEEOF
             fi
         fi
     fi
+    # zsh 美化：把登录 shell 换成 zsh 并安装 configs/.zshrc 依赖的运行时
+    # （oh-my-zsh + 插件 + starship + eza/bat/zoxide）。仅在用户选择了 zsh 时生效。
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        if [ "$_p" = "zsh" ] && [ "$DRY_RUN" -eq 0 ] && [ -n "$TARGET_USER" ] \
+            && [ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != "$(command -v zsh)" ]; then
+            exe chsh -s "$(command -v zsh)" "$TARGET_USER" 2>/dev/null \
+                || warn "$(_t "Failed to set zsh as default shell" "Failed to set zsh as default shell")"
+            break
+        fi
+    done
+    install_zsh_extras
+
     success "$(_t "Config deploy complete." "Config deploy complete.")"
     stage_mark configs
 }
@@ -3670,13 +3662,11 @@ stage_hardware_adapt() {
         fi
     fi
 
-    # --- 4) polkit agent path per family (Arch: /usr/lib; Debian/RHEL: /usr/libexec) ---
-    if [ -f "$niri_cfg" ] && grep -q 'polkit-gnome-authentication-agent-1' "$niri_cfg" 2>/dev/null; then
-        if grep -q '/usr/lib/polkit-gnome-authentication-agent-1' "$niri_cfg"; then
-            sed -i 's#/usr/lib/polkit-gnome-authentication-agent-1#/usr/libexec/polkit-gnome-authentication-agent-1#g' "$niri_cfg"
-            log "$(_t "polkit agent path adapted to /usr/libexec (Debian/RHEL layout)" "polkit agent path adapted to /usr/libexec (Debian/RHEL layout)")"
-        fi
-    fi
+    # --- 4) polkit agent path ---
+    # stage_configs 里的 fix_polkit_agent() 已按"实际安装的 agent"改写 spawn 路径
+    # （polkit-gnome 上游已废弃，Fedora/EPEL 均无此包，不能再盲目改写到
+    # /usr/libexec/polkit-gnome-*——那个路径永远不存在）。此处仅兜底：若前面没有
+    # 任何 agent 可指（警告已发），保持原样留给用户处理，不再做无效改写。
 
     # GPU driver hint
     if command -v lspci &>/dev/null; then
@@ -3847,7 +3837,7 @@ save_diag_bundle() {
         echo "=== eilNiri diagnostic bundle ==="
         echo "Date: $(date)"
         echo "Script: v$SCRIPT_VERSION  Progress: $PROGRESS_VERSION"
-        echo "Distro: $DISTRO_FAMILY ($DISTRO_ID)  Ubuntu: $UBUNTU_VER_NUM"
+        echo "Distro: $DISTRO_FAMILY ($DISTRO_ID)"
         echo "Target user: $TARGET_USER  Home: $HOME_DIR"
         echo
         echo "=== systemctl get-default ==="
