@@ -64,7 +64,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.10.0"
+SCRIPT_VERSION="1.10.1"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -346,6 +346,23 @@ RHEL_SOURCE_BUILD_DEPS=(git gcc gcc-c++ make cmake ninja-build meson pkgconf-pkg
     xcb-util-devel xcb-util-wm-devel xcb-util-image-devel xcb-util-keysyms-devel
     xcb-util-renderutil-devel xcb-util-cursor-devel libjpeg-turbo-devel libpng-devel
     libwebp-devel pam-devel sdbus-cpp-devel)
+# Per-project extra build deps for the source-build fallbacks, on top of
+# RHEL_SOURCE_BUILD_DEPS. All names are tolerant-installed, so a package absent
+# on an older EL release only degrades that one feature instead of aborting.
+#   waybar   — needs far more than the generic GTK list: GUI binding (gtkmm),
+#              layer-shell for the floating bar, logging (spdlog/fmt/jsoncpp),
+#              network (libnl3), bluetooth (bluez), audio (pulse/pipewire),
+#              tray (dbusmenu), media/mpd (libmpdclient), power (upower),
+#              evdev + udev/systemd for some modules.
+#   copyq    — builds against Qt6 (+X11 record extension for clipboard hooks).
+#   playerctl — GLib + gobject-introspection.
+SRC_DEPS_WAYBAR=(gtkmm30-devel gtkmm4.0-devel gtk-layer-shell-devel jsoncpp-devel
+    spdlog-devel fmt-devel libnl3-devel libevdev-devel systemd-devel
+    pulseaudio-libs-devel pipewire-devel wireplumber-devel bluez-libs-devel
+    libdbusmenu-gtk3-devel libmpdclient-devel upower-devel)
+SRC_DEPS_COPYQ=(qt6-qtbase-devel qt6-qtdeclarative-devel qt6-qtsvg-devel
+    qt6-qttools-devel qt6-qtwayland-devel libXtst-devel)
+SRC_DEPS_PLAYERCTL=(glib2-devel gobject-introspection-devel)
 FCITX5_RIME_REPO="https://github.com/fcitx/fcitx5-rime"
 LIBRIME_REPO="https://github.com/rime/librime"
 
@@ -422,6 +439,9 @@ DISABLE_SYS=(
 # Summary report collectors
 INSTALLED_PKGS=() SKIPPED_PKGS=() FAILED_PKGS=() MANUAL_ITEMS=() ENABLED_SVCS=()
 DRY_PKGS=() DRY_SVCS=()  # items "that would be executed" in dry-run mode; kept separate to avoid inflated counts
+# logical pkg name -> real RPM name resolved by resolve_rhel_package (e.g.
+# polkit-agent -> mate-polkit); stage_verify audits the REAL name, not the alias.
+declare -A RESOLVED_PKG_NAME=()
 
 
 # 4. restore mode — reproduce desktop on new system (run as root)
@@ -734,8 +754,22 @@ ensure_rhel_repos() {
     [ "$DRY_RUN" -eq 1 ] && { log "$(_t "[DRY-RUN] would enable EPEL + CRB/PowerTools repos." "[DRY-RUN] would enable EPEL + CRB/PowerTools repos.")"; return 0; }
     if [ ! -f /etc/yum.repos.d/epel.repo ] && ! rpm -q epel-release >/dev/null 2>&1; then
         log "$(_t "Enabling EPEL..." "Enabling EPEL...")"
-        dnf install -y epel-release 2>/dev/null \
-            || warn "$(_t "EPEL enable failed; some -devel packages may be unavailable." "EPEL enable failed; some -devel packages may be unavailable.")"
+        if ! dnf install -y epel-release 2>/dev/null; then
+            # dnf path failed (mirror/CDN trouble): grab the epel-release RPM
+            # straight from a CN mirror of the EPEL Everything repo.
+            warn "$(_t "dnf epel-release failed — trying direct RPM from CN mirrors..." "dnf epel-release failed — trying direct RPM from CN mirrors...")"
+            local _maj _mirror _erpm
+            _maj=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
+            for _mirror in "https://mirrors.aliyun.com/epel" "https://mirrors.tuna.tsinghua.edu.cn/epel" "https://mirrors.ustc.edu.cn/epel"; do
+                _erpm=$(curl -fsSL --connect-timeout 8 --max-time 30 "${_mirror}/${_maj}/Everything/x86_64/Packages/e/" 2>/dev/null \
+                    | grep -oE 'epel-release-[0-9][^"]*\.noarch\.rpm' | sort -V | tail -1)
+                if [ -n "$_erpm" ] && exe dnf install -y "${_mirror}/${_maj}/Everything/x86_64/Packages/e/${_erpm}" 2>>"$LOG_DIR/dnf-errors.log"; then
+                    break
+                fi
+                _erpm=""
+            done
+            [ -z "$_erpm" ] && warn "$(_t "EPEL enable failed; -devel/EPEL packages will be unavailable and source builds will fail." "EPEL enable failed; -devel/EPEL packages will be unavailable and source builds will fail.")"
+        fi
     fi
     if ! command -v dnf >/dev/null 2>&1; then
         return 0
@@ -757,13 +791,22 @@ ensure_rhel_repos() {
         codeready-builder-for-rhel-10-rhui-rpms; do
         dnf config-manager --set-enabled "$_rid" 2>/dev/null || true
     done
-    dnf clean all >/dev/null 2>&1 || true
+    dnf clean all >/dev/null 2>/dev/null || true
     dnf makecache --refresh >/dev/null 2>&1 || true
     _rhel_refresh_enablerepo
-    if dnf repolist 2>/dev/null | grep -qiE 'epel|crb|powertools|codeready'; then
+    # Report EPEL and CRB separately: EPEL carries the app packages, CRB the
+    # -devel headers every source build needs. Missing either one degrades a
+    # different slice of the install, so say WHICH one is missing.
+    if dnf repolist 2>/dev/null | grep -qiE '(^|/)epel'; then
         log "$(_t "Extra repos active:" "Extra repos active:") $(dnf repolist 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /(epel|crb|powertools|codeready)/ {printf "%s ", $1}')"
     else
-        warn "$(_t "CRB/PowerTools/EPEL still not visible; -devel packages may be missing. Try: dnf install epel-release && dnf config-manager --set-enabled crb" "CRB/PowerTools/EPEL still not visible; -devel packages may be missing. Try: dnf install epel-release && dnf config-manager --set-enabled crb")"
+        warn "$(_t "EPEL is NOT active — app packages that only EPEL carries will fail. Try: dnf install epel-release (或手动下载 epel-release RPM)" "EPEL is NOT active — app packages that only EPEL carries will fail. Try: dnf install epel-release")"
+        MANUAL_ITEMS+=("EPEL 仓库未启用 — 运行 'dnf install epel-release' 后重跑脚本")
+    fi
+    if [ "${DISTRO_ID:-}" != fedora ] \
+        && ! dnf repolist 2>/dev/null | grep -qiE 'crb|powertools|codeready'; then
+        warn "$(_t "CRB/PowerTools is NOT active — source builds (waybar/fuzzel/hyprlock/...) will fail for lack of -devel packages. Try: dnf config-manager --set-enabled crb" "CRB/PowerTools is NOT active — source builds will fail for lack of -devel packages. Try: dnf config-manager --set-enabled crb")"
+        MANUAL_ITEMS+=("CRB/PowerTools 仓库未启用 — 源码编译（waybar/fuzzel/hyprlock 等）必需；运行 'dnf config-manager --set-enabled crb'（Rocky 8 为 powertools）后重跑")
     fi
     # Fedora already has niri/waybar/hypr* in official repos — skip COPR there.
     # Rocky/Alma/CentOS Stream 10: enable COPRs once so later dnf installs succeed.
@@ -885,6 +928,9 @@ stage_apps_select() {
     load_app_universe
 
     # Chinese component selection
+    if [ "$DISTRO_ID" != fedora ]; then
+        warn "$(_t "注意: EL10 系（Rocky/Alma/CentOS Stream）官方与 EPEL 仓库均无 fcitx5 包，中文输入法在 EL 上不可用（其余桌面功能不受影响）；Fedora 不受此限。" "注意: EL10-family repos carry no fcitx5 package — the Chinese IME will be unavailable on EL (everything else is unaffected); Fedora is not affected.")"
+    fi
     if ! confirm "$(_t "Install Chinese IME (fcitx5+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):" "Install Chinese IME (fcitx5+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):")" "Y" 15; then
         local _cn_exclude=(fcitx5 fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git wqy-zenhei)
         local _tmp_arr=() _p
@@ -1003,10 +1049,11 @@ install_rhel() {
         if [ -n "${RHEL_CANDIDATES[$p]:-}" ]; then
             resolved=$(resolve_rhel_package "$p") || {
                 warn "$(_t "No RHEL package candidate for " "No RHEL package candidate for ") $p"
-                FAILED_PKGS+=("dnf:$p")
+                FAILED_PKGS+=("dnf:$p (no candidate in enabled repos — 需要 EPEL/CRB?)")
                 continue
             }
             name="$resolved"
+            RESOLVED_PKG_NAME["$p"]="$resolved"
         fi
         # EL-only COPR shortcut for niri/xwayland-satellite (yalter/niri is the one
         # project that builds an epel-10 chroot). Fedora ships both in official
@@ -1065,10 +1112,17 @@ install_rhel() {
                 install_source_package "$p" "${SOURCE_PKGS[$p]}"
             elif [ "$p" = "ttf-jetbrains-mono-nerd" ]; then
                 log "$(_t "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead." "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead.")"
+            elif [[ "$p" =~ ^fcitx5 ]] && [ "$DISTRO_ID" != fedora ]; then
+                # fcitx5 has no EPEL builds and no COPR with an epel-10 chroot
+                # (verified 2026-10) — give actionable advice instead of a bare
+                # failure entry. Everything else on the desktop is unaffected.
+                MANUAL_ITEMS+=("$p — EL10 系无 fcitx5 RPM（未进 EPEL）。可选: 1) 保持现状用 ibus: dnf install ibus-libpinyin; 2) 换 Fedora 系（fcitx5 在官方仓库）; 3) 自行从 Fedora 源编译。桌面其余功能不受影响。")
             elif [ -n "${RHEL_FAIL_HINT[$p]:-}" ]; then
                 MANUAL_ITEMS+=("$name — not available in repo. ${RHEL_FAIL_HINT[$p]}")
             else
-                FAILED_PKGS+=("dnf:$name")
+                local _dnferr
+                _dnferr=$(tail -n 2 "$LOG_DIR/dnf-errors.log" 2>/dev/null | tr '\n' ' ')
+                FAILED_PKGS+=("dnf:$name (${_dnferr:-见 $LOG_DIR/dnf-errors.log})")
             fi
         fi
     done
@@ -1147,6 +1201,16 @@ _dl_gh_bounded() { # $1=github asset url, $2=outfile, $3=seconds cap (default 90
     return 1
 }
 
+# Vendored subprojects (e.g. fuzzel's fcft/tllist, hyprwm components) are git
+# submodules; a plain clone leaves those dirs empty and the build dies with
+# "subproject exists but has no meson.build". Fetch them best-effort after ANY
+# successful clone — failure is non-fatal here (a project that truly needs a
+# submodule fails in its own build step with a clearer, logged error).
+_git_clone_submodules() { # $1 = repo dir
+    git -C "$1" submodule update --init --recursive --depth 1 >/dev/null 2>&1 || \
+        warn "$(_t "git submodule fetch failed for " "git submodule fetch failed for ")$(basename "$1")$(_t " — build may fail if it vendors deps as submodules" " — build may fail if it vendors deps as submodules")"
+}
+
 # Clone a GitHub repo, falling back to the CN mirror proxies when direct git fails
 # (git smart-HTTP works through ghfast.top and friends; verified with git ls-remote).
 # Bounded so a blocked GitHub never hangs the install (git has no default timeout).
@@ -1155,6 +1219,7 @@ git_clone_gh() { # $1 = github repo URL, $2 = dest dir; returns 0 on success
     [ -n "$repo" ] && [ -n "$dest" ] || return 1
     if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
         clone --depth 1 "$repo" "$dest" >/dev/null 2>&1; then
+        _git_clone_submodules "$dest"
         return 0
     fi
     for prox in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
@@ -1162,6 +1227,7 @@ git_clone_gh() { # $1 = github repo URL, $2 = dest dir; returns 0 on success
         rm -rf "$dest"
         if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
             clone --depth 1 "$full" "$dest" >/dev/null 2>&1; then
+            _git_clone_submodules "$dest"
             return 0
         fi
     done
@@ -2408,7 +2474,7 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     if [ ! -x "$_bin" ]; then
         local tailmsg
         tailmsg=$(tail -n 6 "$logf" 2>/dev/null | tr '\n' ' ')
-        MANUAL_ITEMS+=("$pkg — build failed ($tailmsg); build manually: $repo")
+        MANUAL_ITEMS+=("$pkg — build failed; 缺失依赖: ${BDEPS_MISSING[*]:-（常见为 CRB/EPEL 的 -devel 包未装，pkg_check_modules 失败即此因）}; 依赖需 CRB/EPEL 仓库。日志尾部: ${tailmsg:-empty} (full: $logf)")
         warn "$(_t "Build failed: " "Build failed: ") $pkg (see $logf)"
         return 1
     fi
@@ -2449,17 +2515,33 @@ install_source_package() { # $1 = package, $2 = upstream repository
         return $?
     fi
     dnf_install_tolerant "${RHEL_SOURCE_BUILD_DEPS[@]}" || true
+    # project-specific extras (tolerant: a name missing on older EL only degrades
+    # that feature); remember what is still missing so the failure report below
+    # can name the real cause instead of a bare log path.
+    BDEPS_MISSING=()
+    local _extra=()
+    case "$pkg" in
+        waybar)    _extra=("${SRC_DEPS_WAYBAR[@]}") ;;
+        copyq)     _extra=("${SRC_DEPS_COPYQ[@]}") ;;
+        playerctl) _extra=("${SRC_DEPS_PLAYERCTL[@]}") ;;
+    esac
+    if [ ${#_extra[@]} -gt 0 ]; then
+        dnf_install_tolerant "${_extra[@]}" || true
+    fi
+    local _missing_deps="${BDEPS_MISSING[*]:-}"
     work=$(mktemp -d)
     register_temp_path "$work"
     logf="$LOG_DIR/$pkg-build.log"
     if ! git_clone_gh "$repo" "$work/$pkg"; then
-        MANUAL_ITEMS+=("$pkg — source clone failed; see $logf")
+        MANUAL_ITEMS+=("$pkg — source clone failed (GitHub 与 CN 镜像均不可达); 可设 EILNIRI_GH_PROXY 重试: $repo")
         return 1
     fi
     export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
     export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
     if ! build_source_project "$pkg" "$repo" "$work" "$logf"; then
-        MANUAL_ITEMS+=("$pkg — source build failed; see $logf")
+        local _why
+        _why=$(tail -n 4 "$logf" 2>/dev/null | tr '\n' ' ')
+        MANUAL_ITEMS+=("$pkg — source build failed; 缺失依赖: ${_missing_deps:-（见日志）}; 依赖包需 CRB/EPEL 仓库（dnf config-manager --set-enabled crb）。日志尾部: ${_why:-empty} (full: $logf)")
         return 1
     fi
     INSTALLED_PKGS+=("$pkg (source build)")
@@ -2475,6 +2557,9 @@ build_source_project() {
     elif [ -f "$src/meson.build" ]; then
         ( cd "$src" && meson setup build --prefix=/usr --libdir=lib64 --buildtype=release \
             && meson compile -C build -j"$(nproc)" && meson install -C build ) >"$logf" 2>&1
+    elif [ -f "$src/Makefile" ]; then
+        # Plain-Makefile projects (e.g. brightnessctl): most honor PREFIX/DESTDIR.
+        ( cd "$src" && make -j"$(nproc)" && make install PREFIX=/usr ) >"$logf" 2>&1
     else
         return 1
     fi
@@ -2714,7 +2799,9 @@ stage_services() {
                 exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$provider" || erc=$?
             fi
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
-                FAILED_PKGS+=("svc-provider:$provider")
+                local _svcerr
+                _svcerr=$(tail -n 2 "$LOG_DIR/dnf-errors.log" 2>/dev/null | tr '\n' ' ')
+                FAILED_PKGS+=("svc-provider:$provider (${_svcerr:-见 $LOG_DIR/dnf-errors.log})")
                 any_failed=1
                 continue
             fi
@@ -3045,9 +3132,22 @@ install_zsh_extras() {
         fi
     fi
 
-    # 6) zoxide (configs/.zshrc evals `zoxide init zsh` under a command -v guard)
+    # 6) zoxide (configs/.zshrc evals `zoxide init zsh` under a command -v guard).
+    #    Fedora ships it; EL often doesn't — fall back to cargo (rustup mirror
+    #    already configured for CN timezones via apply_cargo_mirror/ensure_rust).
     if ! command -v zoxide >/dev/null 2>&1; then
-        pm_install zoxide 2>/dev/null || MANUAL_ITEMS+=("zoxide — install failed; run: sudo dnf install zoxide (Fedora/EPEL), or cargo install zoxide")
+        pm_install zoxide 2>/dev/null || true
+        if ! command -v zoxide >/dev/null 2>&1; then
+            if command -v cargo >/dev/null 2>&1 || ensure_rust; then
+                if exe cargo install --locked --root /usr/local zoxide 2>/dev/null; then
+                    INSTALLED_PKGS+=("zoxide (cargo build)")
+                else
+                    MANUAL_ITEMS+=("zoxide — 无仓库包且 cargo 构建失败; 手动: dnf install zoxide (Fedora) 或 cargo install zoxide")
+                fi
+            else
+                MANUAL_ITEMS+=("zoxide — EL 仓库无包且 Rust 工具链不可用; 手动: dnf install zoxide (Fedora) 或 cargo install zoxide")
+            fi
+        fi
     fi
 }
 
@@ -3708,6 +3808,30 @@ stage_verify() {
                     ;;
             esac
             [ -n "${RHEL_MANUAL[$p]:-}" ] && continue
+            # ttf-jetbrains-mono-nerd falls back to a GitHub zip install (no RPM
+            # exists on EL) — audit the font itself, not a package name.
+            if [ "$p" = "ttf-jetbrains-mono-nerd" ]; then
+                fc-list 2>/dev/null | grep -qi 'jetbrainsmono.*nerd' || missing+=("JetBrainsMono Nerd Font")
+                continue
+            fi
+            # Packages with a source-build fallback may legitimately end up as
+            # plain binaries with no RPM (waybar/mako/fuzzel/copyq/grim/slurp/
+            # playerctl/brightnessctl/hyprlock/hypridle) — audit by command.
+            if [ -n "${SOURCE_PKGS[$p]:-}" ]; then
+                command -v "$p" >/dev/null 2>&1 || missing+=("$p")
+                continue
+            fi
+            # polkit-agent is a logical alias resolved to a real package at
+            # install time (RESOLVED_PKG_NAME) — auditing the alias name with
+            # rpm -q would always fail even when the agent is installed.
+            if [ "$p" = "polkit-agent" ]; then
+                name="${RESOLVED_PKG_NAME[$p]:-}"
+                [ -z "$name" ] && name=$(resolve_rhel_package "$p" 2>/dev/null || true)
+                if [ -z "$name" ] || ! pkg_installed "$name"; then
+                    missing+=("$p")
+                fi
+                continue
+            fi
             name="${RHEL_MAP[$p]:-$p}"
             pkg_installed "$name" || missing+=("$name")
         done

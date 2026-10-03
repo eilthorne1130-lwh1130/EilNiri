@@ -221,6 +221,8 @@ bluetooth（蓝牙，bluetui 依赖）、libvirtd（虚拟机）、power-profile
 - niri / awww 在 Debian 系走源码编译（约 10-20 分钟 + 5 分钟），需要 ≥ 6GB 磁盘与足够内存（编译并发按内存自动限制）
 - `arch-install.sh`、`RHEL-install.sh` 已完成核心功能（arch：pacman + AUR/yay；RHEL：dnf/EPEL/COPR + 源码编译 + 配置同步），欢迎测试反馈
 - RHEL 系 COPR 说明：`alebastr/sway-extras` 与 `solopasha/hyprland` 均未构建 EPEL chroot（在 EL 上 `dnf copr enable` 必报 "Chroot not found"），脚本只在 EL 上启用确有 `epel-10` chroot 的 `yalter/niri`，且启用前会先探测该 chroot 是否存在，失败自动降级到 EPEL / 源码编译，不会阻塞安装；EL9 无可用 COPR，niri 等一律源码编译
+- **EL10 系（Rocky/Alma/CentOS Stream 10）无 fcitx5**：官方仓库与 EPEL10 均无 fcitx5 包，也没有带 epel-10 chroot 的 fcitx5 COPR——中文输入法在 EL 上不可用（脚本会明确提示，可选 ibus+拼音替代）；Fedora 不受影响
+- EL10 上 waybar/mako/fuzzel/grim/slurp/copyq/playerctl/brightnessctl/hyprlock/hypridle 均无 RPM，脚本自动源码编译；编译依赖 `-devel` 包需要 **CRB/PowerTools 仓库启用**（脚本会自动启用并在失败时明确报告），源码编译约需 10-30 分钟
 
 ---
 
