@@ -58,7 +58,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 
 # GitHub mirror proxies used by download helpers (override with EILNIRI_GH_PROXY)
 GH_MIRRORS="https://ghfast.top https://gh-proxy.com https://ghproxy.net https://gh.llkk.cc"

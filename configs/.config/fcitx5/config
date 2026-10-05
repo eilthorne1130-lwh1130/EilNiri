@@ -52,8 +52,10 @@ ActiveByDefault=False
 resetStateWhenFocusIn=Program
 # 共享输入状态
 ShareInputState=No
-# 在程序中显示预编辑文本
-PreeditEnabledByDefault=True
+# 关闭应用内 preedit：组词高亮显示在候选窗里而不是应用输入框内。
+# 应用端 preedit 支持不佳（Wayland text-input/XIM 实现差异）时，应用内高亮的
+# 预编辑渲染不出来，表现为"第一个候选被高亮成空白/组词直接消失"。
+PreeditEnabledByDefault=False
 # 切换输入法时显示输入法信息
 ShowInputMethodInformation=True
 # 在焦点更改时显示输入法信息

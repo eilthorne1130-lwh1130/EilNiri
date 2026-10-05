@@ -62,7 +62,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.9.35"
+SCRIPT_VERSION="1.9.36"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -3468,17 +3468,23 @@ IMEEOF
 
     # 预编辑兜底：组词高亮显示在候选窗里而不是应用输入框内。应用端 preedit 支持
     # 不佳（Wayland text-input/XIM 实现差异）时，输入框里的高亮词会“直接消失”——
-    # 把 preedit 移出应用即可绕开。不部署任何主题/美化配置。
-    local _rimeconf="$HOME_DIR/.config/fcitx5/conf"
-    mkdir -p "$_rimeconf"
-    local _rf="$_rimeconf/rime.conf"
-    if grep -q "^PreeditInApplication=" "$_rf" 2>/dev/null; then
-        sed -i 's/^PreeditInApplication=.*/PreeditInApplication=False/' "$_rf"
-    else
-        printf '\n# eilNiri: preedit in candidate window (fixes vanishing preedit in apps with broken preedit support)\nPreeditInApplication=False\n' >> "$_rf"
+    # 把 preedit 移出应用即可绕开。正确的开关是 fcitx5 核心的
+    # [Behavior] PreeditEnabledByDefault（False = preedit 显示在候选窗）。
+    # 旧版脚本曾向 conf/rime.conf 写入 PreeditInApplication=——该键在 fcitx5-rime
+    # 5.1.16+ 已不存在（fcitx5 静默忽略未知键），从未生效，这里一并清理残留。
+    local _f5dir0="$HOME_DIR/.config/fcitx5"
+    local _f5cfg0="$_f5dir0/config" _rf0="$_f5dir0/conf/rime.conf"
+    if [ -f "$_f5cfg0" ] && grep -q "^PreeditEnabledByDefault=" "$_f5cfg0" 2>/dev/null; then
+        sed -i 's/^PreeditEnabledByDefault=.*/PreeditEnabledByDefault=False/' "$_f5cfg0"
     fi
-    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_rf" 2>/dev/null || true
-    log "$(_t "fcitx5-rime: PreeditInApplication=False（组词高亮改在候选窗显示）" "fcitx5-rime: PreeditInApplication=False (preedit shown in the candidate window)")"
+    if [ -f "$_rf0" ] && grep -q "PreeditInApplication" "$_rf0" 2>/dev/null; then
+        sed -i -e '/eilNiri/d' -e '/^PreeditInApplication=/d' "$_rf0"
+        # 清理后只剩空白则删除整个文件
+        if ! grep -q '[^[:space:]]' "$_rf0" 2>/dev/null; then
+            rm -f "$_rf0"
+        fi
+    fi
+    log "$(_t "fcitx5: PreeditEnabledByDefault=False（组词高亮改在候选窗显示）" "fcitx5: PreeditEnabledByDefault=False (preedit shown in the candidate window)")"
 
     # --- 快捷键与输入法组（与参考机同步）---
     # config：单击左 Shift 切换中英文（TriggerKeys=Shift+Shift_L + AltTriggerKeys=Shift_L，
@@ -3549,8 +3555,10 @@ ActiveByDefault=False
 resetStateWhenFocusIn=Program
 # 共享输入状态
 ShareInputState=No
-# 在程序中显示预编辑文本
-PreeditEnabledByDefault=True
+# 关闭应用内 preedit：组词高亮显示在候选窗里而不是应用输入框内。
+# 应用端 preedit 支持不佳（Wayland text-input/XIM 实现差异）时，应用内高亮的
+# 预编辑渲染不出来，表现为"第一个候选被高亮成空白/组词直接消失"。
+PreeditEnabledByDefault=False
 # 切换输入法时显示输入法信息
 ShowInputMethodInformation=True
 # 在焦点更改时显示输入法信息
@@ -5726,6 +5734,8 @@ stage_configs() {
     for item in "$snap/.local/share"/*; do
         name=$(basename "$item")
         [ -d "$item" ] || continue
+        # 与 .config 循环对称：deb 版 fcitx5 走 stock 配置，不部署主题等美化数据
+        case "$name" in fcitx5|fcitx) continue ;; esac
         if is_privacy_risk "$item"; then
             warn "$(_t "skip (privacy): " "skip (privacy): ") .local/share/$name"
             continue
