@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.4"
+SCRIPT_VERSION="1.11.5"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -281,13 +281,15 @@ declare -A RHEL_CANDIDATES=(
 #   yalter/niri              builds fedora-* AND epel-10-*  -> the only usable one
 #   alebastr/sway-extras     builds fedora-* ONLY           -> "Chroot not found" on EL
 #   solopasha/hyprland       builds fedora-rawhide ONLY, owner warns against using it
+# IMPORTANT: the yalter/niri project contains exactly ONE package, "niri"
+# (verified 2026-10 by fetching the project's package list). xwayland-satellite
+# is NOT built there — it goes pm_install -> EPEL retry -> cargo source build.
 # waybar/mako/fuzzel/grim/slurp/copyq/playerctl/brightnessctl therefore go
 # official repo -> EPEL retry -> source build (SOURCE_PKGS); hyprlock/hypridle go
 # official repo (Fedora) -> source build via build_hypr_stack (EL).
 # Fedora never hits this path: everything ships in Fedora official repos.
 declare -A RHEL_COPR_PKG=(
     [niri]=yalter/niri
-    [xwayland-satellite]=yalter/niri
 )
 # Packages expected from EPEL on EL10 (Fedora has them in the base repo).
 # After a failed dnf, retry with --enablerepo=epel* before COPR/source.
@@ -404,10 +406,17 @@ FCITX5_QT_REPO="https://github.com/fcitx/fcitx5-qt"
 # it manually). Built from source as step 0 of the chain below.
 XCB_IMDKIT_REPO="https://github.com/fcitx/xcb-imdkit"
 FCITX5_SRC_TAG="5.1.23"
+# Protocol libraries fcitx5 5.1.x needs beyond what EL10 provides:
+#   wayland-protocols          EL10 ships 1.45, fcitx5 requires >= 1.46
+#   plasma-wayland-protocols   only EPEL 10.2+ carries it (>= 1.20 required);
+#                              invisible on 10.0/10.1 minors (minor snapshots)
+# Backstopped from source into /usr/local (never touching /usr), conditionally.
+WAYLAND_PROTOCOLS_REPO="https://gitlab.freedesktop.org/wayland/wayland-protocols.git"
+PLASMA_WAYLAND_PROTOCOLS_REPO="https://github.com/KDE/plasma-wayland-protocols"
 SRC_DEPS_Fcitx5=(extra-cmake-modules glib2-devel gdk-pixbuf2-devel iso-codes-devel
     xkeyboard-config-devel nlohmann-json-devel expat-devel libxkbfile-devel
-    xcb-imdkit-devel plasma-wayland-protocols-devel systemd-devel dbus-devel
-    libuuid-devel zlib-devel gettext-devel)
+    libxkbcommon-x11-devel xcb-imdkit-devel plasma-wayland-protocols-devel
+    systemd-devel dbus-devel libuuid-devel zlib-devel gettext-devel)
 
 # System components (from other desktop environments) to disable when restoring
 # on a multi-DE target machine.  Only masked / hidden, NEVER uninstalled — the user
@@ -525,6 +534,11 @@ detect_distro() {
 
 pkg_installed() { # $1 = package name
     rpm -q "$1" &>/dev/null
+}
+
+# Version comparison: returns 0 when $1 < $2 (sort -V semantics)
+_ver_lt() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]
 }
 
 # Extra dnf --enablerepo flags filled by ensure_rhel_repos (epel/crb/powertools).
@@ -977,22 +991,17 @@ ensure_rhel_coprs() {
     dnf makecache --refresh >/dev/null 2>&1 || true
     _rhel_refresh_enablerepo
     # Availability check: "copr enable" succeeding only means the REPO is known to
-    # dnf — the chroot may still build no usable packages (owner dropped the
-    # build, EOL chroot, metadata lag). Probe every package we expect from this
-    # COPR so a silent fallthrough to the cargo source build is at least VISIBLE
-    # with a reason instead of an unexplained downgrade.
+    # dnf — the chroot may still build no usable packages. The yalter/niri project
+    # builds exactly ONE package (niri); xwayland-satellite is not in it (verified
+    # 2026-10), so only niri is probed here — xwayland-satellite always takes the
+    # cargo source-build path and warning about it every run is just noise.
     if dnf repolist 2>/dev/null | grep -qi 'yalter'; then
-        local _cprobe _cok=1
-        for _cprobe in niri xwayland-satellite; do
-            if dnf -q --disablerepo='*' --enablerepo='*yalter*' list available "$_cprobe" >/dev/null 2>&1; then
-                log "$(_t "COPR package check OK: " "COPR package check OK: ") $_cprobe $(_t "is available from yalter/niri" "is available from yalter/niri")"
-            else
-                _cok=0
-                warn "$(_t "COPR yalter/niri is enabled but " "COPR yalter/niri is enabled but ") $_cprobe $(_t "cannot be queried from it (chroot may have no current build) — it will fall back to the cargo source build." "cannot be queried from it.")"
-                MANUAL_ITEMS+=("COPR yalter/niri 已启用但查不到 $_cprobe（该 chroot 可能没有当前构建）——将自动走 cargo 源码编译兜底；若想用 COPR 包请检查 https://copr.fedorainfracloud.org/coprs/yalter/niri/ 的构建状态后重跑")
-            fi
-        done
-        [ "$_cok" -eq 1 ] || true
+        if dnf -q --disablerepo='*' --enablerepo='*yalter*' list available niri >/dev/null 2>&1; then
+            log "$(_t "COPR package check OK: " "COPR package check OK: ") niri $(_t "is available from yalter/niri" "is available from yalter/niri")"
+        else
+            warn "$(_t "COPR yalter/niri is enabled but 'niri' cannot be queried from it (chroot may have no current build) — it will fall back to the cargo source build." "COPR yalter/niri is enabled but 'niri' cannot be queried from it.")"
+            MANUAL_ITEMS+=("COPR yalter/niri 已启用但查不到 niri（该 chroot 可能没有当前构建）——将自动走 cargo 源码编译兜底；若想用 COPR 包请检查 https://copr.fedorainfracloud.org/coprs/yalter/niri/ 的构建状态后重跑")
+        fi
     fi
 }
 
@@ -2309,6 +2318,51 @@ RIME_ICE_ZIP_URL="https://github.com/iDvel/rime-ice/releases/latest/download/ful
 # Builds fcitx5 core + gtk + qt IM modules from source, then hands off to
 # install_fcitx5_rime_source for the rime engine. Idempotent: each step checks
 # for its already-installed artifact. Non-fatal steps report via MANUAL_ITEMS.
+# --- fcitx5 protocol-library backstops ---
+# wayland-protocols: EL10 ships 1.45 < fcitx5's required 1.46 — build the latest
+# from gitlab.freedesktop.org into /usr/local (pure noarch XML, seconds-fast).
+# CMake's find_package rejects the older /usr copy on version mismatch and finds
+# the /usr/local one. plasma-wayland-protocols: only EPEL 10.2+ carries it, so
+# 10.0/10.1 minors see nothing — build from the official KDE GitHub mirror.
+# Both are conditional: satisfied systems skip straight through.
+install_fcitx5_protocol_libs() {
+    local work="$1"
+    local _wpver _pwver
+    _wpver=$(pkg-config --modversion wayland-protocols 2>/dev/null || echo 0)
+    if _ver_lt "$_wpver" "1.46"; then
+        log "$(_t "[fcitx5 0a] system wayland-protocols (" "[fcitx5 0a] system wayland-protocols (") $_wpver $(_t ") < 1.46 — building latest into /usr/local..." ") < 1.46 — building latest into /usr/local...")"
+        rm -rf "$work/wayland-protocols"
+        if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+            clone --depth 1 "$WAYLAND_PROTOCOLS_REPO" "$work/wayland-protocols" >>"$LOG_DIR/wayland-protocols-build.log" 2>&1 \
+            && ( cd "$work/wayland-protocols" && meson setup build --prefix=/usr/local --buildtype=release \
+                 && meson install -C build ) >>"$LOG_DIR/wayland-protocols-build.log" 2>&1; then
+            INSTALLED_PKGS+=("wayland-protocols (source, /usr/local)")
+            export PKG_CONFIG_PATH="/usr/local/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+        else
+            MANUAL_ITEMS+=("wayland-protocols — 源码安装失败（fcitx5 需要 >=1.46，系统仅 $_wpver）。手动: git clone $WAYLAND_PROTOCOLS_REPO && meson setup build --prefix=/usr/local -Dtests=false && meson install -C build (日志: $LOG_DIR/wayland-protocols-build.log)")
+            return 1
+        fi
+    fi
+    _pwver=$(pkg-config --modversion plasma-wayland-protocols 2>/dev/null || echo 0)
+    if _ver_lt "$_pwver" "1.20"; then
+        log "$(_t "[fcitx5 0b] building plasma-wayland-protocols into /usr/local..." "[fcitx5 0b] building plasma-wayland-protocols into /usr/local...")"
+        rm -rf "$work/plasma-wayland-protocols"
+        if git_clone_gh "$PLASMA_WAYLAND_PROTOCOLS_REPO" "$work/plasma-wayland-protocols"; then
+            CMAKE_EXTRA_ARGS=()
+            if build_source_project plasma-wayland-protocols "$PLASMA_WAYLAND_PROTOCOLS_REPO" "$work" "$LOG_DIR/plasma-protocols-build.log"; then
+                INSTALLED_PKGS+=("plasma-wayland-protocols (source, /usr/local)")
+            else
+                MANUAL_ITEMS+=("plasma-wayland-protocols — source build failed; fcitx5 需要 >=1.20（EL 仅 10.2+ 有包）。日志尾部: $(tail -n 8 "$LOG_DIR/plasma-protocols-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/plasma-protocols-build.log)")
+                return 1
+            fi
+        else
+            MANUAL_ITEMS+=("plasma-wayland-protocols — source clone failed (GitHub 与镜像均不可达): $PLASMA_WAYLAND_PROTOCOLS_REPO")
+            return 1
+        fi
+    fi
+    return 0
+}
+
 install_fcitx5_source() {
     [ "$DISTRO_ID" != fedora ] || return 0
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -2322,8 +2376,12 @@ install_fcitx5_source() {
     local work logf
     work=$(mktemp -d)
     register_temp_path "$work"
-    export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    export PKG_CONFIG_PATH="/usr/local/share/pkgconfig:/usr/local/lib64/pkgconfig:/usr/lib64/pkgconfig:/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
     export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
+
+    # 0a/0b) wayland-protocols (>=1.46) + plasma-wayland-protocols (>=1.20):
+    # EL10's copies are too old / absent on early minors — build into /usr/local.
+    install_fcitx5_protocol_libs "$work" || true
 
     # 0) xcb-imdkit — fcitx5's X11/XIM helper library, unavailable from EPEL 10.
     #    Its only build deps (libxcb + xcb-util-*-devel) are already in the
@@ -2355,6 +2413,20 @@ install_fcitx5_source() {
         if ! git_clone_gh "$FCITX5_REPO" "$work/fcitx5" "$FCITX5_SRC_TAG"; then
             MANUAL_ITEMS+=("fcitx5 — source clone failed (GitHub 与镜像均不可达); 可设 EILNIRI_GH_PROXY 重试: $FCITX5_REPO")
             return 1
+        fi
+        # fcitx5 pins facebook/yoga as a submodule (third_party/yoga) — a --depth 1
+        # clone does not include it and cmake requires it (USE_SYSTEM_YOGA=Off).
+        # CN networks: rewrite the submodule URL through a mirror proxy and retry.
+        if ! git -C "$work/fcitx5" submodule update --init --depth 1 >>"$LOG_DIR/fcitx5-build.log" 2>&1; then
+            local _prox
+            for _prox in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
+                git -C "$work/fcitx5" config submodule.third_party/yoga.url "${_prox%/}/https://github.com/facebook/yoga" || true
+                git -C "$work/fcitx5" submodule update --init --depth 1 >>"$LOG_DIR/fcitx5-build.log" 2>&1 && break
+            done
+            git -C "$work/fcitx5" submodule update --init --depth 1 >>"$LOG_DIR/fcitx5-build.log" 2>&1 || {
+                MANUAL_ITEMS+=("fcitx5 — yoga submodule 拉取失败（third_party/yoga 为 cmake 必需）；手动: 进入 fcitx5 源码目录执行 git submodule update --init (日志: $LOG_DIR/fcitx5-build.log)")
+                return 1
+            }
         fi
         CMAKE_EXTRA_ARGS=(-DENABLE_ENCHANT=OFF -DENABLE_EMOJI=OFF -DENABLE_TEST=OFF -DENABLE_TESTING_ADDONS=OFF -DENABLE_DOC=OFF)
         logf="$LOG_DIR/fcitx5-build.log"
