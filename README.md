@@ -68,7 +68,7 @@ sudo reboot
 | `sudo ./deb-install.sh update` | root | 检查并更新软件：apt 包升级 + niri/awww/xwayland-satellite 源码组件有新版时重编译（fzf 勾选） |
 | `./deb-install.sh --help` | - | 查看帮助 |
 
-> Debian 系**没有** `rollback` 命令（配置覆盖前的本地备份以 `.bak-时间戳` 形式保留在原目录）。`rollback` 仅存在于 Arch / RHEL 脚本中。
+> 三个脚本都**没有** `rollback` 命令：配置覆盖前的本地备份以 `.bak-时间戳` 形式保留在原目录（每处仅保留最新一份），需要回退时手动恢复即可。
 
 ## 四、环境变量
 
@@ -215,7 +215,7 @@ bluetooth（蓝牙，bluetui 依赖）、libvirtd（虚拟机）、power-profile
 
 ## 十一、已知限制
 
-- **Debian 系无 `rollback` 命令**（配置备份仅保留覆盖前的 `.bak-时间戳` 单份）
+- 三个脚本均无 `rollback` 命令（配置备份仅保留覆盖前的 `.bak-时间戳` 单份）
 - **虚拟机必须开 3D 加速**，否则 niri 无法运行（niri 拒绝软件渲染，这是上游设计而非脚本问题）
 - Debian 12 / Ubuntu 24.04 的 waybar 为 0.9.x 旧版，自动使用精简布局（无折叠抽屉/媒体模块）
 - niri / awww 在 Debian 系走源码编译（约 10-20 分钟 + 5 分钟），需要 ≥ 6GB 磁盘与足够内存（编译并发按内存自动限制）
@@ -246,7 +246,6 @@ EilNiri/
 ## 参考
 
 - 交互风格与视觉引擎：[SHORiN-KiWATA/shorin-arch-setup](https://github.com/SHORiN-KiWATA/shorin-arch-setup)
-- 快照回滚设计（仅 Arch/RHEL）：[ech678/NyxNiri](https://github.com/ech678/NyxNiri)
 - 跨发行版思路：[nickjj/dotfriedrice](https://github.com/nickjj/dotfriedrice)
 
 ## 贡献者
