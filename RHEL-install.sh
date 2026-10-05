@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.6"
+SCRIPT_VERSION="1.11.7"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -408,9 +408,15 @@ FCITX5_QT_REPO="https://github.com/fcitx/fcitx5-qt"
 # it manually). Built from source as step 0 of the chain below.
 XCB_IMDKIT_REPO="https://github.com/fcitx/xcb-imdkit"
 FCITX5_SRC_TAG="5.1.10"
-SRC_DEPS_Fcitx5=(extra-cmake-modules glib2-devel gdk-pixbuf2-devel iso-codes-devel
-    xkeyboard-config-devel nlohmann-json-devel expat-devel libxkbfile-devel
-    libxkbcommon-x11-devel xcb-imdkit-devel
+# fcitx5 5.1.10's complete default-dependency surface (verified against its
+# CMakeLists.txt): ECM, json-c (keyboard config parsing — NOT nlohmann_json,
+# which only later 5.1.x uses), fmt, libuv (event-loop fallback when the systemd
+# cmake target is absent), iso-codes, xkeyboard-config, expat, libxkbcommon(+X11),
+# xkbfile, xcb-imdkit, dbus-1, zlib, libuuid, gettext, glib/gdk-pixbuf/cairo/pango
+# (generic list) — the generic RHEL_SOURCE_BUILD_DEPS already covers the last group.
+SRC_DEPS_Fcitx5=(extra-cmake-modules json-c-devel fmt-devel libuv-devel
+    glib2-devel gdk-pixbuf2-devel iso-codes-devel xkeyboard-config-devel
+    expat-devel libxkbfile-devel libxkbcommon-x11-devel xcb-imdkit-devel
     systemd-devel dbus-devel libuuid-devel zlib-devel gettext-devel)
 
 # System components (from other desktop environments) to disable when restoring
