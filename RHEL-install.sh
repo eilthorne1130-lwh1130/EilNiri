@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.2"
+SCRIPT_VERSION="1.11.3"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -269,6 +269,11 @@ declare -A RHEL_CANDIDATES=(
     # packaged by neither Fedora nor EPEL; lxpolkit was merged into lxsession. Both
     # mates below are actively maintained and built for Fedora AND EPEL.
     [polkit-agent]="mate-polkit polkit-kde"
+    # RHEL 10 family REPLACED the standalone power-profiles-daemon package with
+    # tuned-ppd (a PPD API translation daemon on top of tuned; same D-Bus API,
+    # ships tuned-ppd.service which Requires=tuned.service). Fedora still has
+    # the real power-profiles-daemon, so it stays the first candidate.
+    [power-profiles-daemon]="power-profiles-daemon tuned-ppd"
 )
 # COPR usage on the RHEL family — chroot support verified against
 # copr.fedorainfracloud.org (the #1 cause of "dnf copr enable" failures on EL is
@@ -361,23 +366,44 @@ RHEL_SOURCE_BUILD_DEPS=(git gcc gcc-c++ make cmake ninja-build meson pkgconf-pkg
 #              tray (dbusmenu), media/mpd (libmpdclient), power (upower),
 #              evdev + udev/systemd for some modules.
 #   copyq    — builds against Qt6 (+X11 record extension for clipboard hooks).
-#              qca-qt6-devel + qtkeychain-qt6-devel are CopyQ's encryption-plugin
-#              dependencies (both are hard-required by default). When either is
-#              unavailable the build passes -DWITH_QCA_ENCRYPTION=OFF instead
-#              (CopyQ then auto-disables keychain too; core clipboard features
-#              are unaffected). NOTE: the option is NOT "WITH_QCA" — cmake
-#              silently ignores an unknown -D and configure still fails.
+#              CopyQ 16's three OPTIONAL dependency chains are all hard-REQUIRED
+#              by cmake when their option is ON (the default): encryption needs
+#              qca-qt6-devel + qtkeychain-qt6-devel (WITH_QCA_ENCRYPTION), native
+#              notifications need extra-cmake-modules + the KF6 stack
+#              (WITH_NATIVE_NOTIFICATIONS), audio needs miniaudio-devel
+#              (WITH_AUDIO). Each chain's -devel packages are tolerant-installed
+#              below; whichever chain is still missing its package gets turned
+#              OFF via cmake (see install_source_package) instead of failing the
+#              configure — EL has no KF6 stack and may lack the others.
 SRC_DEPS_WAYBAR=(gtkmm30-devel gtkmm4.0-devel gtk-layer-shell-devel jsoncpp-devel
     spdlog-devel fmt-devel libnl3-devel libevdev-devel systemd-devel
     pulseaudio-libs-devel pipewire-devel wireplumber-devel bluez-libs-devel
     libdbusmenu-gtk3-devel libmpdclient-devel upower-devel)
-SRC_DEPS_COPYQ=(qt6-qtbase-devel qt6-qtdeclarative-devel qt6-qtsvg-devel
-    qt6-qttools-devel qt6-qtwayland-devel qt6-qtmultimedia-devel qca-qt6-devel
-    qtkeychain-qt6-devel libXtst-devel libX11-devel)
+SRC_DEPS_COPYQ=(qt6-qtbase-devel qt6-qtbase-private-devel qt6-qtdeclarative-devel
+    qt6-qtsvg-devel qt6-qttools-devel qt6-qtwayland-devel qt6-qtmultimedia-devel
+    qca-qt6-devel qtkeychain-qt6-devel extra-cmake-modules miniaudio-devel
+    libXtst-devel libXfixes-devel libX11-devel)
 #   playerctl — GLib + gobject-introspection.
 SRC_DEPS_PLAYERCTL=(glib2-devel gobject-introspection-devel)
 FCITX5_RIME_REPO="https://github.com/fcitx/fcitx5-rime"
 LIBRIME_REPO="https://github.com/rime/librime"
+# fcitx5 source-build chain (EL only — no fcitx5 RPM exists in any EL repository,
+# verified 2026-10 against EPEL10 and the COPR epel-10 chroots). Chain order:
+# fcitx5 core -> fcitx5-gtk (GTK3/4 IM modules) -> fcitx5-qt (Qt6 IM module) ->
+# fcitx5-rime via install_fcitx5_rime_source (builds librime too when absent).
+# fcitx5-configtool is NOT built: it hard-depends on KDE Frameworks 6, which EL
+# does not package — the deployed configs already provide a working IME.
+# Known EL risks (tolerant-installed; failures land in build logs): fcitx5 5.1.x
+# needs wayland-protocols >= 1.46, and xcb-imdkit / plasma-wayland-protocols may
+# be absent on some EPEL minors.
+FCITX5_REPO="https://github.com/fcitx/fcitx5"
+FCITX5_GTK_REPO="https://github.com/fcitx/fcitx5-gtk"
+FCITX5_QT_REPO="https://github.com/fcitx/fcitx5-qt"
+FCITX5_SRC_TAG="5.1.23"
+SRC_DEPS_Fcitx5=(extra-cmake-modules glib2-devel gdk-pixbuf2-devel iso-codes-devel
+    xkeyboard-config-devel nlohmann-json-devel expat-devel libxkbfile-devel
+    xcb-imdkit-devel plasma-wayland-protocols-devel systemd-devel dbus-devel
+    libuuid-devel zlib-devel gettext-devel)
 
 # System components (from other desktop environments) to disable when restoring
 # on a multi-DE target machine.  Only masked / hidden, NEVER uninstalled — the user
@@ -946,6 +972,19 @@ ensure_rhel_coprs() {
     done
     dnf makecache --refresh >/dev/null 2>&1 || true
     _rhel_refresh_enablerepo
+    # Availability check: "copr enable" succeeding only means the REPO is known to
+    # dnf — the chroot may still build no usable packages (owner dropped the
+    # build, EOL chroot, metadata lag). Probe an actual package so niri silently
+    # falling through to the cargo source build is at least VISIBLE with a
+    # reason instead of an unexplained downgrade.
+    if dnf repolist 2>/dev/null | grep -qi 'yalter'; then
+        if ! dnf -q --disablerepo='*' --enablerepo='*yalter*' list available niri >/dev/null 2>&1; then
+            warn "$(_t "COPR yalter/niri is enabled but 'niri' cannot be queried from it (chroot may have no current build) — niri will fall back to the cargo source build." "COPR yalter/niri is enabled but 'niri' cannot be queried from it.")"
+            MANUAL_ITEMS+=("COPR yalter/niri 已启用但查不到 niri 包（该 chroot 可能没有当前构建）——将自动走 cargo 源码编译兜底；若想用 COPR 包请检查 https://copr.fedorainfracloud.org/coprs/yalter/niri/ 的构建状态后重跑")
+        else
+            log "$(_t "COPR package check OK: niri is available from yalter/niri" "COPR package check OK: niri is available from yalter/niri")"
+        fi
+    fi
 }
 
 ensure_rhel_graphics_runtime() {
@@ -1108,17 +1147,21 @@ install_rhel() {
             continue
         fi
         # EL has no fcitx5 packages at all (not in EPEL, no COPR epel-10 chroot —
-        # verified 2026-10). Short-circuit BEFORE per-candidate resolution so the
-        # whole family lands in MANUAL guidance instead of FAILED entries. The
-        # guidance is emitted ONCE for the family; further members are recorded
-        # as skipped so the summary doesn't repeat the same paragraph 5 times.
+        # verified 2026-10). Route the family through the source-build chain;
+        # only configtool (needs KDE Frameworks 6) and rime (handled together
+        # with the rime-ice dictionary deploy) are handled differently.
         if [[ "$p" =~ ^fcitx5 ]] && [ "$DISTRO_ID" != fedora ]; then
-            if [ "${_FCITX5_NOTED:-0}" -eq 0 ]; then
-                MANUAL_ITEMS+=("fcitx5 全家（fcitx5/configtool/gtk/qt/rime）— EL10 系无 fcitx5 RPM（未进 EPEL）。可选: 1) 保持现状用 ibus: dnf install ibus-libpinyin; 2) 换 Fedora 系（fcitx5 在官方仓库）; 3) 自行从 Fedora 源编译。桌面其余功能不受影响。")
-                _FCITX5_NOTED=1
-            else
-                SKIPPED_PKGS+=("$p (见 fcitx5 手动提示)")
-            fi
+            case "$p" in
+                fcitx5-configtool)
+                    SKIPPED_PKGS+=("$p (EL 无包且依赖 KDE Frameworks 6，无法编译；快捷键/输入法组已随脚本配置，无需 configtool)")
+                    ;;
+                fcitx5-rime)
+                    SKIPPED_PKGS+=("$p (由 rime-ice 步骤统一处理：engine 源码编译 + 词典部署)")
+                    ;;
+                *)
+                    install_fcitx5_source
+                    ;;
+            esac
             continue
         fi
         if [ -n "${RHEL_MANUAL[$p]:-}" ]; then
@@ -2254,6 +2297,102 @@ install_satty() {
 RIME_ICE_REPO="https://github.com/iDvel/rime-ice"
 RIME_ICE_ZIP_URL="https://github.com/iDvel/rime-ice/releases/latest/download/full.zip"
 
+# --- fcitx5 full source-build chain (EL only) ---
+# Builds fcitx5 core + gtk + qt IM modules from source, then hands off to
+# install_fcitx5_rime_source for the rime engine. Idempotent: each step checks
+# for its already-installed artifact. Non-fatal steps report via MANUAL_ITEMS.
+install_fcitx5_source() {
+    [ "$DISTRO_ID" != fedora ] || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("fcitx5+gtk+qt+rime (source build chain)")
+        return "$DRY_RUN_RC"
+    fi
+    command -v fcitx5 >/dev/null 2>&1 || log "$(_t "Building fcitx5 from source (no EL package exists) — this takes a while..." "Building fcitx5 from source (no EL package exists)...")"
+
+    dnf_install_tolerant "${RHEL_SOURCE_BUILD_DEPS[@]}" "${SRC_DEPS_Fcitx5[@]}" || true
+
+    local work logf
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
+
+    # 1) fcitx5 core. Everything non-essential OFF to shrink the dependency
+    #    surface on EL (enchant spelling, emoji dict, tests); X11+Wayland stay ON
+    #    (X11 needs xcb-imdkit — dropping it would break input into XWayland apps).
+    if ! command -v fcitx5 >/dev/null 2>&1; then
+        log "$(_t "[fcitx5 1/4] building core..." "[fcitx5 1/4] building core...")"
+        if ! git_clone_gh "$FCITX5_REPO" "$work/fcitx5" "$FCITX5_SRC_TAG"; then
+            MANUAL_ITEMS+=("fcitx5 — source clone failed (GitHub 与镜像均不可达); 可设 EILNIRI_GH_PROXY 重试: $FCITX5_REPO")
+            return 1
+        fi
+        CMAKE_EXTRA_ARGS=(-DENABLE_ENCHANT=OFF -DENABLE_EMOJI=OFF -DENABLE_TEST=OFF -DENABLE_TESTING_ADDONS=OFF -DENABLE_DOC=OFF)
+        logf="$LOG_DIR/fcitx5-build.log"
+        if ! build_source_project fcitx5 "$FCITX5_REPO" "$work" "$logf"; then
+            MANUAL_ITEMS+=("fcitx5 — source build failed; 依赖包需 CRB/EPEL 仓库。日志尾部: $(tail -n 8 "$logf" 2>/dev/null | tr '\n' ' ') (full: $logf)")
+            return 1
+        fi
+        INSTALLED_PKGS+=("fcitx5 (source build)")
+        success "$(_t "fcitx5 core built from source" "fcitx5 core built from source")"
+    else
+        SKIPPED_PKGS+=("fcitx5 core (already installed)")
+    fi
+
+    # 2) fcitx5-gtk (GTK2/3/4 IM modules — GTK3/4 are what the desktop needs)
+    if ! find /usr/lib64/gtk-3.0 /usr/lib/gtk-3.0 /usr/lib64/gtk-4.0 /usr/lib/gtk-4.0 \
+        -name '*fcitx5*' 2>/dev/null | grep -q .; then
+        log "$(_t "[fcitx5 2/4] building gtk IM modules..." "[fcitx5 2/4] building gtk IM modules...")"
+        if git_clone_gh "$FCITX5_GTK_REPO" "$work/fcitx5-gtk"; then
+            CMAKE_EXTRA_ARGS=()
+            logf="$LOG_DIR/fcitx5-gtk-build.log"
+            if build_source_project fcitx5-gtk "$FCITX5_GTK_REPO" "$work" "$logf"; then
+                INSTALLED_PKGS+=("fcitx5-gtk (source build)")
+            else
+                MANUAL_ITEMS+=("fcitx5-gtk — source build failed; GTK 应用的输入法支持缺失（QT 应用不受影响）。日志尾部: $(tail -n 8 "$logf" 2>/dev/null | tr '\n' ' ') (full: $logf)")
+            fi
+        else
+            MANUAL_ITEMS+=("fcitx5-gtk — source clone failed: $FCITX5_GTK_REPO")
+        fi
+    else
+        SKIPPED_PKGS+=("fcitx5-gtk (already installed)")
+    fi
+
+    # 3) fcitx5-qt (Qt5/6 platform input context plugin)
+    if ! find /usr/lib64/qt6/plugins/platforminputcontexts /usr/lib64/qt5/plugins/platforminputcontexts \
+        -name '*fcitx5*' 2>/dev/null | grep -q .; then
+        log "$(_t "[fcitx5 3/4] building qt IM module..." "[fcitx5 3/4] building qt IM module...")"
+        if git_clone_gh "$FCITX5_QT_REPO" "$work/fcitx5-qt"; then
+            CMAKE_EXTRA_ARGS=(-DENABLE_QT5=OFF -DENABLE_QT6=ON)
+            logf="$LOG_DIR/fcitx5-qt-build.log"
+            if build_source_project fcitx5-qt "$FCITX5_QT_REPO" "$work" "$logf"; then
+                INSTALLED_PKGS+=("fcitx5-qt (source build)")
+            else
+                MANUAL_ITEMS+=("fcitx5-qt — source build failed; Qt 应用的输入法支持缺失（GTK 应用不受影响）。日志尾部: $(tail -n 8 "$logf" 2>/dev/null | tr '\n' ' ') (full: $logf)")
+            fi
+        else
+            MANUAL_ITEMS+=("fcitx5-qt — source clone failed: $FCITX5_QT_REPO")
+        fi
+    else
+        SKIPPED_PKGS+=("fcitx5-qt (already installed)")
+    fi
+    unset CMAKE_EXTRA_ARGS
+
+    # 4) fcitx5-rime engine (existing helper: also builds librime when the EL
+    #    librime-devel package is unavailable). The fcitx5 headers installed by
+    #    step 1 satisfy its fcitx5-devel pre-check.
+    if ! pkg_installed fcitx5-rime && ! find /usr -name 'libFcitx5Rime.so' -print -quit 2>/dev/null | grep -q .; then
+        log "$(_t "[fcitx5 4/4] building rime engine (incl. librime)..." "[fcitx5 4/4] building rime engine (incl. librime)...")"
+        if install_fcitx5_rime_source; then
+            INSTALLED_PKGS+=("fcitx5-rime (source build)")
+        else
+            MANUAL_ITEMS+=("fcitx5-rime — source build failed（rime 引擎缺失则无法中文输入；备选: 自行编译 fcitx5-chinese-addons 走拼音 https://github.com/fcitx/fcitx5-chinese-addons）")
+        fi
+    else
+        SKIPPED_PKGS+=("fcitx5-rime (already installed)")
+    fi
+    return 0
+}
+
 install_fcitx5_rime_source() {
     [ "$DISTRO_FAMILY" = rhel ] || return 1
     [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
@@ -2652,12 +2791,22 @@ install_source_package() { # $1 = package, $2 = upstream repository
     case "$pkg" in
         waybar)    _extra=("${SRC_DEPS_WAYBAR[@]}") ;;
         copyq)     _extra=("${SRC_DEPS_COPYQ[@]}")
-                   # Qca + Qt6Keychain are both hard-required for the encryption
-                   # plugin (CopyQ 16 CMakeLists). Only when BOTH -devel packages
-                   # are installed do we build with encryption; otherwise disable
-                   # it — WITH_QCA_ENCRYPTION=OFF also auto-disables keychain.
+                   # Disable whichever of CopyQ 16's three optional chains cannot
+                   # be satisfied on this EL release (each is hard-REQUIRED by
+                   # cmake while its option is ON — see SRC_DEPS_COPYQ note).
+                   # NOTE: option names are exact; cmake silently ignores an
+                   # unknown -D and configure still fails.
                    if ! pkg_installed qca-qt6-devel || ! pkg_installed qtkeychain-qt6-devel; then
-                       CMAKE_EXTRA_ARGS=(-DWITH_QCA_ENCRYPTION=OFF)
+                       CMAKE_EXTRA_ARGS+=(-DWITH_QCA_ENCRYPTION=OFF)
+                   fi
+                   if ! pkg_installed kf6-knotifications-devel; then
+                       # EL has no KF6 stack: WITH_NATIVE_NOTIFICATIONS=OFF also
+                       # drops the ECM requirement. Tray falls back to Qt's own
+                       # implementation; core clipboard features unaffected.
+                       CMAKE_EXTRA_ARGS+=(-DWITH_NATIVE_NOTIFICATIONS=OFF)
+                   fi
+                   if ! pkg_installed miniaudio-devel; then
+                       CMAKE_EXTRA_ARGS+=(-DWITH_AUDIO=OFF)
                    fi ;;
         playerctl) _extra=("${SRC_DEPS_PLAYERCTL[@]}")
                    # playerctl's meson wants gtk-doc to render the API docs; the
@@ -2929,14 +3078,22 @@ stage_services() {
         unit=$(echo "$line" | cut -f1 -d"$(printf '\t')" | xargs)
         [ -z "$unit" ] && continue
         provider="${SVC_PROVIDER[$unit]:-}"
-        # install the provider package if it is missing
-        if [ -n "$provider" ] && ! pkg_installed "$provider"; then
-            log "$(_t "Installing service provider: " "Installing service provider: ")$provider"
+        # Resolve provider candidates (RHEL_CANDIDATES) BEFORE the install chain:
+        # EL10 has no power-profiles-daemon RPM at all — it ships tuned-ppd (PPD
+        # API translation daemon) instead. Installing tuned-ppd also pulls in
+        # tuned, and its service unit is tuned-ppd.service, not the original one.
+        local _pprovider="$provider"
+        if [ -n "$provider" ] && ! pkg_installed "$provider" && [ -n "${RHEL_CANDIDATES[$provider]:-}" ]; then
+            _pprovider=$(resolve_rhel_package "$provider" 2>/dev/null || echo "$provider")
+            [ "$_pprovider" != "$provider" ] && log "$(_t "Provider resolved: " "Provider resolved: ") $provider $(_t "-> " "-> ") $_pprovider"
+        fi
+        if [ -n "$provider" ] && ! pkg_installed "$_pprovider"; then
+            log "$(_t "Installing service provider: " "Installing service provider: ")$_pprovider"
             erc=0
             # stderr MUST land in dnf-errors.log — the failure report below greps
             # that file for THIS provider's real error (without it the report
             # inherits whichever unrelated line sits at the log tail).
-            pm_install "$provider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
+            pm_install "$_pprovider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
             # RHEL family: some providers (power-profiles-daemon, ...) are only in EPEL,
             # not the base repos — enable EPEL once and retry before declaring failure.
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] \
@@ -2944,26 +3101,33 @@ stage_services() {
                 log "$(_t "Provider not in base RHEL repos — enabling EPEL and retrying..." "Provider not in base RHEL repos — enabling EPEL and retrying...")"
                 pm_install epel-release 2>/dev/null || true
                 erc=0
-                pm_install "$provider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
+                pm_install "$_pprovider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
             fi
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
-                log "$(_t "Retrying service provider with EPEL: " "Retrying service provider with EPEL: ")$provider"
+                log "$(_t "Retrying service provider with EPEL: " "Retrying service provider with EPEL: ")$_pprovider"
                 erc=0
-                exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$provider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
+                exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$_pprovider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
             fi
-            # power-profiles-daemon declares `Conflicts: tuned`, and tuned ships
-            # preinstalled on EL server/cloud images. Masking tuned (stage_disable_system)
-            # does NOT lift a package-level conflict — only removing it does. Ask,
-            # never remove silently.
+            # The standalone power-profiles-daemon declares `Conflicts: tuned`, and
+            # tuned ships preinstalled on EL8/9 server/cloud images. Masking tuned
+            # (stage_disable_system) does NOT lift a package-level conflict — only
+            # removing it does. Not applicable when we resolved to tuned-ppd (tuned
+            # is its hard dependency). Ask, never remove silently.
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] \
-                && [ "$provider" = "power-profiles-daemon" ] && pkg_installed tuned; then
+                && [ "$_pprovider" = "power-profiles-daemon" ] && pkg_installed tuned; then
                 warn "$(_t "power-profiles-daemon conflicts with the installed 'tuned' package (EL server/cloud images ship it preinstalled)." "power-profiles-daemon conflicts with the installed 'tuned' package.")"
                 if confirm "$(_t "Remove 'tuned' to install power-profiles-daemon? [Y/n] (default Y, 20s):" "Remove 'tuned' to install power-profiles-daemon? [Y/n] (default Y, 20s):")" "Y" 20; then
                     exe dnf remove -y tuned 2>>"$LOG_DIR/dnf-errors.log" || true
                     erc=0
-                    pm_install "$provider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
+                    pm_install "$_pprovider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
                     [ "$erc" -eq 0 ] && ENABLED_SVCS+=("removed:tuned")
                 fi
+            fi
+            # The replacement provider's service unit has a different name — enable
+            # tuned-ppd.service instead of the (nonexistent) power-profiles-daemon.service.
+            if [ "$erc" -eq 0 ] && [ "$_pprovider" != "$provider" ] && [ "$_pprovider" = "tuned-ppd" ]; then
+                unit="tuned-ppd.service"
+                log "$(_t "Service unit switched to: " "Service unit switched to: ") $unit $(_t "(tuned-ppd provides the same PPD D-Bus API)" "(tuned-ppd provides the same PPD D-Bus API)")"
             fi
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
                 local _svcerr
@@ -2971,7 +3135,7 @@ stage_services() {
                 # the shared dnf-errors.log tail often belongs to an UNRELATED
                 # earlier failure (e.g. awww's optional dav1d-devel) and must not
                 # be shown as this provider's error.
-                _svcerr=$(grep -F "$provider" "$LOG_DIR/dnf-errors.log" 2>/dev/null | tail -n 2 | tr '\n' ' ')
+                _svcerr=$(grep -F "${_pprovider:-$provider}" "$LOG_DIR/dnf-errors.log" 2>/dev/null | tail -n 2 | tr '\n' ' ')
                 [ -z "$_svcerr" ] && _svcerr=$(grep -hE '没有任何匹配|No match|conflicts with|problem with|无法安装|Failed' "$LOG_DIR/dnf-errors.log" 2>/dev/null | tail -n 2 | tr '\n' ' ')
                 [ -z "$_svcerr" ] && _svcerr="(dnf 日志尾部: $(tail -n 2 "$LOG_DIR/dnf-errors.log" 2>/dev/null | tr '\n' ' '))"
                 FAILED_PKGS+=("svc-provider:$provider (${_svcerr:-见 $LOG_DIR/dnf-errors.log})")
@@ -3635,14 +3799,33 @@ stage_disable_system() {
     fi
 
     > "$DISABLE_MANIFEST"  # Clear manifest before rebuild
-    
+
     local line type name reason _rc _adir _afile valid
     local disabled_count=0 skipped_count=0 failed_items=()
-    
+
+    # EL10 whitelist pre-check (runs BEFORE stage_services installs anything):
+    # when the power-profiles-daemon provider resolves to tuned-ppd (RHEL 10
+    # family ships tuned-ppd instead of the standalone daemon), masking
+    # tuned.service would break tuned-ppd, which hard-requires tuned. Resolve
+    # once up front — this stage runs before the service stage installs the
+    # provider, so checking installed packages alone is too late.
+    local _TUNED_PPD_MODE=0
+    if pkg_installed tuned-ppd 2>/dev/null \
+        || [ "$(resolve_rhel_package power-profiles-daemon 2>/dev/null || true)" = "tuned-ppd" ]; then
+        _TUNED_PPD_MODE=1
+        log "$(_t "EL10 detected: power-profiles API is provided by tuned-ppd — tuned.service will NOT be masked." "EL10 detected: power-profiles API is provided by tuned-ppd — tuned.service will NOT be masked.")"
+    fi
+
     for line in "${DISABLE_SYS[@]}"; do
         IFS='|' read -r type name reason <<< "$line"
         valid=0
-        
+
+        if [ "$name" = "tuned.service" ] && [ "$_TUNED_PPD_MODE" -eq 1 ]; then
+            log "$(_t "  [SKIP] tuned.service — tuned-ppd (power-profiles provider) requires it" "  [SKIP] tuned.service — tuned-ppd (power-profiles provider) requires it")"
+            skipped_count=$((skipped_count + 1))
+            continue
+        fi
+
         case "$type" in
             autostart)
                 # Check if autostart file exists in system
