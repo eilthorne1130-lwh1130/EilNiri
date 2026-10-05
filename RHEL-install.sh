@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.1"
+SCRIPT_VERSION="1.11.2"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -361,16 +361,19 @@ RHEL_SOURCE_BUILD_DEPS=(git gcc gcc-c++ make cmake ninja-build meson pkgconf-pkg
 #              tray (dbusmenu), media/mpd (libmpdclient), power (upower),
 #              evdev + udev/systemd for some modules.
 #   copyq    — builds against Qt6 (+X11 record extension for clipboard hooks).
-#              qca-qt6-devel is CopyQ's encryption-plugin dependency; when it is
-#              unavailable the build passes -DWITH_QCA=OFF instead (core
-#              clipboard features are unaffected).
+#              qca-qt6-devel + qtkeychain-qt6-devel are CopyQ's encryption-plugin
+#              dependencies (both are hard-required by default). When either is
+#              unavailable the build passes -DWITH_QCA_ENCRYPTION=OFF instead
+#              (CopyQ then auto-disables keychain too; core clipboard features
+#              are unaffected). NOTE: the option is NOT "WITH_QCA" — cmake
+#              silently ignores an unknown -D and configure still fails.
 SRC_DEPS_WAYBAR=(gtkmm30-devel gtkmm4.0-devel gtk-layer-shell-devel jsoncpp-devel
     spdlog-devel fmt-devel libnl3-devel libevdev-devel systemd-devel
     pulseaudio-libs-devel pipewire-devel wireplumber-devel bluez-libs-devel
     libdbusmenu-gtk3-devel libmpdclient-devel upower-devel)
 SRC_DEPS_COPYQ=(qt6-qtbase-devel qt6-qtdeclarative-devel qt6-qtsvg-devel
     qt6-qttools-devel qt6-qtwayland-devel qt6-qtmultimedia-devel qca-qt6-devel
-    libXtst-devel libX11-devel)
+    qtkeychain-qt6-devel libXtst-devel libX11-devel)
 #   playerctl — GLib + gobject-introspection.
 SRC_DEPS_PLAYERCTL=(glib2-devel gobject-introspection-devel)
 FCITX5_RIME_REPO="https://github.com/fcitx/fcitx5-rime"
@@ -1934,8 +1937,15 @@ install_awww() {
     # RHEL: awww's common crate links xkbcommon + lz4 (mandatory); dav1d is an
     # optional runtime codec, so only lz4/xkbcommon are hard pre-checks. Tolerant
     # so a missing name (e.g. dav1d-devel on older EL) never aborts the batch.
-    dnf_install_tolerant git wayland-devel wayland-protocols-devel lz4-devel \
-        libxkbcommon-devel dav1d-devel libdrm-devel mesa-libgbm-devel || bdeps_rc=$?
+    # dav1d(-devel) entered EPEL only in a later 10.x minor — on earlier minors
+    # it is simply not there; probing first keeps the log free of a guaranteed
+    # "没有任何匹配: dav1d-devel" line on every run.
+    local _awww_bdeps=(git wayland-devel wayland-protocols-devel lz4-devel \
+        libxkbcommon-devel libdrm-devel mesa-libgbm-devel)
+    if dnf -q --disablerepo='*' --enablerepo='epel*' list available dav1d-devel >/dev/null 2>&1; then
+        _awww_bdeps+=(dav1d-devel)
+    fi
+    dnf_install_tolerant "${_awww_bdeps[@]}" || bdeps_rc=$?
     if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
         warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
     fi
@@ -2642,11 +2652,12 @@ install_source_package() { # $1 = package, $2 = upstream repository
     case "$pkg" in
         waybar)    _extra=("${SRC_DEPS_WAYBAR[@]}") ;;
         copyq)     _extra=("${SRC_DEPS_COPYQ[@]}")
-                   # Qca is only needed for the encryption plugin: when its -devel
-                   # package is unavailable on this EL release, disable the plugin
-                   # instead of failing the whole cmake configure.
-                   if ! pkg_installed qca-qt6-devel; then
-                       CMAKE_EXTRA_ARGS=(-DWITH_QCA=OFF)
+                   # Qca + Qt6Keychain are both hard-required for the encryption
+                   # plugin (CopyQ 16 CMakeLists). Only when BOTH -devel packages
+                   # are installed do we build with encryption; otherwise disable
+                   # it — WITH_QCA_ENCRYPTION=OFF also auto-disables keychain.
+                   if ! pkg_installed qca-qt6-devel || ! pkg_installed qtkeychain-qt6-devel; then
+                       CMAKE_EXTRA_ARGS=(-DWITH_QCA_ENCRYPTION=OFF)
                    fi ;;
         playerctl) _extra=("${SRC_DEPS_PLAYERCTL[@]}")
                    # playerctl's meson wants gtk-doc to render the API docs; the
@@ -2922,7 +2933,10 @@ stage_services() {
         if [ -n "$provider" ] && ! pkg_installed "$provider"; then
             log "$(_t "Installing service provider: " "Installing service provider: ")$provider"
             erc=0
-            pm_install "$provider" || erc=$?
+            # stderr MUST land in dnf-errors.log — the failure report below greps
+            # that file for THIS provider's real error (without it the report
+            # inherits whichever unrelated line sits at the log tail).
+            pm_install "$provider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
             # RHEL family: some providers (power-profiles-daemon, ...) are only in EPEL,
             # not the base repos — enable EPEL once and retry before declaring failure.
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] \
@@ -2930,12 +2944,12 @@ stage_services() {
                 log "$(_t "Provider not in base RHEL repos — enabling EPEL and retrying..." "Provider not in base RHEL repos — enabling EPEL and retrying...")"
                 pm_install epel-release 2>/dev/null || true
                 erc=0
-                pm_install "$provider" || erc=$?
+                pm_install "$provider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
             fi
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
                 log "$(_t "Retrying service provider with EPEL: " "Retrying service provider with EPEL: ")$provider"
                 erc=0
-                exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$provider" || erc=$?
+                exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$provider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
             fi
             # power-profiles-daemon declares `Conflicts: tuned`, and tuned ships
             # preinstalled on EL server/cloud images. Masking tuned (stage_disable_system)
@@ -2947,7 +2961,7 @@ stage_services() {
                 if confirm "$(_t "Remove 'tuned' to install power-profiles-daemon? [Y/n] (default Y, 20s):" "Remove 'tuned' to install power-profiles-daemon? [Y/n] (default Y, 20s):")" "Y" 20; then
                     exe dnf remove -y tuned 2>>"$LOG_DIR/dnf-errors.log" || true
                     erc=0
-                    pm_install "$provider" || erc=$?
+                    pm_install "$provider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
                     [ "$erc" -eq 0 ] && ENABLED_SVCS+=("removed:tuned")
                 fi
             fi
