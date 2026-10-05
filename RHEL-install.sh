@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.3"
+SCRIPT_VERSION="1.11.4"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -399,6 +399,10 @@ LIBRIME_REPO="https://github.com/rime/librime"
 FCITX5_REPO="https://github.com/fcitx/fcitx5"
 FCITX5_GTK_REPO="https://github.com/fcitx/fcitx5-gtk"
 FCITX5_QT_REPO="https://github.com/fcitx/fcitx5-qt"
+# xcb-imdkit (fcitx5's X11/XIM helper library) is NOT obtainable from EPEL 10
+# (no fcitx5 COPR exists either — verified 2026-10; Rocky 10 IME guides compile
+# it manually). Built from source as step 0 of the chain below.
+XCB_IMDKIT_REPO="https://github.com/fcitx/xcb-imdkit"
 FCITX5_SRC_TAG="5.1.23"
 SRC_DEPS_Fcitx5=(extra-cmake-modules glib2-devel gdk-pixbuf2-devel iso-codes-devel
     xkeyboard-config-devel nlohmann-json-devel expat-devel libxkbfile-devel
@@ -974,16 +978,21 @@ ensure_rhel_coprs() {
     _rhel_refresh_enablerepo
     # Availability check: "copr enable" succeeding only means the REPO is known to
     # dnf — the chroot may still build no usable packages (owner dropped the
-    # build, EOL chroot, metadata lag). Probe an actual package so niri silently
-    # falling through to the cargo source build is at least VISIBLE with a
-    # reason instead of an unexplained downgrade.
+    # build, EOL chroot, metadata lag). Probe every package we expect from this
+    # COPR so a silent fallthrough to the cargo source build is at least VISIBLE
+    # with a reason instead of an unexplained downgrade.
     if dnf repolist 2>/dev/null | grep -qi 'yalter'; then
-        if ! dnf -q --disablerepo='*' --enablerepo='*yalter*' list available niri >/dev/null 2>&1; then
-            warn "$(_t "COPR yalter/niri is enabled but 'niri' cannot be queried from it (chroot may have no current build) — niri will fall back to the cargo source build." "COPR yalter/niri is enabled but 'niri' cannot be queried from it.")"
-            MANUAL_ITEMS+=("COPR yalter/niri 已启用但查不到 niri 包（该 chroot 可能没有当前构建）——将自动走 cargo 源码编译兜底；若想用 COPR 包请检查 https://copr.fedorainfracloud.org/coprs/yalter/niri/ 的构建状态后重跑")
-        else
-            log "$(_t "COPR package check OK: niri is available from yalter/niri" "COPR package check OK: niri is available from yalter/niri")"
-        fi
+        local _cprobe _cok=1
+        for _cprobe in niri xwayland-satellite; do
+            if dnf -q --disablerepo='*' --enablerepo='*yalter*' list available "$_cprobe" >/dev/null 2>&1; then
+                log "$(_t "COPR package check OK: " "COPR package check OK: ") $_cprobe $(_t "is available from yalter/niri" "is available from yalter/niri")"
+            else
+                _cok=0
+                warn "$(_t "COPR yalter/niri is enabled but " "COPR yalter/niri is enabled but ") $_cprobe $(_t "cannot be queried from it (chroot may have no current build) — it will fall back to the cargo source build." "cannot be queried from it.")"
+                MANUAL_ITEMS+=("COPR yalter/niri 已启用但查不到 $_cprobe（该 chroot 可能没有当前构建）——将自动走 cargo 源码编译兜底；若想用 COPR 包请检查 https://copr.fedorainfracloud.org/coprs/yalter/niri/ 的构建状态后重跑")
+            fi
+        done
+        [ "$_cok" -eq 1 ] || true
     fi
 }
 
@@ -1147,19 +1156,18 @@ install_rhel() {
             continue
         fi
         # EL has no fcitx5 packages at all (not in EPEL, no COPR epel-10 chroot —
-        # verified 2026-10). Route the family through the source-build chain;
-        # only configtool (needs KDE Frameworks 6) and rime (handled together
-        # with the rime-ice dictionary deploy) are handled differently.
+        # verified 2026-10). The WHOLE family (xcb-imdkit + core + gtk + qt +
+        # rime) is built by install_fcitx5_source, triggered ONCE by the fcitx5
+        # entry itself — the other family members are only bookkeeping here, so
+        # a failure cannot repeat the same build+error three times.
         if [[ "$p" =~ ^fcitx5 ]] && [ "$DISTRO_ID" != fedora ]; then
             case "$p" in
+                fcitx5)          install_fcitx5_source ;;
                 fcitx5-configtool)
                     SKIPPED_PKGS+=("$p (EL 无包且依赖 KDE Frameworks 6，无法编译；快捷键/输入法组已随脚本配置，无需 configtool)")
                     ;;
-                fcitx5-rime)
-                    SKIPPED_PKGS+=("$p (由 rime-ice 步骤统一处理：engine 源码编译 + 词典部署)")
-                    ;;
                 *)
-                    install_fcitx5_source
+                    SKIPPED_PKGS+=("$p (由 fcitx5 源码链统一编译)")
                     ;;
             esac
             continue
@@ -2317,6 +2325,28 @@ install_fcitx5_source() {
     export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
     export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
 
+    # 0) xcb-imdkit — fcitx5's X11/XIM helper library, unavailable from EPEL 10.
+    #    Its only build deps (libxcb + xcb-util-*-devel) are already in the
+    #    generic list. Without it fcitx5's cmake aborts on "XCBImdkit not found".
+    if ! pkg-config --exists xcb-imdkit 2>/dev/null \
+        && ! find /usr/lib64/cmake /usr/lib/cmake /usr/local/lib64/cmake /usr/local/lib/cmake \
+            -iname 'XCBImdkit*Config.cmake' 2>/dev/null | grep -q .; then
+        log "$(_t "[fcitx5 0/4] building xcb-imdkit (not in EPEL)..." "[fcitx5 0/4] building xcb-imdkit (not in EPEL)...")"
+        if git_clone_gh "$XCB_IMDKIT_REPO" "$work/xcb-imdkit"; then
+            CMAKE_EXTRA_ARGS=()
+            logf="$LOG_DIR/xcb-imdkit-build.log"
+            if build_source_project xcb-imdkit "$XCB_IMDKIT_REPO" "$work" "$logf"; then
+                INSTALLED_PKGS+=("xcb-imdkit (source build)")
+            else
+                MANUAL_ITEMS+=("xcb-imdkit — source build failed; fcitx5 依赖它提供 XWayland 应用输入。日志尾部: $(tail -n 8 "$logf" 2>/dev/null | tr '\n' ' ') (full: $logf)")
+            fi
+        else
+            MANUAL_ITEMS+=("xcb-imdkit — source clone failed: $XCB_IMDKIT_REPO")
+        fi
+    else
+        SKIPPED_PKGS+=("xcb-imdkit (already installed)")
+    fi
+
     # 1) fcitx5 core. Everything non-essential OFF to shrink the dependency
     #    surface on EL (enchant spelling, emoji dict, tests); X11+Wayland stay ON
     #    (X11 needs xcb-imdkit — dropping it would break input into XWayland apps).
@@ -3087,6 +3117,19 @@ stage_services() {
             _pprovider=$(resolve_rhel_package "$provider" 2>/dev/null || echo "$provider")
             [ "$_pprovider" != "$provider" ] && log "$(_t "Provider resolved: " "Provider resolved: ") $provider $(_t "-> " "-> ") $_pprovider"
         fi
+        # The replacement provider's service unit has a different name — this must
+        # run OUTSIDE the install block below: on a rerun tuned-ppd is already
+        # installed, the install block is skipped entirely, and without this the
+        # enable step would still target the nonexistent power-profiles-daemon.service.
+        if [ "$_pprovider" != "$provider" ] && [ "$_pprovider" = "tuned-ppd" ]; then
+            unit="tuned-ppd.service"
+            log "$(_t "Service unit switched to: " "Service unit switched to: ") $unit $(_t "(tuned-ppd provides the same PPD D-Bus API)" "(tuned-ppd provides the same PPD D-Bus API)")"
+            # tuned-ppd.service hard-requires tuned.service; if an earlier
+            # stage_disable_system run masked tuned (stale pre-check), lift it.
+            if systemctl is-enabled tuned 2>/dev/null | grep -q masked; then
+                exe systemctl unmask tuned
+            fi
+        fi
         if [ -n "$provider" ] && ! pkg_installed "$_pprovider"; then
             log "$(_t "Installing service provider: " "Installing service provider: ")$_pprovider"
             erc=0
@@ -3123,12 +3166,6 @@ stage_services() {
                     [ "$erc" -eq 0 ] && ENABLED_SVCS+=("removed:tuned")
                 fi
             fi
-            # The replacement provider's service unit has a different name — enable
-            # tuned-ppd.service instead of the (nonexistent) power-profiles-daemon.service.
-            if [ "$erc" -eq 0 ] && [ "$_pprovider" != "$provider" ] && [ "$_pprovider" = "tuned-ppd" ]; then
-                unit="tuned-ppd.service"
-                log "$(_t "Service unit switched to: " "Service unit switched to: ") $unit $(_t "(tuned-ppd provides the same PPD D-Bus API)" "(tuned-ppd provides the same PPD D-Bus API)")"
-            fi
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
                 local _svcerr
                 # Prefer lines about THIS provider, then generic dnf failure lines;
@@ -3154,14 +3191,22 @@ stage_services() {
         else
             # diagnostics: distinguish a *missing/masked unit* from a *start failure*
             # so the failure is actionable on the rerun instead of repeating silently.
-            local _desc
+            local _desc _srctxt
             _desc=$(systemctl show "$unit" --property=Description 2>/dev/null | sed 's/^Description=//')
             if [ -z "$_desc" ]; then
                 warn "$(_t "Service unit not found: " "Service unit not found: ")$unit (package may not ship this unit on this distro)"
+                _srctxt="unit 不存在于本系统（软件包未提供该 unit）"
+            else
+                # masked units are another common cause: name it explicitly
+                if systemctl is-enabled "$unit" 2>/dev/null | grep -q masked; then
+                    _srctxt="unit 处于 masked 状态"
+                else
+                    _srctxt="启动失败（见 service-$unit.log）"
+                fi
             fi
             systemctl --no-pager --lines=5 status "$unit" >"$LOG_DIR/service-$unit.log" 2>&1 || true
             log "$(_t "Enable failed for " "Enable failed for ")$unit — details: $LOG_DIR/service-$unit.log"
-            FAILED_PKGS+=("service:$unit")
+            FAILED_PKGS+=("service:$unit ($_srctxt)")
             any_failed=1
         fi
         # also enable the sockets that ship with libvirtd (if present)
