@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.0"
+SCRIPT_VERSION="1.11.1"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -351,7 +351,7 @@ RHEL_SOURCE_BUILD_DEPS=(git gcc gcc-c++ make cmake ninja-build meson pkgconf-pkg
     gtk3-devel gtk4-devel libadwaita-devel librsvg2-devel libnotify-devel libxcb-devel
     xcb-util-devel xcb-util-wm-devel xcb-util-image-devel xcb-util-keysyms-devel
     xcb-util-renderutil-devel xcb-util-cursor-devel libjpeg-turbo-devel libpng-devel
-    libwebp-devel pam-devel sdbus-cpp-devel)
+    libwebp-devel pam-devel sdbus-cpp-devel scdoc)
 # Per-project extra build deps for the source-build fallbacks, on top of
 # RHEL_SOURCE_BUILD_DEPS. All names are tolerant-installed, so a package absent
 # on an older EL release only degrades that one feature instead of aborting.
@@ -361,13 +361,17 @@ RHEL_SOURCE_BUILD_DEPS=(git gcc gcc-c++ make cmake ninja-build meson pkgconf-pkg
 #              tray (dbusmenu), media/mpd (libmpdclient), power (upower),
 #              evdev + udev/systemd for some modules.
 #   copyq    — builds against Qt6 (+X11 record extension for clipboard hooks).
-#   playerctl — GLib + gobject-introspection.
+#              qca-qt6-devel is CopyQ's encryption-plugin dependency; when it is
+#              unavailable the build passes -DWITH_QCA=OFF instead (core
+#              clipboard features are unaffected).
 SRC_DEPS_WAYBAR=(gtkmm30-devel gtkmm4.0-devel gtk-layer-shell-devel jsoncpp-devel
     spdlog-devel fmt-devel libnl3-devel libevdev-devel systemd-devel
     pulseaudio-libs-devel pipewire-devel wireplumber-devel bluez-libs-devel
     libdbusmenu-gtk3-devel libmpdclient-devel upower-devel)
 SRC_DEPS_COPYQ=(qt6-qtbase-devel qt6-qtdeclarative-devel qt6-qtsvg-devel
-    qt6-qttools-devel qt6-qtwayland-devel qt6-qtmultimedia-devel libXtst-devel libX11-devel)
+    qt6-qttools-devel qt6-qtwayland-devel qt6-qtmultimedia-devel qca-qt6-devel
+    libXtst-devel libX11-devel)
+#   playerctl — GLib + gobject-introspection.
 SRC_DEPS_PLAYERCTL=(glib2-devel gobject-introspection-devel)
 FCITX5_RIME_REPO="https://github.com/fcitx/fcitx5-rime"
 LIBRIME_REPO="https://github.com/rime/librime"
@@ -501,6 +505,9 @@ pm_install() { # $@ = package names
 # names are genuinely unavailable. Used for build-deps batches that must be resilient to a
 # few absent names (so a single renamed -devel package no longer aborts the whole build).
 BDEPS_MISSING=()
+# Extra cmake -D args for the current source build (e.g. copyq's -DWITH_QCA=OFF
+# when qca-qt6-devel is unavailable); reset per build by install_source_package.
+CMAKE_EXTRA_ARGS=()
 dnf_install_tolerant() {
     BDEPS_MISSING=()
     [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$@"); return "$DRY_RUN_RC"; }
@@ -871,6 +878,18 @@ ensure_rhel_repos() {
         warn "$(_t "CRB/PowerTools is NOT active — source builds (waybar/fuzzel/hyprlock/...) will fail for lack of -devel packages. Try: dnf config-manager --set-enabled crb" "CRB/PowerTools is NOT active — source builds will fail for lack of -devel packages. Try: dnf config-manager --set-enabled crb")"
         MANUAL_ITEMS+=("CRB/PowerTools 仓库未启用 — 源码编译（waybar/fuzzel/hyprlock 等）必需；运行 'dnf config-manager --set-enabled crb'（Rocky 8 为 powertools）后重跑")
     fi
+    # EPEL being *enabled* is not enough: a stale/unsynced mirror or a releasever
+    # mismatch leaves the repo visible but EMPTY for this system — every EPEL
+    # package then fails with "没有任何匹配: <pkg>" (observed on EL10: scdoc,
+    # dav1d-devel, copyq all missing at once). Probe a small package EPEL 10
+    # definitely carries so this is caught HERE with actionable advice instead
+    # of cascading as dozens of unrelated failures later.
+    if dnf repolist 2>/dev/null | grep -qiE '(^|/)epel'; then
+        if ! dnf -q --disablerepo='*' --enablerepo='epel*' list available scdoc >/dev/null 2>&1; then
+            warn "$(_t "EPEL repo is enabled but NO packages can be queried from it (probed: scdoc) — metadata is broken or releasever does not match. Fix and rerun, or EPEL apps (copyq/playerctl/brightnessctl) and -devel builds will all fail." "EPEL repo is enabled but NO packages can be queried from it (probed: scdoc).")"
+            MANUAL_ITEMS+=("EPEL 仓库已启用但查不到任何包（探测 scdoc 失败）——metadata 损坏或 releasever 不匹配。检查 'dnf repolist -v epel' 与 /etc/yum.repos.d/epel.repo 的 baseurl/\$releasever，修正后执行 'dnf clean all && dnf makecache' 再重跑 restore")
+        fi
+    fi
     # Fedora already has niri/waybar/hypr* in official repos — skip COPR there.
     # Rocky/Alma/CentOS Stream 10: enable COPRs once so later dnf installs succeed.
     if [ "${DISTRO_ID:-}" != fedora ]; then
@@ -1087,9 +1106,16 @@ install_rhel() {
         fi
         # EL has no fcitx5 packages at all (not in EPEL, no COPR epel-10 chroot —
         # verified 2026-10). Short-circuit BEFORE per-candidate resolution so the
-        # whole family lands in MANUAL guidance instead of FAILED entries.
+        # whole family lands in MANUAL guidance instead of FAILED entries. The
+        # guidance is emitted ONCE for the family; further members are recorded
+        # as skipped so the summary doesn't repeat the same paragraph 5 times.
         if [[ "$p" =~ ^fcitx5 ]] && [ "$DISTRO_ID" != fedora ]; then
-            MANUAL_ITEMS+=("$p — EL10 系无 fcitx5 RPM（未进 EPEL）。可选: 1) 保持现状用 ibus: dnf install ibus-libpinyin; 2) 换 Fedora 系（fcitx5 在官方仓库）; 3) 自行从 Fedora 源编译。桌面其余功能不受影响。")
+            if [ "${_FCITX5_NOTED:-0}" -eq 0 ]; then
+                MANUAL_ITEMS+=("fcitx5 全家（fcitx5/configtool/gtk/qt/rime）— EL10 系无 fcitx5 RPM（未进 EPEL）。可选: 1) 保持现状用 ibus: dnf install ibus-libpinyin; 2) 换 Fedora 系（fcitx5 在官方仓库）; 3) 自行从 Fedora 源编译。桌面其余功能不受影响。")
+                _FCITX5_NOTED=1
+            else
+                SKIPPED_PKGS+=("$p (见 fcitx5 手动提示)")
+            fi
             continue
         fi
         if [ -n "${RHEL_MANUAL[$p]:-}" ]; then
@@ -2612,13 +2638,22 @@ install_source_package() { # $1 = package, $2 = upstream repository
     # can name the real cause instead of a bare log path.
     BDEPS_MISSING=()
     local _extra=() _meson_args=()
+    CMAKE_EXTRA_ARGS=()
     case "$pkg" in
         waybar)    _extra=("${SRC_DEPS_WAYBAR[@]}") ;;
-        copyq)     _extra=("${SRC_DEPS_COPYQ[@]}") ;;
+        copyq)     _extra=("${SRC_DEPS_COPYQ[@]}")
+                   # Qca is only needed for the encryption plugin: when its -devel
+                   # package is unavailable on this EL release, disable the plugin
+                   # instead of failing the whole cmake configure.
+                   if ! pkg_installed qca-qt6-devel; then
+                       CMAKE_EXTRA_ARGS=(-DWITH_QCA=OFF)
+                   fi ;;
         playerctl) _extra=("${SRC_DEPS_PLAYERCTL[@]}")
                    # playerctl's meson wants gtk-doc to render the API docs; the
                    # runtime binary does not need them and gtk-doc is absent on EL.
                    _meson_args=(-Dgtk-doc=false) ;;
+        fuzzel)    # fuzzel's man pages need scdoc; without it, build without docs
+                   pkg_installed scdoc || _meson_args=(-Ddocs=disabled) ;;
     esac
     if [ ${#_extra[@]} -gt 0 ]; then
         dnf_install_tolerant "${_extra[@]}" || true
@@ -2652,6 +2687,7 @@ build_source_project() {
     if [ -f "$src/CMakeLists.txt" ]; then
         ( cd "$src" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+            ${CMAKE_EXTRA_ARGS[@]+"${CMAKE_EXTRA_ARGS[@]}"} \
             && cmake --build build -j"$(nproc)" && cmake --install build ) >"$logf" 2>&1
     elif [ -f "$src/meson.build" ]; then
         ( cd "$src" && meson setup build --prefix=/usr --libdir=lib64 --buildtype=release \
@@ -2901,12 +2937,29 @@ stage_services() {
                 erc=0
                 exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$provider" || erc=$?
             fi
+            # power-profiles-daemon declares `Conflicts: tuned`, and tuned ships
+            # preinstalled on EL server/cloud images. Masking tuned (stage_disable_system)
+            # does NOT lift a package-level conflict — only removing it does. Ask,
+            # never remove silently.
+            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] \
+                && [ "$provider" = "power-profiles-daemon" ] && pkg_installed tuned; then
+                warn "$(_t "power-profiles-daemon conflicts with the installed 'tuned' package (EL server/cloud images ship it preinstalled)." "power-profiles-daemon conflicts with the installed 'tuned' package.")"
+                if confirm "$(_t "Remove 'tuned' to install power-profiles-daemon? [Y/n] (default Y, 20s):" "Remove 'tuned' to install power-profiles-daemon? [Y/n] (default Y, 20s):")" "Y" 20; then
+                    exe dnf remove -y tuned 2>>"$LOG_DIR/dnf-errors.log" || true
+                    erc=0
+                    pm_install "$provider" || erc=$?
+                    [ "$erc" -eq 0 ] && ENABLED_SVCS+=("removed:tuned")
+                fi
+            fi
             if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
                 local _svcerr
-                # Prefer lines about THIS provider — the shared dnf-errors.log
-                # tail often belongs to an unrelated earlier failure.
+                # Prefer lines about THIS provider, then generic dnf failure lines;
+                # the shared dnf-errors.log tail often belongs to an UNRELATED
+                # earlier failure (e.g. awww's optional dav1d-devel) and must not
+                # be shown as this provider's error.
                 _svcerr=$(grep -F "$provider" "$LOG_DIR/dnf-errors.log" 2>/dev/null | tail -n 2 | tr '\n' ' ')
-                [ -z "$_svcerr" ] && _svcerr=$(tail -n 2 "$LOG_DIR/dnf-errors.log" 2>/dev/null | tr '\n' ' ')
+                [ -z "$_svcerr" ] && _svcerr=$(grep -hE '没有任何匹配|No match|conflicts with|problem with|无法安装|Failed' "$LOG_DIR/dnf-errors.log" 2>/dev/null | tail -n 2 | tr '\n' ' ')
+                [ -z "$_svcerr" ] && _svcerr="(dnf 日志尾部: $(tail -n 2 "$LOG_DIR/dnf-errors.log" 2>/dev/null | tr '\n' ' '))"
                 FAILED_PKGS+=("svc-provider:$provider (${_svcerr:-见 $LOG_DIR/dnf-errors.log})")
                 any_failed=1
                 continue
