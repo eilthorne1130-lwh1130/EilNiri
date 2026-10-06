@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.7"
+SCRIPT_VERSION="1.11.8"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -408,6 +408,12 @@ FCITX5_QT_REPO="https://github.com/fcitx/fcitx5-qt"
 # it manually). Built from source as step 0 of the chain below.
 XCB_IMDKIT_REPO="https://github.com/fcitx/xcb-imdkit"
 FCITX5_SRC_TAG="5.1.10"
+# Companion modules pinned to releases contemporary with fcitx5 5.1.10 — the
+# fcitx family ships its components in lockstep, and unpinned fcitx5-qt master
+# already failed to compile against the 5.1.10 core headers (standardpaths.h).
+FCITX5_QT_SRC_TAG="5.1.9"    # 2025-01, same generation as core 5.1.10
+FCITX5_RIME_SRC_TAG="5.1.10" # 2025-01-22
+LIBRIME_SRC_TAG="1.16.1"     # librime stable contemporary with fcitx5-rime 5.1.10
 # fcitx5 5.1.10's complete default-dependency surface (verified against its
 # CMakeLists.txt): ECM, json-c (keyboard config parsing — NOT nlohmann_json,
 # which only later 5.1.x uses), fmt, libuv (event-loop fallback when the systemd
@@ -2389,7 +2395,9 @@ install_fcitx5_source() {
         -name '*fcitx5*' 2>/dev/null | grep -q .; then
         log "$(_t "[fcitx5 2/4] building gtk IM modules..." "[fcitx5 2/4] building gtk IM modules...")"
         if git_clone_gh "$FCITX5_GTK_REPO" "$work/fcitx5-gtk"; then
-            CMAKE_EXTRA_ARGS=()
+            # GTK2 IM module is pointless on a modern Wayland desktop and drags in
+            # gtk+-2.0/-devel which EL does not provide — GTK3/4 stay ON.
+            CMAKE_EXTRA_ARGS=(-DENABLE_GTK2_IM_MODULE=OFF)
             logf="$LOG_DIR/fcitx5-gtk-build.log"
             if build_source_project fcitx5-gtk "$FCITX5_GTK_REPO" "$work" "$logf"; then
                 INSTALLED_PKGS+=("fcitx5-gtk (source build)")
@@ -2407,7 +2415,7 @@ install_fcitx5_source() {
     if ! find /usr/lib64/qt6/plugins/platforminputcontexts /usr/lib64/qt5/plugins/platforminputcontexts \
         -name '*fcitx5*' 2>/dev/null | grep -q .; then
         log "$(_t "[fcitx5 3/4] building qt IM module..." "[fcitx5 3/4] building qt IM module...")"
-        if git_clone_gh "$FCITX5_QT_REPO" "$work/fcitx5-qt"; then
+        if git_clone_gh "$FCITX5_QT_REPO" "$work/fcitx5-qt" "$FCITX5_QT_SRC_TAG"; then
             CMAKE_EXTRA_ARGS=(-DENABLE_QT5=OFF -DENABLE_QT6=ON)
             logf="$LOG_DIR/fcitx5-qt-build.log"
             if build_source_project fcitx5-qt "$FCITX5_QT_REPO" "$work" "$logf"; then
@@ -2459,7 +2467,7 @@ install_fcitx5_rime_source() {
         extra-cmake-modules boost-devel yaml-cpp-devel opencc-devel marisa-devel leveldb-devel \
         || true
     if ! rpm -q librime-devel >/dev/null 2>&1; then
-        if ! git_clone_gh "$LIBRIME_REPO" "$work/librime"; then
+        if ! git_clone_gh "$LIBRIME_REPO" "$work/librime" "$LIBRIME_SRC_TAG"; then
             return 1
         fi
         if ! ( cd "$work/librime" && cmake -S . -B build -G Ninja \
@@ -2473,7 +2481,7 @@ install_fcitx5_rime_source() {
         warn "$(_t "fcitx5-devel is unavailable on this AlmaLinux release; fcitx5-rime source build cannot continue." "fcitx5-devel is unavailable on this AlmaLinux release; fcitx5-rime source build cannot continue.")"
         return 1
     fi
-    if ! git_clone_gh "$FCITX5_RIME_REPO" "$work/fcitx5-rime"; then
+    if ! git_clone_gh "$FCITX5_RIME_REPO" "$work/fcitx5-rime" "$FCITX5_RIME_SRC_TAG"; then
         return 1
     fi
     export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
