@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.10"
+SCRIPT_VERSION="1.11.11"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -2424,13 +2424,13 @@ install_fcitx5_source() {
         -name '*fcitx5*' 2>/dev/null | grep -q .; then
         log "$(_t "[fcitx5 3/4] building qt IM module..." "[fcitx5 3/4] building qt IM module...")"
         if git_clone_gh "$FCITX5_QT_REPO" "$work/fcitx5-qt" "$FCITX5_QT_SRC_TAG"; then
-            # BUILD_ONLY_PLUGIN: build ONLY dbusaddons + platforminputcontext (the
-            # Qt6 IM module itself). Everything that fails on EL — guiwrapper,
-            # widgetsaddons, quickphrase-editor, immodule-probing and the
-            # Fcitx5Utils cmake dependency — sits behind if(NOT BUILD_ONLY_PLUGIN)
-            # in fcitx5-qt's qt6/CMakeLists.txt. No config GUI shipped; configs
-            # are already deployed by the script.
-            CMAKE_EXTRA_ARGS=(-DBUILD_ONLY_PLUGIN=ON -DENABLE_QT5=OFF -DENABLE_QT6=ON)
+            # Full build of fcitx5-qt 5.1.10 against fcitx5 core 5.1.10 — the exact
+            # same-tag combination upstream (and Arch's packaging) validates.
+            # NOTE: BUILD_ONLY_PLUGIN=ON is NOT usable here: it forces dbusaddons
+            # into OBJECT-library mode, which does not define the
+            # Fcitx5Qt6::DBusAddons ALIAS that platforminputcontext links against,
+            # and CMake dies with "An ALIAS target is missing" at Generate step.
+            CMAKE_EXTRA_ARGS=(-DENABLE_QT5=OFF -DENABLE_QT6=ON)
             logf="$LOG_DIR/fcitx5-qt-build.log"
             if build_source_project fcitx5-qt "$FCITX5_QT_REPO" "$work" "$logf"; then
                 INSTALLED_PKGS+=("fcitx5-qt (source build)")
@@ -2502,13 +2502,14 @@ install_rime_build_libs() {
             _rc=1
         fi
     fi
-    # 3) marisa — s-yata/marisa-trie (autotools; no pre-generated configure,
-    #    so autoreconf -i first). Header check backs up pkg-config.
+    # 3) marisa — s-yata/marisa-trie is a pure CMAKE project (no autotools files
+    #    in the repo; autoreconf dies with "configure.ac is required"). Build per
+    #    the README; header/pkg-config detection backs up pkg-config.
     if ! pkg-config --exists marisa 2>/dev/null && [ ! -f /usr/include/marisa.h ]; then
         log "$(_t "[rime 0c] building marisa (not in this repo set)..." "[rime 0c] building marisa (not in this repo set)...")"
         if git_clone_gh "$MARISA_REPO" "$work/marisa-trie"; then
-            if ( cd "$work/marisa-trie" && autoreconf -i && ./configure --prefix=/usr \
-                 && make -j"$(nproc)" && make install ) >>"$LOG_DIR/marisa-build.log" 2>&1; then
+            CMAKE_EXTRA_ARGS=(-DENABLE_NATIVE_CODE=ON -DBUILD_TESTING=OFF)
+            if build_source_project marisa "$MARISA_REPO" "$work" "$LOG_DIR/marisa-build.log"; then
                 INSTALLED_PKGS+=("marisa (source build)")
             else
                 MANUAL_ITEMS+=("marisa — source build failed; librime 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/marisa-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/marisa-build.log)")
