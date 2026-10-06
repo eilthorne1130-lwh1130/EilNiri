@@ -10,9 +10,24 @@
 |---|---|---|
 | **`deb-install.sh`** | Debian 12/13、Ubuntu 24.04+、Linux Mint、Pop!_OS，以及任意 Debian 衍生版（脚本自动识别 `/etc/debian_version`：deepin / UOS / Kali / MX / 麒麟等均可） | ✅ **可用（当前主力，完整测试）** |
 | `arch-install.sh` | Arch / Manjaro / EndeavourOS | ⚙️ **可用（新完成，欢迎测试反馈）**：仓库包走 pacman、AUR 包走 yay（缺失时自动编译安装），配置快照与本机同步 |
-| `RHEL-install.sh` | Fedora / Rocky / Alma / CentOS Stream / RHEL | ⚙️ **可用（新完成，欢迎测试反馈）**：Fedora 全部组件走官方仓库；EL10 衍生用 EPEL + `yalter/niri` COPR + 源码编译兜底，配置快照与本机同步 |
+| `RHEL-install.sh` | Fedora / Rocky / Alma / CentOS Stream / RHEL | ⚙️ **可用（新完成，欢迎测试反馈）**：Fedora 全部组件走官方仓库；EL10 衍生用 EPEL + COPR + 大量源码编译兜底（含 fcitx5 输入法全家源码编译），配置快照与本机同步 |
 
 > **新手请直接用 `deb-install.sh`。** `arch-install.sh` 与 `RHEL-install.sh` 已完成核心功能，但测试覆盖尚不及 deb 版。
+
+### 快速开始（RHEL 系）
+
+```bash
+git clone <本仓库> && cd EilNiri
+sudo ./RHEL-install.sh restore            # 或先加 --dry-run 预览
+```
+
+支持 Fedora / Rocky / Alma / CentOS Stream / RHEL（**EL10 已实测**）。与 Debian 版的主要差异：
+
+- **大量组件在 EL 官方仓库 / EPEL 没有 RPM，脚本自动源码编译兜底**：waybar、mako、fuzzel、copyq、hyprlock、hypridle、grim、slurp（niri 走 yalter/niri COPR；awww 用 cargo 编译；satty 用官方预编译二进制）——安装耗时明显长于 Debian 版，属正常现象
+- **fcitx5 输入法全家源码编译**：EL10 无任何 fcitx5 RPM（未进 EPEL、无 COPR），脚本自动编译 fcitx5 core（5.1.10）→ GTK3/4 模块 → Qt6 模块 → fcitx5-rime + librime（leveldb / opencc / marisa 等外部库也源码兜底）→ 雾凇拼音词库自动部署；fcitx5-configtool 除外（依赖 KDE Frameworks 6，配置已随脚本部署无需它）
+- **EL10 电源管理走 tuned-ppd**：EL10 移除了独立的 power-profiles-daemon，改用 tuned-ppd（同一 PPD D-Bus API），脚本自动映射并启用 `tuned-ppd.service`，tuned 不会被误禁用
+- **仓库自动启用与自检**：EPEL + CRB（CodeReady Builder）自动启用并做包可见性探测（repo 启用但查不到包会明确警告）；COPR 仅 yalter/niri（该项目只构建 niri），启用后自动验证包可查，查不到自动转 cargo 源码编译
+- 命令与 Debian 版一致（`restore [--dry-run]` / `status` / `restore-system`），无 `update` 子命令
 
 ---
 
@@ -220,9 +235,10 @@ bluetooth（蓝牙，bluetui 依赖）、libvirtd（虚拟机）、power-profile
 - Debian 12 / Ubuntu 24.04 的 waybar 为 0.9.x 旧版，自动使用精简布局（无折叠抽屉/媒体模块）
 - niri / awww 在 Debian 系走源码编译（约 10-20 分钟 + 5 分钟），需要 ≥ 6GB 磁盘与足够内存（编译并发按内存自动限制）
 - `arch-install.sh`、`RHEL-install.sh` 已完成核心功能（arch：pacman + AUR/yay；RHEL：dnf/EPEL/COPR + 源码编译 + 配置同步），欢迎测试反馈
-- RHEL 系 COPR 说明：`alebastr/sway-extras` 与 `solopasha/hyprland` 均未构建 EPEL chroot（在 EL 上 `dnf copr enable` 必报 "Chroot not found"），脚本只在 EL 上启用确有 `epel-10` chroot 的 `yalter/niri`，且启用前会先探测该 chroot 是否存在，失败自动降级到 EPEL / 源码编译，不会阻塞安装；EL9 无可用 COPR，niri 等一律源码编译
-- **EL10 系（Rocky/Alma/CentOS Stream 10）无 fcitx5**：官方仓库与 EPEL10 均无 fcitx5 包，也没有带 epel-10 chroot 的 fcitx5 COPR——中文输入法在 EL 上不可用（脚本会明确提示，可选 ibus+拼音替代）；Fedora 不受影响
-- EL10 上 waybar/mako/fuzzel/grim/slurp/copyq/playerctl/brightnessctl/hyprlock/hypridle 均无 RPM，脚本自动源码编译；编译依赖 `-devel` 包需要 **CRB/PowerTools 仓库启用**（脚本会自动启用并在失败时明确报告），源码编译约需 10-30 分钟；fuzzel 源码构建钉在 1.11.1（master 需要 pixman >= 0.46，EL10 自带 0.43.4）
+- RHEL 系 COPR 说明：`alebastr/sway-extras` 与 `solopasha/hyprland` 均未构建 EPEL chroot（在 EL 上 `dnf copr enable` 必报 "Chroot not found"），脚本只在 EL 上启用确有 `epel-10` chroot 的 `yalter/niri`（该项目**仅构建 niri**，xwayland-satellite 走 cargo 源码编译），启用前会先探测 chroot 是否存在、启用后验证包可查，失败自动降级到 EPEL / 源码编译，不会阻塞安装；EL9 无可用 COPR，niri 等一律源码编译
+- **EL10 系（Rocky/Alma/CentOS Stream 10）无 fcitx5 包**：官方仓库与 EPEL10 均无，也没有带 epel-10 chroot 的 fcitx5 COPR——脚本自动**源码编译全家**（core 5.1.10 → GTK3/4 → Qt6 → fcitx5-rime + librime + 外部库 → 雾凇词库），详见[快速开始（RHEL 系）](#快速开始rhel-系)；Fedora 不受影响（全部官方仓库）
+- EL10 上 waybar/mako/fuzzel/grim/slurp/copyq/hyprlock/hypridle 均无 RPM，脚本自动源码编译（playerctl/brightnessctl/copyq 等从 EPEL 安装）；编译依赖 `-devel` 包需要 **CRB/PowerTools 仓库启用**（脚本会自动启用并在失败时明确报告），源码编译约需 10-30 分钟；fuzzel 源码构建钉在 1.11.1（master 需要 pixman >= 0.46，EL10 自带 0.43.4）
+- EL10 的 EPEL 按 minor 版本快照分发：较新包（如 dav1d、copyq）只出现在 10.2+ 的小版本里，10.0/10.1 的机器查不到时脚本自动转源码编译，无需手动干预
 
 ---
 
