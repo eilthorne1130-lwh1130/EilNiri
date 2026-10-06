@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.14"
+SCRIPT_VERSION="1.11.16"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -2456,6 +2456,16 @@ install_fcitx5_source() {
             # Fcitx5Qt6::DBusAddons ALIAS that platforminputcontext links against,
             # and CMake dies with "An ALIAS target is missing" at Generate step.
             CMAKE_EXTRA_ARGS=(-DENABLE_QT5=OFF -DENABLE_QT6=ON)
+            # fcitx5-qt 5.1.10's platforminputcontext links Qt6::GuiPrivate, but no
+            # find_package() ever declares the private component — CMake Generate
+            # dies with "Qt6::GuiPrivate was not found" even though
+            # qt6-qtbase-private-devel (providing Qt6GuiPrivateConfig.cmake) is
+            # installed. Inject the missing find_package before the qt6 subtree.
+            if grep -q 'Qt6::GuiPrivate' "$work/fcitx5-qt/qt6/platforminputcontext/CMakeLists.txt" 2>/dev/null \
+                && ! grep -q 'GuiPrivate' "$work/fcitx5-qt/CMakeLists.txt" 2>/dev/null; then
+                sed -i '1i find_package(Qt6GuiPrivate REQUIRED)' "$work/fcitx5-qt/qt6/CMakeLists.txt"
+                log "$(_t "fcitx5-qt: injected find_package(Qt6GuiPrivate REQUIRED)" "fcitx5-qt: injected find_package(Qt6GuiPrivate REQUIRED)")"
+            fi
             logf="$LOG_DIR/fcitx5-qt-build.log"
             if build_source_project fcitx5-qt "$FCITX5_QT_REPO" "$work" "$logf"; then
                 INSTALLED_PKGS+=("fcitx5-qt (source build)")
@@ -2496,7 +2506,10 @@ install_rime_build_libs() {
     local work="$1" _rc=0
     # 1) leveldb — google/leveldb (cmake; crc32c submodule fetched by git_clone_gh;
     #    snappy disabled to avoid pulling another optional dependency).
-    if ! pkg-config --exists leveldb 2>/dev/null; then
+    #    leveldb's cmake install does NOT ship a .pc, so pkg-config alone always
+    #    reports missing and every rerun rebuilt it — check the installed headers
+    #    too (db.h is what librime's find_package(LevelDb) effectively needs).
+    if ! pkg-config --exists leveldb 2>/dev/null && [ ! -f /usr/include/leveldb/db.h ]; then
         log "$(_t "[rime 0a] building leveldb (not in EPEL10)..." "[rime 0a] building leveldb (not in EPEL10)...")"
         if git_clone_gh "$LEVELDB_REPO" "$work/leveldb"; then
             CMAKE_EXTRA_ARGS=(-DLEVELDB_BUILD_TESTS=OFF -DLEVELDB_BUILD_BENCHMARKS=OFF -DWITH_SNAPPY=OFF)
@@ -2530,9 +2543,12 @@ install_rime_build_libs() {
     # 3) marisa — s-yata/marisa-trie is a pure CMAKE project (no autotools files
     #    in the repo; autoreconf dies with "configure.ac is required"). Build per
     #    the README; header/pkg-config detection backs up pkg-config.
+    #    Clone into $work/marisa (NOT marisa-trie) — build_source_project resolves
+    #    the source dir as $work/<pkg name> and would report "empty or corrupt
+    #    clone" for a differently-named directory.
     if ! pkg-config --exists marisa 2>/dev/null && [ ! -f /usr/include/marisa.h ]; then
         log "$(_t "[rime 0c] building marisa (not in this repo set)..." "[rime 0c] building marisa (not in this repo set)...")"
-        if git_clone_gh "$MARISA_REPO" "$work/marisa-trie"; then
+        if git_clone_gh "$MARISA_REPO" "$work/marisa"; then
             CMAKE_EXTRA_ARGS=(-DENABLE_NATIVE_CODE=ON -DBUILD_TESTING=OFF)
             if build_source_project marisa "$MARISA_REPO" "$work" "$LOG_DIR/marisa-build.log"; then
                 INSTALLED_PKGS+=("marisa (source build)")
@@ -2918,10 +2934,13 @@ build_hypr_stack() {
     fi
 
     # 3) libspng — randy408/libspng (required by hyprgraphics, absent from EL repos).
-    #    Try CMake first; libspng is a single-file C library, so as a last resort
-    #    compile it by hand (gcc -shared + manual header/pc install) — that path
-    #    cannot fail short of a broken clone.
-    if ! pkg-config --exists spng 2>/dev/null; then
+    #    NAMING TRAP: libspng's CMake installs libspng.pc (pkg-config module
+    #    "libspng"), but hyprgraphics pkg_check_modules wants module "spng" — so
+    #    after installing, the pc file is copied under both names or hyprgraphics'
+    #    configure dies on the missing module while the library is actually fine.
+    #    Guard checks BOTH names: otherwise every rerun rebuilds libspng for
+    #    nothing (spng is never seen even though libspng is installed).
+    if ! pkg-config --exists spng 2>/dev/null && ! pkg-config --exists libspng 2>/dev/null; then
         log "$(_t "[hypr 0c] building libspng (not in this repo set)..." "[hypr 0c] building libspng (not in this repo set)...")"
         local _spng_ok=0
         if git_clone_gh "https://github.com/randy408/libspng" "$_work/libspng" \
@@ -2929,6 +2948,10 @@ build_hypr_stack() {
                 -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
                 && cmake --build build -j"$(nproc)" && cmake --install build ) >>"$LOG_DIR/libspng-build.log" 2>&1; then
             _spng_ok=1
+            # CMake branch installed libspng.pc — alias it as module "spng"
+            if ! pkg-config --exists spng 2>/dev/null && [ -f /usr/lib64/pkgconfig/libspng.pc ]; then
+                cp /usr/lib64/pkgconfig/libspng.pc /usr/lib64/pkgconfig/spng.pc
+            fi
         elif [ -f "$_work/libspng/spng/spng.c" ]; then
             # Hand-rolled fallback: spng.c + spng.h + a minimal spng.pc
             ( cd "$_work/libspng" \
