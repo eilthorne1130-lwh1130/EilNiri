@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.12"
+SCRIPT_VERSION="1.11.13"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -2883,9 +2883,12 @@ build_hypr_stack() {
         return 1
     }
 
-    # External backstops first (both are hard deps EL may not package):
+    # External backstops first (all are hard deps EL may not package):
     #   pugixml    — required by hyprwayland-scanner
     #   sdbus-c++  — required by hyprlock/hypridle
+    #   libspng    — required by hyprgraphics (hyprlock only); EL has no libspng
+    #                package and hyprgraphics' CMakeLists marks spng REQUIRED
+    #                with no option to turn it off
     if ! pkg-config --exists pugixml 2>/dev/null; then
         log "$(_t "[hypr 0a] building pugixml (not in this repo set)..." "[hypr 0a] building pugixml (not in this repo set)...")"
         if git_clone_gh "https://github.com/zeux/pugixml" "$_work/pugixml" "v1.14" \
@@ -2910,6 +2913,22 @@ build_hypr_stack() {
             INSTALLED_PKGS+=("sdbus-c++ (source build)")
         else
             MANUAL_ITEMS+=("sdbus-c++ — source build failed; hyprlock/hypridle 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/sdbus-cpp-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/sdbus-cpp-build.log)")
+            return 1
+        fi
+    fi
+
+    # 3) libspng — randy408/libspng (single-file C library, only zlib needed;
+    #    required by hyprgraphics, absent from EL repos).
+    if ! pkg-config --exists spng 2>/dev/null; then
+        log "$(_t "[hypr 0c] building libspng (not in this repo set)..." "[hypr 0c] building libspng (not in this repo set)...")"
+        if git_clone_gh "https://github.com/randy408/libspng" "$_work/libspng" \
+           && ( cd "$_work/libspng" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+                && cmake --build build -j"$(nproc)" && cmake --install build ) >>"$LOG_DIR/libspng-build.log" 2>&1; then
+            ldconfig 2>/dev/null || true
+            INSTALLED_PKGS+=("libspng (source build)")
+        else
+            MANUAL_ITEMS+=("libspng — source build failed; hyprgraphics 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/libspng-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/libspng-build.log)")
             return 1
         fi
     fi
