@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.16"
+SCRIPT_VERSION="1.11.17"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -456,6 +456,7 @@ SRC_DEPS_Fcitx5=(extra-cmake-modules json-c-devel fmt-devel libuv-devel
     expat-devel libxkbfile-devel libxkbcommon-x11-devel xcb-imdkit-devel
     systemd-devel dbus-devel libuuid-devel zlib-devel gettext-devel
     qt6-qtbase-devel qt6-qtbase-private-devel qt6-qtwayland-devel
+    qt6-qtwayland-private-devel
     autoconf automake libtool glog-devel)
 
 # System components (from other desktop environments) to disable when restoring
@@ -2593,6 +2594,21 @@ install_fcitx5_rime_source() {
         if ! git_clone_gh "$LIBRIME_REPO" "$work/librime" "$LIBRIME_SRC_TAG"; then
             return 1
         fi
+        # librime vendors glog (and friends) as git submodules; git_clone_gh
+        # fetches them best-effort ONCE and a flaky fetch makes librime's cmake
+        # fall back to the SYSTEM glog, whose API is incompatible with 1.16.x
+        # ("'IsGoogleLoggingInitialized' is not a member of 'google'"). Retry the
+        # fetch explicitly — the pinned submodule commit is the only glog known
+        # to compile this librime tag.
+        local _sub_try _sub_ok=0
+        for _sub_try in 1 2 3; do
+            if git -C "$work/librime" submodule update --init --recursive --depth 1 >>"$logf" 2>&1; then
+                _sub_ok=1
+                break
+            fi
+            sleep 5
+        done
+        [ "$_sub_ok" -eq 1 ] || warn "$(_t "librime submodule fetch failed after retries — system glog may be API-incompatible; build will likely fail." "librime submodule fetch failed after retries.")"
         if ! ( cd "$work/librime" && cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
             -DBUILD_TEST=OFF \
@@ -3154,6 +3170,10 @@ install_source_package() { # $1 = package, $2 = upstream repository
         MANUAL_ITEMS+=("$pkg — source clone failed (GitHub 与 CN 镜像均不可达); 可设 EILNIRI_GH_PROXY 重试: $repo")
         return 1
     fi
+    # Progress note BEFORE the silent build: cmake/ninja output goes to the log
+    # file only, so without this line the terminal looks frozen for minutes
+    # (copyq users reported it as "stuck").
+    log "$(_t "Building $pkg from source — output goes to " "Building $pkg from source — output goes to ") $logf$(_t " (screen stays quiet while it compiles)" " (screen stays quiet while it compiles)")"
     export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
     export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
     if ! build_source_project "$pkg" "$repo" "$work" "$logf" ${_meson_args[@]+"${_meson_args[@]}"}; then
