@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.8"
+SCRIPT_VERSION="1.11.10"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -408,6 +408,12 @@ FCITX5_QT_REPO="https://github.com/fcitx/fcitx5-qt"
 # it manually). Built from source as step 0 of the chain below.
 XCB_IMDKIT_REPO="https://github.com/fcitx/xcb-imdkit"
 FCITX5_SRC_TAG="5.1.10"
+# librime's hard external dependencies; some are absent from EL10 repos
+# (leveldb-devel confirmed missing on EPEL10, 2026-10). Built from source
+# conditionally into /usr before librime itself — see install_rime_build_libs().
+LEVELDB_REPO="https://github.com/google/leveldb"
+OPENCC_REPO="https://github.com/BYVoid/OpenCC"
+MARISA_REPO="https://github.com/s-yata/marisa-trie"
 # Companion modules pinned to releases contemporary with fcitx5 5.1.10 — the
 # fcitx family ships its components in lockstep, and unpinned fcitx5-qt master
 # already failed to compile against the 5.1.10 core headers (standardpaths.h).
@@ -423,7 +429,9 @@ LIBRIME_SRC_TAG="1.16.1"     # librime stable contemporary with fcitx5-rime 5.1.
 SRC_DEPS_Fcitx5=(extra-cmake-modules json-c-devel fmt-devel libuv-devel
     glib2-devel gdk-pixbuf2-devel iso-codes-devel xkeyboard-config-devel
     expat-devel libxkbfile-devel libxkbcommon-x11-devel xcb-imdkit-devel
-    systemd-devel dbus-devel libuuid-devel zlib-devel gettext-devel)
+    systemd-devel dbus-devel libuuid-devel zlib-devel gettext-devel
+    qt6-qtbase-devel qt6-qtbase-private-devel qt6-qtwayland-devel
+    autoconf automake libtool glog-devel)
 
 # System components (from other desktop environments) to disable when restoring
 # on a multi-DE target machine.  Only masked / hidden, NEVER uninstalled — the user
@@ -2416,7 +2424,13 @@ install_fcitx5_source() {
         -name '*fcitx5*' 2>/dev/null | grep -q .; then
         log "$(_t "[fcitx5 3/4] building qt IM module..." "[fcitx5 3/4] building qt IM module...")"
         if git_clone_gh "$FCITX5_QT_REPO" "$work/fcitx5-qt" "$FCITX5_QT_SRC_TAG"; then
-            CMAKE_EXTRA_ARGS=(-DENABLE_QT5=OFF -DENABLE_QT6=ON)
+            # BUILD_ONLY_PLUGIN: build ONLY dbusaddons + platforminputcontext (the
+            # Qt6 IM module itself). Everything that fails on EL — guiwrapper,
+            # widgetsaddons, quickphrase-editor, immodule-probing and the
+            # Fcitx5Utils cmake dependency — sits behind if(NOT BUILD_ONLY_PLUGIN)
+            # in fcitx5-qt's qt6/CMakeLists.txt. No config GUI shipped; configs
+            # are already deployed by the script.
+            CMAKE_EXTRA_ARGS=(-DBUILD_ONLY_PLUGIN=ON -DENABLE_QT5=OFF -DENABLE_QT6=ON)
             logf="$LOG_DIR/fcitx5-qt-build.log"
             if build_source_project fcitx5-qt "$FCITX5_QT_REPO" "$work" "$logf"; then
                 INSTALLED_PKGS+=("fcitx5-qt (source build)")
@@ -2439,12 +2453,73 @@ install_fcitx5_source() {
         if install_fcitx5_rime_source; then
             INSTALLED_PKGS+=("fcitx5-rime (source build)")
         else
-            MANUAL_ITEMS+=("fcitx5-rime — source build failed（rime 引擎缺失则无法中文输入；备选: 自行编译 fcitx5-chinese-addons 走拼音 https://github.com/fcitx/fcitx5-chinese-addons）")
+            MANUAL_ITEMS+=("fcitx5-rime — source build failed（rime 引擎缺失则无法中文输入）。日志尾部: $(tail -n 8 "$LOG_DIR/fcitx5-rime-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/fcitx5-rime-build.log；备选: 自行编译 fcitx5-chinese-addons 走拼音 https://github.com/fcitx/fcitx5-chinese-addons）")
         fi
     else
         SKIPPED_PKGS+=("fcitx5-rime (already installed)")
     fi
     return 0
+}
+
+# --- librime external-library backstops ---
+# librime hard-requires leveldb, marisa, opencc, yaml-cpp, glog and boost(regex)
+# (verified against its CMakeLists). yaml-cpp/glog/boost resolve from
+# EPEL/AppStream via the tolerant dep batch; leveldb-devel is NOT in EPEL10
+# (verified 2026-10) and marisa/opencc may be missing on early minors — each is
+# probed via pkg-config and built from source into /usr only when absent.
+install_rime_build_libs() {
+    local work="$1" _rc=0
+    # 1) leveldb — google/leveldb (cmake; crc32c submodule fetched by git_clone_gh;
+    #    snappy disabled to avoid pulling another optional dependency).
+    if ! pkg-config --exists leveldb 2>/dev/null; then
+        log "$(_t "[rime 0a] building leveldb (not in EPEL10)..." "[rime 0a] building leveldb (not in EPEL10)...")"
+        if git_clone_gh "$LEVELDB_REPO" "$work/leveldb"; then
+            CMAKE_EXTRA_ARGS=(-DLEVELDB_BUILD_TESTS=OFF -DLEVELDB_BUILD_BENCHMARKS=OFF -DWITH_SNAPPY=OFF)
+            if build_source_project leveldb "$LEVELDB_REPO" "$work" "$LOG_DIR/leveldb-build.log"; then
+                INSTALLED_PKGS+=("leveldb (source build)")
+            else
+                MANUAL_ITEMS+=("leveldb — source build failed; librime 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/leveldb-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/leveldb-build.log)")
+                _rc=1
+            fi
+        else
+            MANUAL_ITEMS+=("leveldb — source clone failed: $LEVELDB_REPO")
+            _rc=1
+        fi
+    fi
+    # 2) opencc — BYVoid/OpenCC (cmake; plain C++, no external dependencies).
+    if ! pkg-config --exists opencc 2>/dev/null; then
+        log "$(_t "[rime 0b] building opencc (not in this repo set)..." "[rime 0b] building opencc (not in this repo set)...")"
+        if git_clone_gh "$OPENCC_REPO" "$work/opencc"; then
+            CMAKE_EXTRA_ARGS=(-DENABLE_PYTHON=OFF -DBUILD_TESTING=OFF)
+            if build_source_project opencc "$OPENCC_REPO" "$work" "$LOG_DIR/opencc-build.log"; then
+                INSTALLED_PKGS+=("opencc (source build)")
+            else
+                MANUAL_ITEMS+=("opencc — source build failed; librime 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/opencc-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/opencc-build.log)")
+                _rc=1
+            fi
+        else
+            MANUAL_ITEMS+=("opencc — source clone failed: $OPENCC_REPO")
+            _rc=1
+        fi
+    fi
+    # 3) marisa — s-yata/marisa-trie (autotools; no pre-generated configure,
+    #    so autoreconf -i first). Header check backs up pkg-config.
+    if ! pkg-config --exists marisa 2>/dev/null && [ ! -f /usr/include/marisa.h ]; then
+        log "$(_t "[rime 0c] building marisa (not in this repo set)..." "[rime 0c] building marisa (not in this repo set)...")"
+        if git_clone_gh "$MARISA_REPO" "$work/marisa-trie"; then
+            if ( cd "$work/marisa-trie" && autoreconf -i && ./configure --prefix=/usr \
+                 && make -j"$(nproc)" && make install ) >>"$LOG_DIR/marisa-build.log" 2>&1; then
+                INSTALLED_PKGS+=("marisa (source build)")
+            else
+                MANUAL_ITEMS+=("marisa — source build failed; librime 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/marisa-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/marisa-build.log)")
+                _rc=1
+            fi
+        else
+            MANUAL_ITEMS+=("marisa — source clone failed: $MARISA_REPO")
+            _rc=1
+        fi
+    fi
+    return $_rc
 }
 
 install_fcitx5_rime_source() {
@@ -2464,14 +2539,21 @@ install_fcitx5_rime_source() {
     work=$(mktemp -d)
     register_temp_path "$work"
     dnf_install_tolerant "${RHEL_SOURCE_BUILD_DEPS[@]}" fcitx5-devel librime-devel \
-        extra-cmake-modules boost-devel yaml-cpp-devel opencc-devel marisa-devel leveldb-devel \
+        extra-cmake-modules boost-devel glog-devel yaml-cpp-devel opencc-devel marisa-devel leveldb-devel \
         || true
+    # External libraries librime cannot build without; some (leveldb) are absent
+    # from EL10 repos entirely — source-built conditionally into /usr.
+    install_rime_build_libs "$work" || {
+        warn "$(_t "librime's external libraries could not all be built — rime engine build cannot continue." "librime's external libraries could not all be built.")"
+        return 1
+    }
     if ! rpm -q librime-devel >/dev/null 2>&1; then
         if ! git_clone_gh "$LIBRIME_REPO" "$work/librime" "$LIBRIME_SRC_TAG"; then
             return 1
         fi
         if ! ( cd "$work/librime" && cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+            -DBUILD_TEST=OFF \
             && cmake --build build -j"$(nproc)" && cmake --install build ) >"$logf" 2>&1; then
             return 1
         fi
