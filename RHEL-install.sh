@@ -61,7 +61,7 @@ DRY_RUN=0
 _ERROR_REPORTED=0
 
 # Script version — printed at startup so a stale copy on the target machine is easy to spot
-SCRIPT_VERSION="1.11.11"
+SCRIPT_VERSION="1.11.12"
 
 # Output is always English with ANSI colors (TTY/desktop detection removed).
 # _t always returns the English (2nd) argument; kept as a thin translation helper.
@@ -307,10 +307,9 @@ declare -A RHEL_MANUAL=(
 )
 # RHEL family: extra hint when dnf install fails (available in Fedora official repo, but not on Rocky/Alma/CentOS Stream)
 # (xwayland-satellite falls back to cargo install automatically)
-declare -A RHEL_FAIL_HINT=(
-    [hyprlock]="Available in the Fedora official repo (dnf install hyprlock); on Rocky/Alma/CentOS the script builds it from source automatically (needs CRB/EPEL -devel packages)"
-    [hypridle]="Available in the Fedora official repo (dnf install hypridle); on Rocky/Alma/CentOS the script builds it from source automatically (needs CRB/EPEL -devel packages)"
-)
+# NOTE: no hyprlock/hypridle entries — install_rhel routes them to
+# install_hypr_source via SOURCE_PKGS before this table is ever consulted.
+declare -A RHEL_FAIL_HINT=()
 # Packages installable via pip as a fallback (common to Arch/RHEL/Debian)
 declare -A PIP_PKGS=(
     [waypaper]=waypaper
@@ -341,6 +340,31 @@ declare -A SOURCE_TAG=(
     [fuzzel]=1.11.1
 )
 
+# hyprwm stack pinned to release tags — tracking master is fragile: hyprutils
+# master already requires C++26 (EL10's g++ 14 tops out at C++23), components'
+# APIs drift against each other, and a failed clone used to look like an empty
+# log block with no error. Same pins as deb-install.sh (verified combination).
+# Package the pins in a helper so every clone site resolves through one table.
+HYPR_PIN_SCANNER="v0.4.4"
+HYPR_PIN_UTILS="v0.8.4"
+HYPR_PIN_LANG="v0.6.3"
+HYPR_PIN_GRAPHICS="v0.1.3"
+HYPR_PIN_PROTOCOLS="v0.6.4"
+HYPR_PIN_IDLE="v0.1.7"
+HYPR_PIN_LOCK="v0.8.2"
+hypr_git_ref() { # $1 = hyprwm component / binary name -> pinned ref; empty = no pin (fail)
+    case "$1" in
+        hyprwayland-scanner) echo "$HYPR_PIN_SCANNER" ;;
+        hyprutils)           echo "$HYPR_PIN_UTILS" ;;
+        hyprlang)            echo "$HYPR_PIN_LANG" ;;
+        hyprgraphics)        echo "$HYPR_PIN_GRAPHICS" ;;
+        hyprland-protocols)  echo "$HYPR_PIN_PROTOCOLS" ;;
+        hypridle)            echo "$HYPR_PIN_IDLE" ;;
+        hyprlock)            echo "$HYPR_PIN_LOCK" ;;
+        *)                   echo "" ;;
+    esac
+}
+
 # hyprlock / hypridle system build dependencies (RHEL family names).
 # NOTE: upstream migrated hyprlock/hypridle from Rust to C++/CMake (repos no longer
 # contain a Cargo.toml). On distros where the hypr C++ stack (hyprwayland-scanner/
@@ -348,9 +372,10 @@ declare -A SOURCE_TAG=(
 # Stream), those deps are absent and build_hypr_stack() compiles them from source
 # in dependency order first. Missing entries are tolerated (dnf_install_tolerant),
 # so a package absent on an older release never aborts the whole build-deps step.
-HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git wayland-devel wayland-protocols-devel
+# meson is required because hyprland-protocols is a meson-only project.
+HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build meson pkgconf-pkg-config git wayland-devel wayland-protocols-devel
     pango-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel libdrm-devel libxkbcommon-devel libxcb-devel
-    cairo-gobject-devel cairo-devel pam-devel libpam-devel pixman-devel libjpeg-turbo-devel libwebp-devel
+    cairo-gobject-devel cairo-devel pam-devel pixman-devel libjpeg-turbo-devel libwebp-devel
     librsvg2-devel file-devel libpng-devel pugixml-devel sdbus-cpp-devel)
 RHEL_SOURCE_BUILD_DEPS=(git gcc gcc-c++ make cmake ninja-build meson pkgconf-pkg-config
     wayland-devel wayland-protocols-devel libxkbcommon-devel libinput-devel libdrm-devel
@@ -2742,35 +2767,101 @@ install_xwayland_satellite() {
     return 1
 }
 
+# C++23 toolchain gate for the hyprwm stack: verify a candidate compiler actually
+# accepts -std=c++23 and export CXX/CC for all downstream hypr builds.
+ensure_hypr_cxx_toolchain() {
+    command -v cmake >/dev/null 2>&1 || return 1
+    command -v ninja >/dev/null 2>&1 || return 1
+    local _cand
+    for _cand in g++ clang++ c++; do
+        command -v "$_cand" >/dev/null 2>&1 || continue
+        printf 'int main(){return 0;}\n' | "$_cand" -std=c++23 -fsyntax-only -x c++ - >/dev/null 2>&1 || continue
+        export CXX="$_cand"
+        case "$_cand" in
+            g++|c++) export CC=gcc ;;
+            clang++) export CC=clang ;;
+        esac
+        return 0
+    done
+    return 1
+}
+
 # Build the hypr C++ build-tool stack that hyprlock/hypridle require, from source,
-# in dependency order. On distros where the stack is packaged (Fedora base, Ubuntu
-# 25.10+/Debian 13+ universe) these -devel packages were already installed above and
-# this whole function is a no-op. On Rocky/Alma/CentOS Stream none of it is packaged,
-# so we compile hyprwayland-scanner -> hyprutils -> hyprlang -> hyprgraphics and
-# install each to /usr (cmake configs land in /usr/lib64/cmake/), letting each later
-# component's find_package/hyprutils-config.cmake resolve in the default search path.
+# in dependency order. On distros where the stack is packaged (Fedora base) these
+# -devel packages were already installed above and this whole function is a no-op.
+# On Rocky/Alma/CentOS Stream none of it is packaged, so we compile the stack and
+# install each piece to /usr (cmake configs land in /usr/lib64/cmake/), letting
+# each later component's find_package resolve in the default search path.
 # Each component is skipped if it is already resolvable (installed as a package).
+#
+# Ported from deb-install.sh, whose battle-tested version fixes three problems
+# the old all-cmake RHEL build had:
+#   1. hyprland-protocols is a meson-only project (no CMakeLists.txt) — the old
+#      code fed it to cmake and the whole stack failed on the FIRST component;
+#   2. every component was cloned from master — hyprutils master needs C++26
+#      while EL10's g++ tops out at C++23, so all components are now pinned
+#      (HYPR_PIN_* / hypr_git_ref), including hyprlock/hypridle themselves;
+#   3. clone output went to /dev/null and there was a single log file, so a
+#      failed component left no trace — now per-component logs + main-log tails.
+# $1 = optional target (hyprlock|hypridle|all): only hyprlock needs hyprgraphics.
 build_hypr_stack() {
+    local _want="${1:-all}"
     [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
+
+    if ! ensure_hypr_cxx_toolchain; then
+        MANUAL_ITEMS+=("hypr C++ 栈 — 未找到支持 C++23 的编译器（g++/clang++）；请安装 gcc-c++ 后重跑 restore")
+        return 1
+    fi
+
     local _log="$LOG_DIR/hypr-stack.log"
     local _work
     _work=$(mktemp -d)
     register_temp_path "$_work"
+    echo "=== hypr stack (want=$_want cxx=${CXX:-default}) $(date '+%F %T') ===" >> "$_log"
 
-    # Build+install one component into /usr. Returns 0 on success.
+    # Build+install one component into /usr with its pinned tag. Per-component
+    # log; failures append a tail of it to the main log and warn with the path.
     _build_hypr_one() { # $1 = name
-        local n="$1"
-        if git_clone_gh "https://github.com/hyprwm/$n" "$_work/$n" >/dev/null 2>&1 \
-           && ( cd "$_work/$n" \
-                && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-                    -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
-                && cmake --build build -j"$(nproc)" \
-                && cmake --install build ) >> "$_log" 2>&1; then
-            INSTALLED_PKGS+=("hypr-$n (source build)")
-            log "$(_t "Built " "Built ") hypr-$n$(_t " from source" " from source")"
-            return 0
+        local n="$1" ref
+        ref=$(hypr_git_ref "$n")
+        if [ -z "$ref" ]; then
+            echo "no pin for $n — refusing to build master" >> "$_log"
+            warn "$(_t "hypr stack: no pinned ref for " "hypr stack: no pinned ref for ") $n"
+            return 1
         fi
-        return 1
+        echo "=== $n (ref=$ref cxx=${CXX:-default}) ===" >> "$_log"
+        local _clog="$LOG_DIR/hypr-stack-$n.log"
+        if ! git_clone_gh "https://github.com/hyprwm/$n" "$_work/$n" "$ref" >>"$_clog" 2>&1; then
+            warn "$(_t "hypr stack: clone failed for " "hypr stack: clone failed for ") $n $(_t "(see " "(see ") $_clog)"
+            return 1
+        fi
+        # Build-system probe: hyprland-protocols is meson-only (no CMakeLists.txt).
+        local _rc=1
+        if [ -f "$_work/$n/CMakeLists.txt" ]; then
+            ( cd "$_work/$n" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CXX_COMPILER="${CXX:-g++}" -DCMAKE_C_COMPILER="${CC:-gcc}" \
+                -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+                && cmake --build build -j"$(nproc)" \
+                && cmake --install build ) >>"$_clog" 2>&1 && _rc=0
+        elif [ -f "$_work/$n/meson.build" ]; then
+            command -v meson >/dev/null 2>&1 || pm_install meson ninja-build >/dev/null 2>&1 || true
+            ( cd "$_work/$n" && meson setup build --prefix=/usr --libdir=lib64 --buildtype=release \
+                && meson compile -C build -j"$(nproc)" \
+                && meson install -C build ) >>"$_clog" 2>&1 && _rc=0
+        else
+            echo "empty or corrupt clone (no CMakeLists.txt / meson.build)" >> "$_clog"
+        fi
+        if [ "$_rc" -ne 0 ]; then
+            echo "--- $n build failed (tail 40 of $_clog) ---" >> "$_log"
+            tail -n 40 "$_clog" >> "$_log" 2>/dev/null || true
+            warn "$(_t "hypr stack: " "hypr stack: ") $n $(_t "build failed — see " "build failed — see ") $_clog"
+            return 1
+        fi
+        ldconfig 2>/dev/null || true
+        INSTALLED_PKGS+=("hypr-$n (source build, $ref)")
+        log "$(_t "Built " "Built ") hypr-$n $(_t "from source" "from source") ($ref)"
+        return 0
     }
 
     # Skip a component when it is already resolvable:
@@ -2792,16 +2883,52 @@ build_hypr_stack() {
         return 1
     }
 
-    # Strict dependency order. hyprcursor is not required by hyprlock/hypridle
-    # builds, so don't force it (keeps the chain shorter and less likely to
-    # fail). hyprland-protocols is pc-only (required by hypridle, not by
-    # hyprlock) and has no build-time deps of its own, so it goes first.
+    # External backstops first (both are hard deps EL may not package):
+    #   pugixml    — required by hyprwayland-scanner
+    #   sdbus-c++  — required by hyprlock/hypridle
+    if ! pkg-config --exists pugixml 2>/dev/null; then
+        log "$(_t "[hypr 0a] building pugixml (not in this repo set)..." "[hypr 0a] building pugixml (not in this repo set)...")"
+        if git_clone_gh "https://github.com/zeux/pugixml" "$_work/pugixml" "v1.14" \
+           && ( cd "$_work/pugixml" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+                && cmake --build build -j"$(nproc)" && cmake --install build ) >>"$LOG_DIR/pugixml-build.log" 2>&1; then
+            ldconfig 2>/dev/null || true
+            INSTALLED_PKGS+=("pugixml (source build)")
+        else
+            MANUAL_ITEMS+=("pugixml — source build failed; hyprwayland-scanner 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/pugixml-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/pugixml-build.log)")
+            return 1
+        fi
+    fi
+    if ! pkg-config --exists sdbus-c++ 2>/dev/null; then
+        log "$(_t "[hypr 0b] building sdbus-c++ (not in this repo set)..." "[hypr 0b] building sdbus-c++ (not in this repo set)...")"
+        if git_clone_gh "https://github.com/Kistler-Group/sdbus-cpp" "$_work/sdbus-cpp" "v2.1.0" \
+           && ( cd "$_work/sdbus-cpp" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+                -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_DOCS=OFF -DBUILD_CODEGEN=OFF \
+                && cmake --build build -j"$(nproc)" && cmake --install build ) >>"$LOG_DIR/sdbus-cpp-build.log" 2>&1; then
+            ldconfig 2>/dev/null || true
+            INSTALLED_PKGS+=("sdbus-c++ (source build)")
+        else
+            MANUAL_ITEMS+=("sdbus-c++ — source build failed; hyprlock/hypridle 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/sdbus-cpp-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/sdbus-cpp-build.log)")
+            return 1
+        fi
+    fi
+
+    # Strict dependency order (matches deb-install.sh: scanner before utils/lang,
+    # protocols after lang, graphics only for the hyprlock target).
+    _hypr_ok hyprwayland-scanner || _build_hypr_one hyprwayland-scanner || return 1
+    _hypr_ok hyprutils || _build_hypr_one hyprutils || return 1
+    _hypr_ok hyprlang || _build_hypr_one hyprlang || return 1
     _hypr_ok hyprland-protocols || _build_hypr_one hyprland-protocols || return 1
-    _hypr_ok hyprwayland-scanner "hyprwayland" || _build_hypr_one hyprwayland-scanner || return 1
-    _hypr_ok hyprutils "hyprutils" || _build_hypr_one hyprutils || return 1
-    _hypr_ok hyprlang "hyprlang" || _build_hypr_one hyprlang || return 1
-    _hypr_ok hyprgraphics "hyprgraphics" || _build_hypr_one hyprgraphics || return 1
-    return 0
+    if [ "$_want" = hyprlock ] || [ "$_want" = all ]; then
+        _hypr_ok hyprgraphics || _build_hypr_one hyprgraphics || return 1
+    fi
+    # Final re-check: everything the caller needs must now resolve.
+    if _hypr_ok hyprwayland-scanner && _hypr_ok hyprutils && _hypr_ok hyprlang && _hypr_ok hyprland-protocols; then
+        touch "$LOG_DIR/hypr-stack.ok"
+        return 0
+    fi
+    return 1
 }
 
 # --- hyprlock / hypridle source build (fallback when no apt/dnf package) ---
@@ -2840,7 +2967,9 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     work=$(mktemp -d)
     register_temp_path "$work"
     log "$(_t "Cloning " "Cloning ") $pkg ($repo)..."
-    if ! git_clone_gh "$repo" "$work/$pkg"; then
+    local _ref
+    _ref=$(hypr_git_ref "$pkg")
+    if ! git_clone_gh "$repo" "$work/$pkg" "$_ref"; then
         MANUAL_ITEMS+=("$pkg — git clone failed (direct + CN mirrors), build manually: $repo")
         return 1
     fi
@@ -2860,8 +2989,10 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
     elif [ -f "$work/$pkg/CMakeLists.txt" ]; then
         # CMake build needs hyprwayland-scanner + hyprlang/hyprgraphics/hyprutils;
         # build the hypr C++ stack from source iff those aren't already packaged.
-        if ! build_hypr_stack; then
-            MANUAL_ITEMS+=("$pkg — hypr C++ build stack (hyprwayland-scanner/hyprutils/hyprlang/hyprgraphics) could not be built; see $LOG_DIR/hypr-stack.log. Build manually: $repo")
+        # Pass the target so hyprgraphics (only hyprlock needs it) is skipped for
+        # hypridle.
+        if ! build_hypr_stack "$pkg"; then
+            MANUAL_ITEMS+=("$pkg — hypr C++ build stack (hyprwayland-scanner/hyprutils/hyprlang/hyprland-protocols) could not be built; see $LOG_DIR/hypr-stack.log. Build manually: $repo")
             return 1
         fi
         log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
@@ -2869,6 +3000,8 @@ install_hypr_source() { # $1 = pkg name, $2 = repo URL
         export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
         ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+            -DCMAKE_CXX_COMPILER="${CXX:-g++}" -DCMAKE_C_COMPILER="${CC:-gcc}" \
+            -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
             && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
         _bin="$work/$pkg/build/$pkg"
     else
