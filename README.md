@@ -9,20 +9,15 @@
 [![Wayland](https://img.shields.io/badge/Wayland-niri%20wm-purple.svg)](https://github.com/niri-wm/niri)
 [![Shell](https://img.shields.io/badge/Bash-%3E%3D%204.0-success.svg)](#-快速开始)
 
-[✨ 核心特性](#-核心特性) • [💻 效果预览](#-效果预览) • [🚀 快速开始](#-快速开始) • [🔋 笔记本适配](#-笔记本扩展支持) • [⌨️ 快捷键速查](#️-niri-核心快捷键速查) • [❓ 常见排查](#-故障排查与日志)
+[✨ 核心特性](#-核心特性) • [📦 发行版支持](#-支持的发行版矩阵) • [🚀 快速开始](#-快速开始) • [🔋 笔记本适配](#-笔记本扩展支持) • [⌨️ 快捷键速查](#️-niri-核心快捷键速查) • [❓ 常见排查](#-故障排查与日志)
 
 </div>
 
 ---
 
-## 💻 效果预览
+## 📖 项目简介
 
-EilNiri 致力于在全新的 Linux 系统上，全自动安装并调校好基于 Wayland 的 **niri** 无限滚动平铺式窗口管理器环境。**无需任何前置准备**——装完重启，登录界面直接步入高颜值、现代化、开箱即用的工作区。
-
-<div align="center">
-  <img src="QQ图片20260713144149.jpeg" alt="EilNiri Desktop Preview" width="900" style="border-radius: 10px; box-shadow: 0 4px 16px rgba(0,0,0,0.2);" />
-  <p><em>（毛玻璃半透明终端、美化 Waybar 状态栏、圆角几何设计、Fcitx5 中文输入法、精选壁纸）</em></p>
-</div>
+EilNiri 致力于在全新的 Linux 系统上，全自动安装并调校好基于 Wayland 的 **niri** 滚动平铺式窗口管理器环境：软件包安装、无包组件编译、登录管理器（SDDM 自动配置接管）、硬件显示器参数自适应、中文输入法（Fcitx5 + 雾凇拼音）、壁纸及系统服务全部自动完成。**无需任何繁琐前置准备**——装完重启，登录界面直接步入开箱即用的现代化工作区。
 
 ---
 

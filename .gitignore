@@ -1,0 +1,16 @@
+# 编辑器与 AI 工具临时缓存
+.zcode/
+.zcodeignore
+.vscode/
+.idea/
+*.swp
+*~
+
+# 脚本运行期状态与断点续跑文件
+.replicate_progress
+*.log
+*.bak*
+
+# OS 生成的临时文件
+.DS_Store
+Thumbs.db
