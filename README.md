@@ -1,271 +1,322 @@
-# EilNiri
+# 🌟 EilNiri
 
-一键在全新的 Linux 系统上装好并配置 [niri](https://github.com/niri-wm/niri) 平铺式窗口管理器桌面：包安装、niri/awww/satty 等无包组件的安装、登录管理器（自动替换现有 DM）、显示器适配、中文输入法、壁纸、开机自启全部自动完成，**无需任何前置准备**——装完重启，登录界面直接进 niri 桌面。
+<div align="center">
+
+**零心智负担、优雅现代的 Linux [niri](https://github.com/niri-wm/niri) 滚动平铺式桌面一键部署套件**
+
+[![License](https://img.shields.io/badge/License-GPL%203.0-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux-orange.svg)](#-支持的发行版矩阵)
+[![Wayland](https://img.shields.io/badge/Wayland-niri%20wm-purple.svg)](https://github.com/niri-wm/niri)
+[![Shell](https://img.shields.io/badge/Bash-%3E%3D%204.0-success.svg)](#-快速开始)
+
+[✨ 核心特性](#-核心特性) • [💻 效果预览](#-效果预览) • [🚀 快速开始](#-快速开始) • [🔋 笔记本适配](#-笔记本扩展支持) • [⌨️ 快捷键速查](#️-niri-核心快捷键速查) • [❓ 常见排查](#-故障排查与日志)
+
+</div>
 
 ---
 
-## 一、选择你的发行版
+## 💻 效果预览
 
-| 脚本 | 适用发行版 | 状态 |
+EilNiri 致力于在全新的 Linux 系统上，全自动安装并调校好基于 Wayland 的 **niri** 无限滚动平铺式窗口管理器环境。**无需任何前置准备**——装完重启，登录界面直接步入高颜值、现代化、开箱即用的工作区。
+
+<div align="center">
+  <img src="QQ图片20260713144149.jpeg" alt="EilNiri Desktop Preview" width="900" style="border-radius: 10px; box-shadow: 0 4px 16px rgba(0,0,0,0.2);" />
+  <p><em>（毛玻璃半透明终端、美化 Waybar 状态栏、圆角几何设计、Fcitx5 中文输入法、精选壁纸）</em></p>
+</div>
+
+---
+
+## ✨ 核心特性
+
+- 🎯 **一键全自动化**：自动完成软件包安装、登录管理器（SDDM 自动配置接管）、硬件显示器参数自适应探测、中文输入法（Fcitx5 + 雾凇拼音）、壁纸与锁屏守护，开箱即用。
+- 🌐 **跨三大 Linux 主流生态**：原生支持 **Debian/Ubuntu 系**、**Arch 系** 以及 **RHEL/Fedora/CentOS 系**，内置针对各发行版的包映射与安装策略。
+- ⚡ **智能并发编译**：针对各发行版仓库缺失的无包组件（如 niri、awww 等），自动使用 Rust/Cargo 转入后台并行编译，前台同步进行包管理与环境配置，极大缩短等待时间。
+- 🔋 **笔记本深度关怀**：配备独立的 `laptop-need-install.sh` 伴生脚本，自动侦测电池硬件并为 Waybar 幂等无缝注入电量（Battery）胶囊模块。
+- 🇨🇳 **中文环境开箱即用**：全自动配置 Fcitx5 + Rime + 雾凇拼音词库，自动注入环境配置文件，单击左 `Shift` 顺畅切换中英文。
+- 🛡️ **安全、幂等与断点续跑**：
+  - **断点续跑**：中断后直接重新执行，已完成阶段自动跳过；
+  - **配置安全**：修改或覆盖已有配置前自动生成带时间戳的 `.bak-*` 备份；
+  - **非破坏性接管**：多桌面环境下仅禁用冲突守护进程（保留清单于 `.system_disabled`），可通过命令随时无损还原。
+- 🌏 **国内网络自愈**：内置 GitHub 下载代理镜像回退、Rustup/Cargo rsproxy 镜像加速、apt 404 智能换源自愈以及虚拟机时钟偏差检测。
+- 🖥️ **虚拟化环境智能预检**：内置 VM 图形预检机制，自动检测 QEMU/KVM/Virgl 3D 加速状态，防患黑屏于未然。
+
+---
+
+## 📦 支持的发行版矩阵
+
+| 脚本 | 适用系统 | 状态与特点 |
 |---|---|---|
-| **`deb-install.sh`** | Debian 12/13、Ubuntu 24.04+、Linux Mint、Pop!_OS，以及任意 Debian 衍生版（脚本自动识别 `/etc/debian_version`：deepin / UOS / Kali / MX / 麒麟等均可） | ✅ **可用（当前主力，完整测试）** |
-| `arch-install.sh` | Arch / Manjaro / EndeavourOS | ⚙️ **可用（新完成，欢迎测试反馈）**：仓库包走 pacman、AUR 包走 yay（缺失时自动编译安装），配置快照与本机同步 |
-| `RHEL-install.sh` | Fedora / Rocky / Alma / CentOS Stream / RHEL | ⚙️ **可用（新完成，欢迎测试反馈）**：Fedora 全部组件走官方仓库；EL10 衍生用 EPEL + COPR + 大量源码编译兜底（含 fcitx5 输入法全家源码编译），配置快照与本机同步 |
+| **`deb-install.sh`** | **Debian 12/13、Ubuntu 24.04+、Linux Mint、Pop!_OS**，以及 Deepin / UOS / Kali / MX / 麒麟等 Debian 衍生版 | ✅ **成熟主力（推荐首选）**<br>完整覆盖测试，预检、多源自愈与后台编译体验极佳 |
+| **`arch-install.sh`** | **Arch Linux、Manjaro、EndeavourOS** | ⚙️ **官方支持**<br>官方源走 pacman，AUR 走 yay（缺失自动引导编译），配置快照同步 |
+| **`RHEL-install.sh`** | **Fedora 40+、Rocky Linux、AlmaLinux、CentOS Stream、RHEL 9/10** | ⚙️ **深度适配（EL10 实测打通）**<br>Fedora 全组件官方仓库；针对 EL10 缺少 Wayland/fcitx5 生态 RPM 的痛点，全自动执行 CRB/EPEL 探测与全家桶源码编译兜底 |
+| **`laptop-need-install.sh`** | **上述所有发行版的笔记本 / 带电池设备** | 🔋 **随需运行**<br>独立为已安装好的 Waybar 补装电量模块与 pill 样式，普通用户或 root 均可执行 |
 
-> **新手请直接用 `deb-install.sh`。** `arch-install.sh` 与 `RHEL-install.sh` 已完成核心功能，但测试覆盖尚不及 deb 版。
-
-### 快速开始（RHEL 系）
-
-```bash
-git clone <本仓库> && cd EilNiri
-sudo ./RHEL-install.sh restore            # 或先加 --dry-run 预览
-```
-
-支持 Fedora / Rocky / Alma / CentOS Stream / RHEL（**EL10 已实测**）。与 Debian 版的主要差异：
-
-- **大量组件在 EL 官方仓库 / EPEL 没有 RPM，脚本自动源码编译兜底**：waybar、mako、fuzzel、copyq、hyprlock、hypridle、grim、slurp（niri 走 yalter/niri COPR；awww 用 cargo 编译；satty 用官方预编译二进制）——安装耗时明显长于 Debian 版，属正常现象
-- **fcitx5 输入法全家源码编译**：EL10 无任何 fcitx5 RPM（未进 EPEL、无 COPR），脚本自动编译 fcitx5 core（5.1.10）→ GTK3/4 模块 → Qt6 模块 → fcitx5-rime + librime（leveldb / opencc / marisa 等外部库也源码兜底）→ 雾凇拼音词库自动部署；fcitx5-configtool 除外（依赖 KDE Frameworks 6，配置已随脚本部署无需它）
-- **EL10 电源管理走 tuned-ppd**：EL10 移除了独立的 power-profiles-daemon，改用 tuned-ppd（同一 PPD D-Bus API），脚本自动映射并启用 `tuned-ppd.service`，tuned 不会被误禁用
-- **仓库自动启用与自检**：EPEL + CRB（CodeReady Builder）自动启用并做包可见性探测（repo 启用但查不到包会明确警告）；COPR 仅 yalter/niri（该项目只构建 niri），启用后自动验证包可查，查不到自动转 cargo 源码编译
-- 命令与 Debian 版一致（`restore [--dry-run]` / `status` / `restore-system`），无 `update` 子命令
+> 💡 **新手推荐**：首次体验建议优先选用 Debian 13 或 Ubuntu 24.04+ 配合 `deb-install.sh`。
 
 ---
 
-## 二、快速开始（Debian 系）
+## 🚀 快速开始
 
-### 前置要求
+### 1. 克隆仓库
 
-| 项目 | 要求 |
-|---|---|
-| 系统 | 推荐 **Debian 13 / Ubuntu 24.04+**（Debian 12 可用，waybar 版本较旧会自动使用精简布局） |
-| 权限 | root（`sudo`） |
-| 网络 | 需要联网下载包与源码（国内网络已内置镜像与代理回退，见[网络](#七网络与镜像)） |
-| 磁盘 | **≥ 6GB 空闲**（niri/awww 走源码编译，需要空间） |
-| 虚拟机 | 显卡必须设为 **Virtio + 3D 加速**，否则 niri 无法运行（见[虚拟机使用指南](#八虚拟机使用指南)） |
-
-### 安装步骤
+在新装系统上打开终端（确保系统已安装 `git`）：
 
 ```bash
-# 1. 在新机器上 clone 仓库（没有 git 时先 sudo apt-get install -y git）
 git clone https://github.com/eilthorne1130-lwh1130/EilNiri.git
 cd EilNiri
+```
 
-# 2. 运行安装脚本
+### 2. 运行对应发行版安装脚本
+
+#### 🐧 Debian / Ubuntu 系
+```bash
+# 完整交互安装（支持 --dry-run 预览计划）
 sudo ./deb-install.sh restore
+```
 
-# 3. 按提示完成交互（都有默认值，直接回车也能走完）
-#    - 选择目标用户（默认 UID 1000 的用户）
-#    - 是否安装中文输入法（fcitx5 + 雾凇拼音，默认是）
-#    - fzf 界面勾选要装的应用（默认全选，TAB 切换、回车确认）
-#    - fzf 界面勾选要启用的系统服务（bluetooth / libvirtd / power-profiles-daemon）
+#### 🏹 Arch Linux 系
+```bash
+sudo ./arch-install.sh restore
+```
 
-# 4. 等待完成。niri/awww 的编译在后台进行，可在另一个终端看进度：
+#### 🎩 RHEL / Fedora / CentOS 系
+```bash
+sudo ./RHEL-install.sh restore
+```
+
+> **交互提示说明**：
+> 运行过程中会有简单的交互界面（按 `回车` 即可使用推荐默认配置）：
+> 1. **目标用户**：默认选择 UID 1000 用户；
+> 2. **中文输入法**：是否启用 Fcitx5 + 雾凇拼音（默认是）；
+> 3. **应用分组**：使用 fzf 勾选要安装的应用（默认全选，`Tab` 切换、`Enter` 确认）；
+> 4. **系统服务**：勾选需随开机启动的系统服务（蓝牙 / libvirtd / 电源管理）。
+
+### 3. 查看后台构建进度（可选）
+
+对于 Debian 与 RHEL 系，niri / awww 等无包组件的 Cargo 编译在后台并行运行。若想实时查看进度，可在另一终端执行：
+
+```bash
 ./deb-install.sh status        # 或 watch -n 5 ./deb-install.sh status
+# RHEL 系同理：
+./RHEL-install.sh status
+```
 
-# 5. 重启 → 登录界面 → 直接进 niri 桌面
+### 4. 重启系统
+
+安装流程完成后，重启系统即可在 SDDM 登录界面直接进入 Niri 桌面：
+
+```bash
 sudo reboot
 ```
 
-> **注意**：脚本会自动安装登录管理器（sddm）并**替换系统现有的 DM**（例如 Ubuntu 预装的 gdm3 会被禁用，不会被卸载）。想保留现有 DM，用 `EILNIRI_KEEP_DM=1 sudo ./deb-install.sh restore`。
->
-> **断点续跑**：中断后直接重跑同一条命令，已完成的阶段自动跳过、失败的阶段自动重试。删除 `.replicate_progress` 文件可强制全量重跑。
+---
+
+## 🔋 笔记本扩展支持
+
+如果你是在**笔记本电脑**或**带电池的外设环境**上使用，主安装脚本运行完毕后，可直接运行伴生脚本一键增强：
+
+```bash
+# 普通用户直接执行即可（也会在 root 运行时自动识别真实用户）
+./laptop-need-install.sh
+
+# 也支持预览模式
+./laptop-need-install.sh --dry-run
+```
+
+**该脚本将自动完成**：
+- 自动检测 `/sys/class/power_supply/` 下的电池硬件设备；
+- 自动备份 `~/.config/waybar/config` 和 `style.css` 为 `*.bak-bat-<时间戳>`；
+- 安全幂等注入 `battery` 状态定义及优雅的药丸外观；
+- 根据电量自动呈现充电、警告、告急不同状态颜色。
 
 ---
 
-## 三、命令一览
+## 🛠️ 命令与环境变量参考
 
-| 命令 | 权限 | 说明 |
+### 脚本命令对比
+
+| 命令 | 适用脚本 | 权限 | 功能描述 |
+|---|---|---|---|
+| `sudo ./<脚本>.sh restore` | 全部主脚本 | root | 完整执行安装与环境部署流程 |
+| `sudo ./<脚本>.sh restore --dry-run` | 全部主脚本 | root | 预览执行计划，不实际更改系统 |
+| `./<脚本>.sh status` | 全部主脚本 | 普通/root | 实时查看后台源码组件的编译状态与日志 |
+| `sudo ./<脚本>.sh restore-system` | 全部主脚本 | root | 重新启用在安装期间为避免冲突而禁用的旧桌面组件 |
+| `sudo ./deb-install.sh update` | `deb-install.sh` | root | 检查并升级 apt 包，若源码组件有上游更新则重新编译 |
+| `./laptop-need-install.sh` | 笔记本脚本 | 普通/root | 为 Waybar 注入电量监测模块与样式 |
+| `./<脚本>.sh --help` | 全部脚本 | - | 查看详细帮助与说明 |
+
+### 环境变量
+
+| 环境变量 | 默认值 | 作用与用法 |
 |---|---|---|
-| `sudo ./deb-install.sh restore` | root | 完整安装（fzf 交互） |
-| `sudo ./deb-install.sh restore --dry-run` | root | 预览模式：只打印计划，不改动系统 |
-| `./deb-install.sh status` | 任意 | **实时查看后台编译进度**（restore 运行时在另一终端执行，支持 `watch`） |
-| `sudo ./deb-install.sh restore-system` | root | 重新启用 restore 时被禁用的其他桌面组件（多桌面环境场景） |
-| `sudo ./deb-install.sh update` | root | 检查并更新软件：apt 包升级 + niri/awww/xwayland-satellite 源码组件有新版时重编译（fzf 勾选） |
-| `./deb-install.sh --help` | - | 查看帮助 |
+| `EILNIRI_KEEP_DM=1` | 0 | 保留系统现有的显示管理器（如 gdm3/lightdm），不强制替换为 sddm |
+| `EILNIRI_KEEP_SYS=1` | 0 | 跳过对其他桌面环境冲突守护进程的禁用操作（多桌面共存场景） |
+| `EILNIRI_GH_PROXY="..."` | 内置4组代理 | 自定义 GitHub 下载代理加速镜像（空格分隔的 URL 列表） |
 
-> 三个脚本都**没有** `rollback` 命令：配置覆盖前的本地备份以 `.bak-时间戳` 形式保留在原目录（每处仅保留最新一份），需要回退时手动恢复即可。
+*示例：*
+```bash
+# 保留 Ubuntu 原生的 GDM 登录器进行安装
+EILNIRI_KEEP_DM=1 sudo ./deb-install.sh restore
+```
 
-## 四、环境变量
+---
 
-| 变量 | 作用 |
+## 🧩 部署的应用与环境生态
+
+<details open>
+<summary><b>点击展开查看完整集成组件清单</b></summary>
+<br>
+
+| 类别 | 预装组件与工具 | 说明 |
+|---|---|---|
+| **核心合成器** | `niri` | 基于滚动平铺特性的 Wayland 窗口合成器 |
+| **状态栏** | `waybar` | 现代化状态栏，集成工作区、媒体播放、网络、音量、时钟与折叠抽屉 |
+| **通知中心** | `mako` | 轻量级 Wayland 桌面通知守护进程 |
+| **应用启动器** | `fuzzel` | 极速 Wayland 原生应用启动菜单 |
+| **终端模拟器** | `kitty` | GPU 加速终端，默认启用 85% 半透明毛玻璃与圆角 |
+| **Shell & 提示符** | `zsh` + `oh-my-zsh` + `starship` | 集成语法高亮、自动建议插件及现代 CLI 工具（`eza`、`bat`、`zoxide`） |
+| **中文输入法** | `fcitx5` + `fcitx5-rime` + `rime-ice` | 雾凇拼音词库，预置环境变量，左 Shift 一键切中英文 |
+| **锁屏与空闲** | `hyprlock` + `hypridle` | 优雅的锁屏界面与自动休眠/灭屏管理 |
+| **壁纸引擎** | `awww` + `waypaper` | 支持动态平滑切换的壁纸引擎，配套 GUI 壁纸选择器 |
+| **剪贴板管理** | `copyq` + `wl-clipboard` | 强大的剪贴板历史管理器，已配置单实例与启动防呆 |
+| **截图与标注** | `satty` + `grim` + `slurp` | 快捷区域截屏并直接唤起图形化画板进行标注、马赛克与保存 |
+| **音频与媒体** | `pipewire` + `wireplumber` + `playerctl` | 现代低延迟音频架构及全局多媒体快捷键支持 |
+| **蓝牙与系统** | `bluetui` + `brightnessctl` + `btop` | 蓝牙终端管理（点击 Waybar 蓝牙图标即开）、亮度调节与性能监控 |
+| **字体资源** | `JetBrainsMono Nerd Font` + `文泉驿正黑` | 完美呈现 Nerd 图标字形与清晰的中文渲染 |
+
+</details>
+
+---
+
+## ⌨️ niri 核心快捷键速查
+
+`Mod` 键在物理机桌面下默认为 **`Super` (Windows 徽标键)**。
+
+### 常用操作
+
+| 快捷键 | 功能 |
 |---|---|
-| `EILNIRI_KEEP_DM=1` | 保留现有显示管理器，不做替换 |
-| `EILNIRI_KEEP_SYS=1` | 跳过禁用其他桌面组件（多桌面环境共存场景） |
-| `EILNIRI_GH_PROXY="https://a/ https://b/"` | 覆盖默认的 GitHub 下载代理列表（空格分隔） |
+| <kbd>Mod</kbd> + <kbd>W</kbd> | **打开终端**（Kitty + zsh） |
+| <kbd>Mod</kbd> + <kbd>Z</kbd> | **应用启动器**（Fuzzel） |
+| <kbd>Super</kbd> + <kbd>Ctrl</kbd> + <kbd>V</kbd> | **剪贴板历史**（CopyQ） |
+| <kbd>Super</kbd> + <kbd>Alt</kbd> + <kbd>L</kbd> | **立即锁屏**（Hyprlock） |
+| <kbd>Mod</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd> | **区域截图**（框选后直接进入 Satty 标注保存） |
+| <kbd>Ctrl</kbd> + <kbd>Print</kbd> | 全屏截图（保存到 `~/Pictures/Screenshots/`） |
+| <kbd>Mod</kbd> + <kbd>Q</kbd> | **关闭当前窗口** |
+| <kbd>Mod</kbd> + <kbd>Shift</kbd> + <kbd>?</kbd> | **打开快捷键帮助蒙版**（Overlay 帮助界面） |
 
----
+### 窗口、分栏与布局控制
 
-## 五、安装了什么
-
-### 应用分组（fzf 勾选，默认全选）
-
-| 分组 | 内容 |
+| 快捷键 | 功能 |
 |---|---|
-| 核心组件 | niri、waybar、mako（通知）、fuzzel（启动器）、kitty（终端）、polkit 认证代理、xwayland-satellite、xdg-desktop-portal、wl-clipboard、libnotify、zsh + oh-my-zsh（含 autosuggestions / syntax-highlighting 插件、starship 提示符、eza / bat）、gsimplecal、adwaita-icon-theme |
-| 锁屏/空闲 | hyprlock、hypridle |
-| 壁纸 | awww（wayland 壁纸引擎，源码编译）、waypaper（壁纸选择器） |
-| 剪贴板/截图 | copyq、satty、grim、slurp |
-| 媒体/亮度 | playerctl、brightnessctl、btop |
-| 音频 | pipewire-pulse、wireplumber |
-| 输入法（可选） | fcitx5 全家 + rime + 雾凇拼音词库（单击左 Shift 切中英文） |
-| 字体 | JetBrainsMono Nerd Font（waybar 图标）、文泉驿正黑 |
-| 密钥环 | gnome-keyring |
-| 工具 | bluetui（蓝牙 TUI，waybar 蓝牙图标点击打开）、ripgrep、zoxide |
-
-### 系统服务（fzf 可选）
-
-bluetooth（蓝牙，bluetui 依赖）、libvirtd（虚拟机）、power-profiles-daemon（电源性能切换）。
-
-### 登录管理器（自动）
-
-自动安装 **sddm** 并设为默认（失败依次回退 gdm3 / gdm），默认会话设为 niri；现有 DM 自动禁用（不卸载）。重启后直接进 niri。
-
-### 桌面配置
-
-- 仓库 `configs/` 内置 niri / waybar / hypr（锁屏）/ mako / kitty / satty / fcitx5 / waypaper / systemd 用户单元等配置，restore 一并部署，已存在的文件自动备份为 `.bak-时间戳`
-- **默认壁纸 = 仓库根目录那张图片**（`QQ图片20260713144149.jpeg`），桌面与锁屏（hyprlock）共用；想换默认壁纸，直接替换仓库根目录的图片文件再跑一次 restore
-- waybar 使用与参考机同步的完整配置（媒体控件 / 折叠抽屉 / 系统更新计数）；旧版 waybar（< 0.10）自动使用兼容布局；**电量模块安装时按提示选择**（自动检测电池预填默认值，台式机选了也会被 waybar 自动隐藏）
-- niri 显示器参数自动检测注入（分辨率来自 DRM 硬件报告）；登录时若显示器未变不会覆盖你手动调过的配置
-- 启动防呆：waybar 单实例守卫（不会出现两条栏）、fcitx5 单实例、CopyQ 主窗口自动隐藏（无托盘环境不再弹出空白窗口）
+| <kbd>Mod</kbd> + <kbd>←</kbd> / <kbd>→</kbd> / <kbd>↑</kbd> / <kbd>↓</kbd> (或 <kbd>H</kbd>/<kbd>J</kbd>/<kbd>K</kbd>/<kbd>L</kbd>) | 移动窗口/分栏焦点 |
+| <kbd>Mod</kbd> + <kbd>Ctrl</kbd> + 方向键 / HJKL | 在分栏间移动窗口位置 |
+| <kbd>Mod</kbd> + <kbd>O</kbd> | **切换工作区概览**（Overview 缩放全览，或触摸板四指上滑） |
+| <kbd>Mod</kbd> + <kbd>1</kbd> ~ <kbd>9</kbd> | 切换至指定编号的工作区 |
+| <kbd>Mod</kbd> + <kbd>Ctrl</kbd> + <kbd>1</kbd> ~ <kbd>9</kbd> | 将当前列移动到指定编号的工作区 |
+| <kbd>Mod</kbd> + <kbd>F</kbd> | 最大化当前列 |
+| <kbd>Mod</kbd> + <kbd>Shift</kbd> + <kbd>F</kbd> | 当前窗口全屏（Fullscreen） |
+| <kbd>Mod</kbd> + <kbd>V</kbd> | 切换窗口 **浮动 / 平铺** 状态 |
+| <kbd>Mod</kbd> + <kbd>T</kbd> | 切换分栏 **标签页模式**（垂直折叠多标签） |
+| <kbd>Mod</kbd> + <kbd>R</kbd> | 循环切换预设列宽（1/3 ➔ 1/2 ➔ 2/3） |
+| <kbd>Mod</kbd> + <kbd>-</kbd> / <kbd>=</kbd> | 微调当前列宽（每次 ±10%） |
+| <kbd>Mod</kbd> + <kbd>Shift</kbd> + <kbd>E</kbd> | 退出桌面会话（弹出确认对话框） |
 
 ---
 
-## 六、安装过程会发生什么
+## 🖥️ 虚拟机使用指南
 
-1. **Pre-Flight**：apt 更新 + 自动开启 Ubuntu universe 源 + 修复破损 dpkg 状态 + 自动生成中文 locale + **VM 图形预检**（QEMU/KVM 下检测显卡/渲染节点并给出黑屏预防指引）+ Mesa 图形运行时安装
-2. **目标用户检测**：默认 UID 1000 用户，30 秒内可选其他/新建
-3. **应用安装**：按 fzf 勾选批量安装；无 .deb 的组件自动走预编译下载或源码编译；**niri / awww 的 cargo 编译转后台并行**，期间继续装包部署配置
-4. **服务启用**：勾选的系统服务 `systemctl enable --now`
-5. **显示管理器**：安装 sddm 并替换现有 DM，默认会话设为 niri，开机目标设为 graphical.target
-6. **配置部署**：部署 `configs/` + 输入法环境变量（environment.d + /etc/environment）+ zsh/oh-my-zsh 运行时 + waybar/壁纸自愈
-7. **系统清理**：自动**禁用（不卸载）**其他桌面环境的冲突组件（GNOME 通知/设置守护等），清单存 `.system_disabled`，可随时用 `restore-system` 恢复
-8. **等待后台编译**：实时显示进度；完成后自动安装 niri/awww 二进制
-9. **硬件适配**：检测所有已连接显示器 → 生成 output 配置（含真实分辨率）→ niri validate 校验，失败自动回滚
-10. **验证收尾**：包对账 + 配置审计 + 启动链自检 + 汇总报告 + 生成诊断包
-
----
-
-## 七、网络与镜像
-
-- **GitHub 下载代理回退**：niri 源码、satty、bluetui、rime-ice 等下载优先 GitHub 直连，失败自动依次尝试国内代理（ghfast.top 等），可用 `EILNIRI_GH_PROXY` 覆盖
-- **cargo/rustup 镜像**：国内时区自动启用 rsproxy.cn
-- **apt 换源自愈**：apt 404 / 源失效时按 清华 → 阿里云 → 中科大 顺序询问换源，并验证新镜像确实同步了之前 404 的包
-- **系统时钟偏差检测**：apt 报"Release 文件过期"时自动对比时钟，偏差 ≥ 3 天给出校准命令（VM 常见）
-- **Ubuntu universe**：Server/minimal 镜像默认不开 universe（fuzzel/waybar/fcitx5-rime 都在里面），脚本自动开启并硬校验
-
----
-
-## 八、虚拟机使用指南
-
-在 QEMU/KVM 虚拟机里体验 niri 完全可行，但对虚拟机配置有硬性要求（niri 拒绝软件渲染）。**脚本会在每次 restore 开头运行 VM Graphics Check 自动检测并给出结论**，无需自己猜。
+niri 采用现代 GPU 渲染管线，**拒绝纯 CPU 软渲染（llvmpipe）**。如果您在虚拟机中测试体验，请注意以下关键配置：
 
 ### 推荐虚拟机配置
 
-| 项目 | 要求 | 说明 |
+| 项目 | 推荐要求 | 说明 |
 |---|---|---|
-| 显卡 | **Virtio + 3D 加速（必需）** | virt-manager：显示 Virtio → 勾选"3D acceleration"；virsh：`<model type='virtio'><acceleration accel3d='yes'/>`。QXL/std/bochs 纯 2D 显卡**无法运行 niri** |
-| 显示协议 | SPICE（virt-manager 默认） | virgl 输出需要 SPICE（配合远程查看器时开启 GL） |
-| 内存 | ≥ 4GB（建议 8GB） | niri/awww 源码编译需要内存，脚本按内存自动限制编译并发 |
-| CPU | ≥ 2 核 | |
-| 磁盘 | ≥ 25GB | 系统本身 + 约 6GB 编译空间 |
-| 蓝牙 | 无控制器 | 属正常：waybar 蓝牙图标不显示、bluetui 报超时都是因为 VM 没有蓝牙硬件，忽略即可 |
+| **显卡模式** | **Virtio + 勾选 3D 加速（必需）** | 在 `virt-manager` 中显卡选 Virtio 并勾选「3D 加速」；SPICE 协议需开启 GL。纯 2D 显卡（QXL / std / bochs）无法运行 niri |
+| **内存** | **≥ 4GB**（建议 8GB+） | 源码编译需要合理内存支持，脚本会依据内存量动态限制并发线程 |
+| **处理器** | **≥ 2 核** | 保证多线程编译与窗口合成流畅 |
+| **磁盘空间** | **≥ 25GB** 空闲 | 包含基础系统与源码编译产物所需缓存 |
 
-### 脚本为 VM 自动做的事
-
-- **VM Graphics Check**：检测显卡型号 / DRM 设备 / 连接器（virtio 显示为 Virtual-1），并读内核日志判定 **virgl 3D 是否真正启用**（绿字=可以装；黄字=先去宿主机开 3D 再装）
-- **Guest agent 自动安装**：spice-vdagent（宿主机↔VM 剪贴板共享、光标同步）+ qemu-guest-agent（宿主机管理通道）；物理机上自动跳过
-- 会话日志：登录异常时切 TTY（`Ctrl+Alt+F3`）看 `~/.local/state/eilniri/session.log`
-
-### VM 黑屏自查清单
-
-1. 脚本开头 VM Graphics Check 是否黄字警告 3D 未启用？→ 宿主机关机开启 3D 后重试
-2. 确认显卡模型是 Virtio（QXL/std/bochs 不行）
-3. 切 TTY 看 `~/.local/state/eilniri/session.log` 末尾的 niri 报错
-4. 把 `~/.local/state/eilNiri/diag-*.tar.gz` 诊断包发出来
+> 🔍 **自动预检守护**：脚本每次运行都会自动执行 **VM Graphics Check**，读取内核日志判定 Virgl 3D 加速是否真正生效（**绿色**通过，**黄色**会提示先在宿主机开启 3D）。并且会自动在虚拟机内安装 `spice-vdagent`（剪贴板同步）和 `qemu-guest-agent`。
 
 ---
 
-## 九、故障排查
+## ❓ 故障排查与日志
 
-### 登录后黑屏
+### 常见问题速查
 
-1. **虚拟机用户**：niri 硬性要求硬件渲染（拒绝 llvmpipe 软渲染），虚拟显卡必须是 **Virtio 且勾选 3D 加速**。脚本开头的 **VM Graphics Check** 会读取内核日志**直接判定 virgl 3D 是否启用**（绿字=已启用，黄字=未检测到、大概率黑屏），完整配置要求见[虚拟机使用指南](#八虚拟机使用指南)。
-2. 切 TTY（`Ctrl+Alt+F3`）登录后查看会话日志：
-   ```bash
-   tail -n 50 ~/.local/state/eilniri/session.log
-   ```
-   niri 的报错（panic 原文）就在文件末尾。
-3. 把诊断包发出来最快：`~/.local/state/eilNiri/diag-<时间戳>.tar.gz`（含编译日志、DM 状态、DRM 设备、journal 相关行、会话日志）。
+- **登录后黑屏**：
+  1. 虚拟机用户：请确认虚拟显卡是否为 **Virtio 且开启了 3D 加速**；
+  2. 物理机或排查原因：切入 TTY 终端（<kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>F3</kbd>）查看错误日志：
+     ```bash
+     tail -n 50 ~/.local/state/eilNiri/session.log
+     ```
+  3. 获取自动生成的诊断包直接排查：`~/.local/state/eilNiri/diag-*.tar.gz`。
+- **Waybar 出现双重栏位**：
+  直接重新执行一次 `./<脚本>.sh restore`，内置的单实例守卫与链接修复会自动清理。
+- **输入法未唤出**：
+  确认已注销或重启会话以加载环境变量（已自动配置 `/etc/environment` 和 `~/.config/environment.d/`）；默认左 `Shift` 键切换中文。
+- **替换默认壁纸**：
+  仓库根目录的 `QQ图片20260713144149.jpeg` 是安装时的初始壁纸。换用自定义壁纸只需替换该图片重新跑一次 restore，或者进桌面后运行 `waypaper` 自由挑选。
 
-### 其他常见项
+### 关键日志路径
 
-| 现象 | 处理 |
+| 日志文件 | 内容说明 |
 |---|---|
-| waybar 出现两条 | 重跑一次 restore（单实例守卫 + systemd 自启链接清理会自动修复） |
-| 输入法候选异常 / Shift 不切换中文 | 确认装了输入法组件；重跑 restore 会重新写入 fcitx5 配置与输入法环境变量 |
-| 壁纸不是仓库那张 | 确认 `~/.local/share/backgrounds/wallpaper.jpg` 存在；awww 编译失败时壁纸由 waypaper.service 在登录时恢复，重跑 restore 重试编译 |
-| 包安装失败 | 看 `~/.local/state/eilNiri/apt-errors.log`（apt 真实报错都在这里） |
-| 编译失败 | 看 `~/.local/state/eilNiri/{niri,awww}-build.log` 尾部；脚本结尾的 Summary 手动项会给出具体命令 |
-
-### 日志位置
-
-| 文件 | 内容 |
-|---|---|
-| `~/.local/state/eilNiri/replicate.log` | 主日志（保留最近 800 行） |
-| `~/.local/state/eilNiri/apt-errors.log` | apt 安装真实报错 |
-| `~/.local/state/eilNiri/{niri,awww}-build.log` | 后台编译日志（`tail -f` 实时看） |
-| `~/.local/state/eilniri/session.log` | niri 会话日志（黑屏排查第一现场） |
-| `~/.local/state/eilNiri/diag-*.tar.gz` | 诊断包（求助于人时直接分享这个） |
+| `~/.local/state/eilNiri/replicate.log` | 主安装过程日志 |
+| `~/.local/state/eilNiri/session.log` | niri 桌面会话运行日志（排查启动报错的第一现场） |
+| `~/.local/state/eilNiri/{niri,awww}-build.log` | 后台 Cargo 编译日志（可通过 `tail -f` 追踪） |
+| `~/.local/state/eilNiri/apt-errors.log` | （Debian 系）apt 安装失败底层日志 |
+| `~/.local/state/eilNiri/diag-*.tar.gz` | 一键打包的系统与桌面诊断包 |
 
 ---
 
-## 十、自定义配置
-
-- `configs/` **不是必须的**——没有它 restore 也能跑（niri 用内置默认配置）
-- 想用自己的 dotfiles：`configs/.config/` 下的每个目录对应目标机 `~/.config/<name>`；`configs/.local/share/` 对应 `~/.local/share/`
-- 敏感数据（`~/.ssh`、token、keyring）不要放进 `configs/`
-- 配置里的路径建议写成 `$HOME` 字面量（restore 时会展开为实际主目录）
-
----
-
-## 十一、已知限制
-
-- 三个脚本均无 `rollback` 命令（配置备份仅保留覆盖前的 `.bak-时间戳` 单份）
-- **虚拟机必须开 3D 加速**，否则 niri 无法运行（niri 拒绝软件渲染，这是上游设计而非脚本问题）
-- Debian 12 / Ubuntu 24.04 的 waybar 为 0.9.x 旧版，自动使用精简布局（无折叠抽屉/媒体模块）
-- niri / awww 在 Debian 系走源码编译（约 10-20 分钟 + 5 分钟），需要 ≥ 6GB 磁盘与足够内存（编译并发按内存自动限制）
-- `arch-install.sh`、`RHEL-install.sh` 已完成核心功能（arch：pacman + AUR/yay；RHEL：dnf/EPEL/COPR + 源码编译 + 配置同步），欢迎测试反馈
-- RHEL 系 COPR 说明：`alebastr/sway-extras` 与 `solopasha/hyprland` 均未构建 EPEL chroot（在 EL 上 `dnf copr enable` 必报 "Chroot not found"），脚本只在 EL 上启用确有 `epel-10` chroot 的 `yalter/niri`（该项目**仅构建 niri**，xwayland-satellite 走 cargo 源码编译），启用前会先探测 chroot 是否存在、启用后验证包可查，失败自动降级到 EPEL / 源码编译，不会阻塞安装；EL9 无可用 COPR，niri 等一律源码编译
-- **EL10 系（Rocky/Alma/CentOS Stream 10）无 fcitx5 包**：官方仓库与 EPEL10 均无，也没有带 epel-10 chroot 的 fcitx5 COPR——脚本自动**源码编译全家**（core 5.1.10 → GTK3/4 → Qt6 → fcitx5-rime + librime + 外部库 → 雾凇词库），详见[快速开始（RHEL 系）](#快速开始rhel-系)；Fedora 不受影响（全部官方仓库）
-- EL10 上 waybar/mako/fuzzel/grim/slurp/copyq/hyprlock/hypridle 均无 RPM，脚本自动源码编译（playerctl/brightnessctl/copyq 等从 EPEL 安装）；编译依赖 `-devel` 包需要 **CRB/PowerTools 仓库启用**（脚本会自动启用并在失败时明确报告），源码编译约需 10-30 分钟；fuzzel 源码构建钉在 1.11.1（master 需要 pixman >= 0.46，EL10 自带 0.43.4）
-- EL10 的 EPEL 按 minor 版本快照分发：较新包（如 dav1d、copyq）只出现在 10.2+ 的小版本里，10.0/10.1 的机器查不到时脚本自动转源码编译，无需手动干预
-
----
-
-## 产物结构
+## 📂 仓库结构
 
 ```
 EilNiri/
-├── deb-install.sh      # Debian 系安装脚本（当前主力）
-├── arch-install.sh     # Arch 系（⚙️ 可用：pacman + AUR/yay + 配置同步）
-├── RHEL-install.sh     # RHEL 系（⚙️ 可用：dnf/EPEL/COPR + 源码编译 + 配置同步）
-├── configs/            # 桌面配置快照（部署到目标机 $HOME）
-├── QQ图片20260713144149.jpeg   # 默认壁纸（桌面 + 锁屏共用）
-├── LICENSE
-└── README.md
-
-# restore 运行后生成的文件（本目录内）
-├── .replicate_progress # 断点续跑进度（删除即强制全量重跑；带版本标记，旧版自动作废）
-└── .system_disabled    # 被禁用的其他桌面组件清单（restore-system 据此恢复）
+├── deb-install.sh              # Debian / Ubuntu 系一键安装脚本（成熟主力）
+├── arch-install.sh             # Arch / Manjaro 系一键安装脚本
+├── RHEL-install.sh             # RHEL / Fedora / CentOS 系一键安装脚本（含 EL10 深度兜底）
+├── laptop-need-install.sh      # 笔记本 / 电池设备专用的 Waybar 电量模块补装脚本
+├── configs/                    # 预置桌面配置模板快照
+│   ├── .config/
+│   │   ├── niri/               # niri 窗口管理器配置 (config.kdl)
+│   │   ├── waybar/             # waybar 状态栏配置与美化 CSS
+│   │   ├── hypr/               # hyprlock 锁屏与 hypridle 待机守护配置
+│   │   ├── kitty/              # kitty 终端配置
+│   │   ├── mako/               # mako 桌面通知配置
+│   │   ├── fuzzel/             # fuzzel 启动器样式配置
+│   │   ├── fcitx5/             # fcitx5 输入法与主题配置
+│   │   ├── satty/              # satty 截图画板配置
+│   │   └── ...
+│   └── .zshrc                  # 预置 zsh 配置文件
+├── QQ图片20260713144149.jpeg    # 初始预置壁纸（桌面与锁屏共用）
+├── LICENSE                     # GPL-3.0 开源许可协议
+└── README.md                   # 项目文档
 ```
 
-## 参考
+---
 
-- 交互风格与视觉引擎：[SHORiN-KiWATA/shorin-arch-setup](https://github.com/SHORiN-KiWATA/shorin-arch-setup)
-- 跨发行版思路：[nickjj/dotfriedrice](https://github.com/nickjj/dotfriedrice)
+## 💡 自定义配置技巧
 
-## 贡献者
+- 如果你想将自己的配置（Dotfiles）固化到安装流程中，只需将配置放入 `configs/.config/<app_name>` 或 `configs/.local/share/`，脚本在 restore 阶段会自动同步部署；
+- 脚本具备严格的安全机制，绝不会提交或同步隐私历史（如剪贴板历史、输入法词库记忆、最近文件等）；
+- 配置文件中的路径推荐使用 `$HOME` 字面量，脚本部署时会自动将其解析为目标用户的实际家目录。
 
-- **eilthorne** - 项目创建与维护
+---
 
-在这里向所有贡献者表示感谢
+## 🤝 鸣谢与参考
+
+- 交互风格与视觉引擎参考：[SHORiN-KiWATA/shorin-arch-setup](https://github.com/SHORiN-KiWATA/shorin-arch-setup)
+- 跨发行版部署思路启发：[nickjj/dotfriedrice](https://github.com/nickjj/dotfriedrice)
+- 现代滚动平铺合成器：[niri-wm/niri](https://github.com/niri-wm/niri)
+
+## 📄 许可证
+
+本项目采用 [GNU General Public License v3.0](LICENSE) 开源许可证。
+
+---
+<div align="center">
+Made with ❤️ by <b>eilthorne</b> and contributors
+</div>
