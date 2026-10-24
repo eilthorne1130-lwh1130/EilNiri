@@ -1,0 +1,71 @@
+# ==============================================================================
+# eilNiri — IBus 输入法配置（RHEL 系）
+# ==============================================================================
+#
+# 这个文件是 **IBus 设置的可读快照**，不是 IBus 会直接读取的活动配置。
+# 真正的配置存放在 dconf 里，由 RHEL-install.sh 的 install_ibus_ime() 写入：
+#
+#   1) /etc/dconf/db/ibus.d/00-eilniri-ime   ← 脚本生成（系统级默认值，随 restore 刷新）
+#   2) ~/.config/dconf/user                  ← 用户在 ibus-setup / gsettings 里的改动
+#
+# 为什么用系统 dconf 库：IBus 用的是独立 dconf profile
+# （/etc/dconf/profile/ibus，内容为 "user-db:user" + "system-db:ibus"），
+# 因此 root 无需用户 D-Bus 会话即可通过 system-db 预置配置——这正是"装完即用、
+# 不必手动跑 ibus-setup"的关键。快照里 fcitx5 的主题/通知类设置没有 IBus 等价物，
+# 详见同目录 README.md 的迁移对照表。
+#
+# 手动查看/修改（在桌面会话内执行）：
+#   gsettings get org.freedesktop.ibus.general preload-engines
+#   ibus engine                     # 当前引擎，正常应为 rime
+#   ibus-setup                      # 图形化配置（会写入 ~/.config/dconf/user）
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 输入源（org.freedesktop.ibus.general）
+# ------------------------------------------------------------------------------
+[general]
+# 输入源（脚本按实际装上的引擎写这一行，二者之一）：
+#   rime      = ibus-rime（Fedora / EPEL 10 / EPEL 8）→ 雾凇拼音词典
+#   libpinyin = ibus-libpinyin（EL9 官方源，rime 不可用时的后备）
+# 中/英状态由引擎内部管理（Rime 的 ascii_mode / libpinyin 的英文模式），
+# 所以不需要像 fcitx5 那样再塞一个 keyboard-us 分组。
+preload-engines=['rime']
+engines-order=['rime']
+# EL9 上脚本会把上面两行改写成：
+#   preload-engines=['libpinyin']
+#   engines-order=['libpinyin']
+# 对应 fcitx5 [Behavior] ActiveByDefault=False：拿到焦点时不强制打开输入法。
+enable-by-default=false
+# 对应 fcitx5 ShareInputState=No：每个窗口独立记忆中英状态。
+use-global-engine=false
+# 对应 fcitx5 PreeditEnabledByDefault=False：组词文本不进应用输入框，
+# 改在候选窗里显示（Rime 侧另有 ibus_rime.yaml 的 inline_preedit 控制）。
+embed-preedit-text=false
+# 键盘布局交给 niri/系统 XKB（fcitx5 OverrideXkbOption=False）。
+use-system-keyboard-layout=true
+
+# ------------------------------------------------------------------------------
+# 切换快捷键（org.freedesktop.ibus.general.hotkey）
+# ------------------------------------------------------------------------------
+# 注意：fcitx5 的"单击左 Shift 切换中英文"是通过 TriggerKeys=Shift+Shift_L /
+# AltTriggerKeys=Shift_L 实现的，在 IBus 里这个行为属于 Rime 引擎自身
+# （rime-ice 的 ascii_mode 开关绑定 Shift_L），因此在本文件里没有对应键。
+[general/hotkey]
+# 中英开关键
+trigger=['Control+space']
+# fcitx5 的 EnumerateGroupForwardKeys=Super+space
+triggers=['<Super>space']
+# 引擎间轮换
+next-engine=['Alt+Shift_L']
+prev-engine=['Control+Shift_L']
+
+# ------------------------------------------------------------------------------
+# 候选窗 / 语言面板（org.freedesktop.ibus.panel）
+# ------------------------------------------------------------------------------
+[panel]
+# 对应 fcitx5 conf/classicui.conf 的 "Vertical Candidate List=False"（0=横向，1=纵向）
+lookup-table-orientation=0
+# 语言属性面板：0=不弹出（fcitx5 的经典 UI 也没有这种面板）
+show=0
+# 候选窗中随语言选择字形（中文候选用中文字形）
+use-glyph-from-engine-lang=true

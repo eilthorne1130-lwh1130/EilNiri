@@ -1,0 +1,5604 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# eilNiri - RHEL-install.sh
+#
+#   One-click niri desktop setup for a fresh Fedora / Rocky / Alma / CentOS Stream / RHEL system.
+#   Packages come from a built-in list and the script installs everything:
+#   niri/awww/satty builds, the Chinese IME (IBus: ibus-rime + rime-ice where
+#   packaged, ibus-libpinyin fallback otherwise; fcitx5 has no EL package), display manager (replacing any existing one), services and
+#   config deploy. Desktop config is optional and read from the repo's
+#   configs/.config/ if you choose to ship any.
+#
+#   IME note: Debian/Arch builders keep Fcitx5 + Rime; this RHEL builder uses the
+#   IBus stack because it is the only one fully packaged for EL (ibus/ibus-gtk3/
+#   ibus-gtk4 in AppStream, ibus-rime/librime/brise in EPEL) — nothing is compiled.
+#
+#   Usage:
+#     ./RHEL-install.sh restore [--dry-run]     restore on new system (root)
+#     ./RHEL-install.sh status                  show background build progress
+#     ./RHEL-install.sh --help
+#
+#   Interaction style & visual engine reference: https://github.com/SHORiN-KiWATA/shorin-arch-setup
+# ==============================================================================
+echo "The author assumes no responsibility for any changes made to the server, computer, etc., and the author reserves the right of final interpretation."
+set -uo pipefail
+
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_FILE="$BASE_DIR/.replicate_progress"
+
+declare -a CLEANUP_TEMP_PATHS=()
+register_temp_path() { CLEANUP_TEMP_PATHS+=("$1"); }
+
+# Background cargo build jobs (niri/awww): "name pid logfile srcdir"
+BG_JOBS=()
+BG_PENDING_RC=98   # installer return code when the build was spawned in background
+bg_build_start() { # $1=name $2=srcdir $3=logfile $4...=command
+    local name="$1" srcdir="$2" logfile="$3"
+    shift 3
+    log "$(_t "Background build started: " "Background build started: ") $name (log: $logfile)"
+    ( "$@" ) >> "$logfile" 2>&1 &
+    BG_JOBS+=("$name|$!|$logfile|$srcdir")
+    echo "$name|$!|$logfile|$srcdir" >> "$BUILD_STATE_FILE"
+}
+
+cleanup() {
+    local rc=$?
+    local p
+    # kill any background builds still running (they own temp dirs being removed below)
+    local _entry _bpid
+    for _entry in ${BG_JOBS[@]+"${BG_JOBS[@]}"}; do
+        _bpid=$(echo "$_entry" | awk -F'|' '{print $2}')
+        [ -n "$_bpid" ] && kill "$_bpid" 2>/dev/null
+    done
+    rm -f "$BUILD_STATE_FILE" 2>/dev/null
+    for p in ${CLEANUP_TEMP_PATHS[@]+"${CLEANUP_TEMP_PATHS[@]}"}; do
+        [ -n "$p" ] && rm -rf "$p" 2>/dev/null
+    done
+    if [ $rc -ne 0 ] && [ $rc -ne 130 ] && [ "${_ERROR_REPORTED:-0}" -ne 1 ]; then
+        echo -e "\n\e[1;31m[-] Action interrupted or terminated. (Exit: $rc)\e[0m" >&2
+    fi
+    exit $rc
+}
+trap cleanup EXIT INT TERM
+
+MODE=""
+DRY_RUN=0
+_ERROR_REPORTED=0
+
+# Script version — printed at startup so a stale copy on the target machine is easy to spot
+SCRIPT_VERSION="1.15.0"
+
+# Output is always English with ANSI colors (TTY/desktop detection removed).
+# _t always returns the English (2nd) argument; kept as a thin translation helper.
+_t() { echo "$2"; }
+
+# ==============================================================================
+# 1. Visual engine (see 00-utils.sh)
+# ==============================================================================
+
+export NC='\033[0m' BOLD='\033[1m' DIM='\033[2m'
+export H_RED='\033[1;31m' H_GREEN='\033[1;32m' H_YELLOW='\033[1;33m'
+export H_BLUE='\033[1;34m' H_PURPLE='\033[1;35m' H_CYAN='\033[1;36m'
+export H_WHITE='\033[1;37m' H_GRAY='\033[1;90m' H_MAGENTA='\033[1;35m'
+
+export TICK="${H_GREEN}✔${NC}"
+export CROSS="${H_RED}✘${NC}"
+export WARN_I="${H_YELLOW}⚠${NC}"
+export ARROW="${H_CYAN}➜${NC}"
+
+# Log dir: under sudo $HOME is /root, so use the real user's home (same as non-sudo export)
+_LOG_USER="${SUDO_USER:-$USER}"
+_LOG_HOME="$HOME"
+if [ -n "$_LOG_USER" ] && [ "$_LOG_USER" != "root" ]; then
+    _LOG_HOME=$(getent passwd "$_LOG_USER" 2>/dev/null | cut -d: -f6)
+fi
+[ -z "$_LOG_HOME" ] && _LOG_HOME="$HOME"
+LOG_DIR="${XDG_STATE_HOME:-$_LOG_HOME/.local/state}/eilNiri"
+# 以 sudo 运行时，mkdir 会在真实用户家目录下创建 ~/.local / ~/.local/state（若尚不存在），
+# 且属主是 root。waypaper 等程序登录后以普通用户身份在其中创建状态目录，属主不对就
+# PermissionError 崩溃 → GUI 打不开、壁纸失效。这里立即把新创建的层级归还给真实用户。
+if [ -n "$_LOG_USER" ] && [ "$_LOG_USER" != "root" ] && [ -d "$_LOG_HOME/.local/state" ]; then
+    chown "$_LOG_USER:$(id -gn "$_LOG_USER" 2>/dev/null || echo "$_LOG_USER")" \
+        "$_LOG_HOME/.local" "$_LOG_HOME/.local/state" 2>/dev/null || true
+    chown -R "$_LOG_USER" "$LOG_DIR" 2>/dev/null || true
+fi
+unset _LOG_USER _LOG_HOME
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+export TEMP_LOG_FILE="$LOG_DIR/replicate.log"
+# Per-build state for ./RHEL-install.sh status (name|pid|logfile|srcdir per line)
+export BUILD_STATE_FILE="$LOG_DIR/builds.state"
+
+init_logger() {
+    if [ -f "$TEMP_LOG_FILE" ]; then
+        local tmp_log
+        tmp_log=$(tail -n 800 "$TEMP_LOG_FILE" 2>/dev/null || true)
+        echo "$tmp_log" > "$TEMP_LOG_FILE"
+    fi
+    echo "==================================================" >> "$TEMP_LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] eilNiri session started" >> "$TEMP_LOG_FILE"
+    echo "==================================================" >> "$TEMP_LOG_FILE"
+}
+
+write_log() {
+    local clean_msg
+    clean_msg=$(echo -e "$2" | sed 's/\x1b\[[0-9;]*m//g')
+    echo "[$(date '+%H:%M:%S')] [$1] $clean_msg" >> "$TEMP_LOG_FILE" 2>/dev/null || true
+}
+
+section() {
+    echo ""
+    echo -e "${H_PURPLE}╭──────────────────────────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${H_PURPLE}│${NC} ${BOLD}${H_WHITE}$1${NC}"
+    echo -e "${H_PURPLE}│${NC} ${H_CYAN}$2${NC}"
+    echo -e "${H_PURPLE}╰──────────────────────────────────────────────────────────────────────────────╯${NC}"
+    write_log "SECTION" "$1 - $2"
+}
+
+info_kv() {
+    printf "   ${H_BLUE}●${NC} %-15s : ${BOLD}%s${NC} ${DIM}%s${NC}\n" "$1" "$2" "${3:-}"
+    write_log "INFO" "$1=$2"
+}
+
+log()     { echo -e "   $ARROW $1"; write_log "LOG" "$1"; }
+success() { echo -e "   $TICK ${H_GREEN}$1${NC}"; write_log "SUCCESS" "$1"; }
+warn()    { echo -e "   $WARN_I ${H_YELLOW}${BOLD}WARNING:${NC} ${H_YELLOW}$1${NC}"; write_log "WARN" "$1"; }
+
+error() {
+    _ERROR_REPORTED=1
+    echo ""
+    echo -e "${H_RED}   ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
+    echo -e "${H_RED}   ┃  ERROR: $1${NC}"
+    echo -e "${H_RED}   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
+    echo ""
+    write_log "ERROR" "$1"
+}
+
+# Core command executor: visual + logging + dry-run interception
+# In dry-run it returns 99 (DRY_RUN_RC) so callers can distinguish "not actually installed" from "really succeeded"
+DRY_RUN_RC=99
+exe() {
+    local full_command="$*"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo -e "   ${H_GRAY}│${NC} ${H_YELLOW}[DRY-RUN]${NC} ${BOLD}$full_command${NC}"
+        write_log "DRYRUN" "$full_command"
+        return "$DRY_RUN_RC"
+    fi
+    echo -e "   ${H_GRAY}┌──[ ${H_MAGENTA}EXEC${H_GRAY} ]────────────────────────────────────────────────────${NC}"
+    echo -e "   ${H_GRAY}│${NC} ${H_CYAN}$ ${NC}${BOLD}$full_command${NC}"
+    write_log "EXEC" "$full_command"
+    "$@"
+    local status=$?
+    if [ $status -eq 0 ]; then
+        echo -e "   ${H_GRAY}└──────────────────────────────────────────────────────── ${H_GREEN}OK${H_GRAY} ─┘${NC}"
+    else
+        echo -e "   ${H_GRAY}└────────────────────────────────────────────────────── ${H_RED}FAIL${H_GRAY} ─┘${NC}"
+        write_log "FAIL" "Exit Code: $status ($full_command)"
+        return $status
+    fi
+}
+
+# Confirmation prompt with timeout: confirm "question" [default Y|N] [timeout sec]
+# Returns 0 = yes, 1 = no
+confirm() {
+    local prompt="$1" default="${2:-Y}" timeout="${3:-30}" ans
+    echo -ne "   ${H_CYAN}${prompt} ${NC}"
+    if ! read -t "$timeout" -r ans; then echo ""; fi
+    ans=${ans:-$default}
+    [[ "$ans" =~ ^[Yy] ]]
+}
+
+show_logo() {
+    echo ""
+    echo -e "${H_PURPLE}"
+    cat <<'LOGO'
+  ███████╗ ██╗ ██╗        ███╗   ██╗ ██╗ ██████╗  ██╗
+  ██╔════╝ ██║ ██║        ████╗  ██║ ██║ ██╔══██╗ ██║
+  █████╗   ██║ ██║        ██╔██╗ ██║ ██║ ██████╔╝ ██║
+  ██╔══╝   ██║ ██║        ██║╚██╗██║ ██║ ██╔══██╗ ██║
+  ███████╗ ██║ ███████╗   ██║ ╚████║ ██║ ██║  ██║ ██║
+  ╚══════╝ ╚═╝ ╚══════╝   ╚═╝  ╚═══╝ ╚═╝ ╚═╝  ╚═╝ ╚═╝
+LOGO
+    echo -e "${NC}"
+    echo -e "       ${H_CYAN}Niri Desktop Environment — One-Click Setup${NC}"
+    echo ""
+}
+
+# ==============================================================================
+# 2. Data section — niri suite definition (single source of truth for export/restore)
+# ==============================================================================
+
+GROUP_ORDER=(core lock wallpaper clip media audio ime fonts keyring)
+
+declare -A GROUP_EN=(
+    [core]="Core"
+    [lock]="Lock/Idle"
+    [wallpaper]="Wallpaper"
+    [clip]="Clip/Screen"
+    [media]="Media/Bright"
+    [audio]="Audio"
+    [ime]="IME"
+    [fonts]="Fonts"
+    [keyring]="Keyring"
+)
+
+declare -A GROUP_PKGS=(
+    # NOTE: zsh-autosuggestions / zsh-syntax-highlighting are NOT listed here —
+    # distro packages install them in /usr/share or /etc/zsh/zshrc.d, which oh-my-zsh's
+    # plugins=() cannot use. install_zsh_extras clones them into ~/.oh-my-zsh/custom/plugins/
+    # (works identically on Arch / RHEL / Debian families).
+    [core]="niri waybar mako fuzzel kitty polkit-agent xwayland-satellite xdg-desktop-portal-gnome xdg-desktop-portal-gtk wl-clipboard libnotify zsh"
+    [lock]="hyprlock hypridle"
+    [wallpaper]="awww waypaper"
+    [clip]="copyq satty grim slurp"
+    [media]="playerctl brightnessctl btop"
+    [audio]="pipewire-pulse wireplumber"
+    # IME: IBus (NOT fcitx5). fcitx5 exists in NO EL repository (verified 2026-10:
+    # absent from EPEL 10, no COPR epel-10 chroot) whereas the IBus stack ships in
+    # the base OS on both Fedora and EL: ibus/ibus-gtk3/ibus-gtk4/ibus-wayland/
+    # ibus-libpinyin come from AppStream, ibus-panel from CRB, and the Rime engine
+    # (ibus-rime + librime + librime-lua + brise) from EPEL. Nothing is compiled.
+    # Engine = ibus-rime, dictionary = rime-ice (same Rime data files as the fcitx5
+    # build used, different host dir).
+    # NOTE: ibus-panel is listed explicitly — the ibus RPM only Requires it when a
+    # known panel host is installed (gnome/kde/sway/hyprland/waybar...), and niri is
+    # not on that list, so without it /usr/libexec/ibus-ui-gtk3 would be missing and
+    # ibus-daemon would abort with "Can not execute default panel program".
+    [ime]="ibus ibus-panel ibus-gtk3 ibus-gtk4 ibus-wayland ibus-qt ibus-rime rime-ice-pinyin-git"
+    [fonts]="ttf-jetbrains-mono-nerd wqy-zenhei"
+    [keyring]="gnome-keyring"
+)
+
+# pkg -> group reverse lookup table (built at runtime)
+declare -A PKG_GROUP=()
+for _g in "${GROUP_ORDER[@]}"; do
+    for _p in ${GROUP_PKGS[$_g]:-}; do
+        PKG_GROUP["$_p"]="$_g"
+    done
+done
+unset _g _p
+
+# service -> provider package mapping (filtered by is-enabled during export and written to services.txt)
+SVC_ORDER=(bluetooth.service libvirtd.service power-profiles-daemon.service)
+declare -A SVC_PROVIDER=(
+    [bluetooth.service]=bluez
+    [libvirtd.service]=libvirt
+    [power-profiles-daemon.service]=power-profiles-daemon
+)
+
+# --- Arch -> RHEL family translation layer ---
+# Rename mapping
+declare -A RHEL_MAP=(
+    [ttf-jetbrains-mono-nerd]=jetbrains-mono-nerd-fonts
+    [wqy-zenhei]=wqy-zenhei-fonts
+    [pipewire-pulse]=pipewire-pulseaudio
+)
+# RHEL-family package names vary between EPEL, Fedora-derived COPRs, and EL10.
+# Resolve these candidates against the enabled repositories before installing.
+declare -A RHEL_CANDIDATES=(
+    # --- IBus IME stack (see GROUP_PKGS[ime] — fcitx5 is unavailable on EL) ---
+    # Engine backend: ibus-rime (EPEL 10 / Fedora official) pulls librime; brise
+    # ships the stock Rime schemas that rime-ice's default.custom.yaml falls back
+    # to, and librime-lua provides /usr/lib64/rime-plugins/librime-lua.so which
+    # rime-ice's Lua filters require (its README asks for it manually on the Red Hat
+    # family). All three are kept as explicit fallback candidates (weak deps are not
+    # guaranteed on every release).
+    [ibus-rime]="ibus-rime librime librime-lua brise"
+    # Panel: ibus Requires it only when a known panel host is present and niri is
+    # not on that list, so the dependency is resolved explicitly. On EL 10 it lives
+    # in CRB (ensure_rhel_repos enables CRB before apps are installed).
+    [ibus-panel]="ibus-panel"
+    # Qt frontend: ibus-qt is Fedora-only (EPEL 10 never built it). Native Qt6
+    # Wayland apps use the compositor's text-input protocol and do not need it;
+    # only XWayland Qt apps degrade to XIM. Falls through to the RHEL_FAIL_HINT.
+    [ibus-qt]="ibus-qt ibus-qt5 ibus-qt4"
+    # Standalone polkit authentication agent. polkit-gnome is retired upstream and
+    # packaged by neither Fedora nor EPEL; lxpolkit was merged into lxsession. Both
+    # mates below are actively maintained and built for Fedora AND EPEL.
+    [polkit-agent]="mate-polkit polkit-kde"
+    # RHEL 10 family REPLACED the standalone power-profiles-daemon package with
+    # tuned-ppd (a PPD API translation daemon on top of tuned; same D-Bus API,
+    # ships tuned-ppd.service which Requires=tuned.service). Fedora still has
+    # the real power-profiles-daemon, so it stays the first candidate.
+    [power-profiles-daemon]="power-profiles-daemon tuned-ppd"
+)
+# COPR usage on the RHEL family — chroot support verified against
+# copr.fedorainfracloud.org (the #1 cause of "dnf copr enable" failures on EL is
+# mapping packages to projects that never built an epel chroot):
+#   yalter/niri              builds fedora-* AND epel-10-*  -> the only usable one
+#   alebastr/sway-extras     builds fedora-* ONLY           -> "Chroot not found" on EL
+#   solopasha/hyprland       builds fedora-rawhide ONLY, owner warns against using it
+# IMPORTANT: the yalter/niri project contains exactly ONE package, "niri"
+# (verified 2026-10 by fetching the project's package list). xwayland-satellite
+# is NOT built there — it goes pm_install -> EPEL retry -> cargo source build.
+# waybar/mako/fuzzel/grim/slurp/copyq/playerctl/brightnessctl therefore go
+# official repo -> EPEL retry -> source build (SOURCE_PKGS); hyprlock/hypridle go
+# official repo (Fedora) -> source build via build_hypr_stack (EL).
+# Fedora never hits this path: everything ships in Fedora official repos.
+declare -A RHEL_COPR_PKG=(
+    [niri]=yalter/niri
+)
+# Packages expected from EPEL on EL10 (Fedora has them in the base repo).
+# After a failed dnf, retry with --enablerepo=epel* before COPR/source.
+RHEL_EPEL_PKGS=(copyq playerctl brightnessctl ibus-rime librime librime-lua brise power-profiles-daemon)
+# Runtime graphics packages required by niri on EL systems.  These are separate
+# from the compiler dependencies below: a minimal Rocky/Alma install can build
+# niri successfully while still lacking Mesa/DRM support for a virtio GPU.
+RHEL_GRAPHICS_RUNTIME=(mesa-dri-drivers mesa-libGL mesa-libEGL mesa-libgbm libdrm mesa-vulkan-drivers)
+# Build/runtime packages used by optional RHEL components. Keep these names
+# separate from RHEL_MAP because they are dependency groups, not app aliases.
+RHEL_OPTIONAL_DEPS=(ibus-rime)
+# Packages with no official RPM -> go to the "manual install" report (value = reason/advice)
+# (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
+declare -A RHEL_MANUAL=(
+)
+# RHEL family: extra hint when dnf install fails (available in Fedora official repo, but not on Rocky/Alma/CentOS Stream)
+# (xwayland-satellite falls back to cargo install automatically)
+# NOTE: no hyprlock/hypridle entries — install_rhel routes them to
+# install_hypr_source via SOURCE_PKGS before this table is ever consulted.
+declare -A RHEL_FAIL_HINT=(
+    # ibus-qt never got an EPEL 10 build. Not fatal: GTK/Qt6-Wayland apps reach
+    # IBus through the IM modules / text-input protocol; only Qt apps running
+    # under XWayland need this plugin and fall back to the XIM protocol that
+    # ibus-daemon -x already provides.
+    [ibus-qt]="EL has no ibus-qt RPM (Fedora does). Harmless: XWayland Qt apps use XIM (ibus-daemon -x), native Wayland Qt apps use text-input."
+)
+# Packages installable via pip as a fallback (common to Arch/RHEL/Debian)
+declare -A PIP_PKGS=(
+    [waypaper]=waypaper
+)
+
+# Packages to build from source when the distro repo has no package.
+# key = arch-style pkg name, value = upstream git URL. Add entries here to extend
+# the "apt/dnf failed -> build from source" fallback (install_debian / install_rhel).
+declare -A SOURCE_PKGS=(
+    [waybar]="https://github.com/Alexays/Waybar"
+    [mako]="https://github.com/emersion/mako"
+    [fuzzel]="https://codeberg.org/dnkl/fuzzel"
+    [copyq]="https://github.com/hluk/CopyQ"
+    [grim]="https://git.sr.ht/~emersion/grim"
+    [slurp]="https://github.com/emersion/slurp"
+    [playerctl]="https://github.com/altdesktop/playerctl"
+    [brightnessctl]="https://github.com/Hummer12007/brightnessctl"
+    [hyprlock]="https://github.com/hyprwm/hyprlock"
+    [hypridle]="https://github.com/hyprwm/hypridle"
+)
+
+# Source builds pinned to a release tag instead of master. Master chases the
+# newest dependency floors — e.g. fuzzel master needs pixman >= 0.46 while EL10
+# ships 0.43.4 — whereas the 1.11.x releases build fine on old distros
+# (verified against the tag's meson.build: pixman unconstrained,
+# wayland-protocols >= 1.32, fcft 3.x via submodule fallback).
+declare -A SOURCE_TAG=(
+    [fuzzel]=1.11.1
+)
+
+# hyprwm stack pinned to release tags — tracking master is fragile: hyprutils
+# master already requires C++26 (EL10's g++ 14 tops out at C++23), components'
+# APIs drift against each other, and a failed clone used to look like an empty
+# log block with no error. Same pins as deb-install.sh (verified combination).
+# Package the pins in a helper so every clone site resolves through one table.
+HYPR_PIN_SCANNER="v0.4.4"
+HYPR_PIN_UTILS="v0.8.4"
+HYPR_PIN_LANG="v0.6.3"
+HYPR_PIN_GRAPHICS="v0.1.3"
+HYPR_PIN_PROTOCOLS="v0.6.4"
+HYPR_PIN_IDLE="v0.1.7"
+HYPR_PIN_LOCK="v0.8.2"
+hypr_git_ref() { # $1 = hyprwm component / binary name -> pinned ref; empty = no pin (fail)
+    case "$1" in
+        hyprwayland-scanner) echo "$HYPR_PIN_SCANNER" ;;
+        hyprutils)           echo "$HYPR_PIN_UTILS" ;;
+        hyprlang)            echo "$HYPR_PIN_LANG" ;;
+        hyprgraphics)        echo "$HYPR_PIN_GRAPHICS" ;;
+        hyprland-protocols)  echo "$HYPR_PIN_PROTOCOLS" ;;
+        hypridle)            echo "$HYPR_PIN_IDLE" ;;
+        hyprlock)            echo "$HYPR_PIN_LOCK" ;;
+        *)                   echo "" ;;
+    esac
+}
+
+# hyprlock / hypridle system build dependencies (RHEL family names).
+# NOTE: upstream migrated hyprlock/hypridle from Rust to C++/CMake (repos no longer
+# contain a Cargo.toml). On distros where the hypr C++ stack (hyprwayland-scanner/
+# hyprutils/hyprlang/hyprgraphics/hyprcursor) is NOT packaged (Rocky/Alma/CentOS
+# Stream), those deps are absent and build_hypr_stack() compiles them from source
+# in dependency order first. Missing entries are tolerated (dnf_install_tolerant),
+# so a package absent on an older release never aborts the whole build-deps step.
+# meson is required because hyprland-protocols is a meson-only project.
+HYPR_BUILD_DEPS_RHEL=(gcc gcc-c++ cmake ninja-build meson pkgconf-pkg-config git wayland-devel wayland-protocols-devel
+    pango-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel libdrm-devel libxkbcommon-devel libxcb-devel
+    cairo-gobject-devel cairo-devel pam-devel pixman-devel libjpeg-turbo-devel libwebp-devel
+    librsvg2-devel file-devel libpng-devel pugixml-devel sdbus-cpp-devel)
+RHEL_SOURCE_BUILD_DEPS=(git gcc gcc-c++ make cmake ninja-build meson pkgconf-pkg-config
+    wayland-devel wayland-protocols-devel libxkbcommon-devel libinput-devel libdrm-devel
+    mesa-libgbm-devel mesa-libEGL-devel mesa-libGL-devel cairo-devel pango-devel
+    gtk3-devel gtk4-devel libadwaita-devel librsvg2-devel libnotify-devel libxcb-devel
+    xcb-util-devel xcb-util-wm-devel xcb-util-image-devel xcb-util-keysyms-devel
+    xcb-util-renderutil-devel xcb-util-cursor-devel libjpeg-turbo-devel libpng-devel
+    libwebp-devel pam-devel sdbus-cpp-devel scdoc)
+# Per-project extra build deps for the source-build fallbacks, on top of
+# RHEL_SOURCE_BUILD_DEPS. All names are tolerant-installed, so a package absent
+# on an older EL release only degrades that one feature instead of aborting.
+#   waybar   — needs far more than the generic GTK list: GUI binding (gtkmm),
+#              layer-shell for the floating bar, logging (spdlog/fmt/jsoncpp),
+#              network (libnl3), bluetooth (bluez), audio (pulse/pipewire),
+#              tray (dbusmenu), media/mpd (libmpdclient), power (upower),
+#              evdev + udev/systemd for some modules.
+#   copyq    — builds against Qt6 (+X11 record extension for clipboard hooks).
+#              CopyQ 16's three OPTIONAL dependency chains are all hard-REQUIRED
+#              by cmake when their option is ON (the default): encryption needs
+#              qca-qt6-devel + qtkeychain-qt6-devel (WITH_QCA_ENCRYPTION), native
+#              notifications need extra-cmake-modules + the KF6 stack
+#              (WITH_NATIVE_NOTIFICATIONS), audio needs miniaudio-devel
+#              (WITH_AUDIO). Each chain's -devel packages are tolerant-installed
+#              below; whichever chain is still missing its package gets turned
+#              OFF via cmake (see install_source_package) instead of failing the
+#              configure — EL has no KF6 stack and may lack the others.
+SRC_DEPS_WAYBAR=(gtkmm30-devel gtkmm4.0-devel gtk-layer-shell-devel jsoncpp-devel
+    spdlog-devel fmt-devel libnl3-devel libevdev-devel systemd-devel
+    pulseaudio-libs-devel pipewire-devel wireplumber-devel bluez-libs-devel
+    libdbusmenu-gtk3-devel libmpdclient-devel upower-devel)
+SRC_DEPS_COPYQ=(qt6-qtbase-devel qt6-qtbase-private-devel qt6-qtdeclarative-devel
+    qt6-qtsvg-devel qt6-qttools-devel qt6-qtwayland-devel qt6-qtmultimedia-devel
+    qca-qt6-devel qtkeychain-qt6-devel extra-cmake-modules miniaudio-devel
+    libXtst-devel libXfixes-devel libX11-devel)
+#   playerctl — GLib + gobject-introspection.
+SRC_DEPS_PLAYERCTL=(glib2-devel gobject-introspection-devel)
+# NOTE: there is deliberately no *source-build* dependency group for the IME any
+# more. The former fcitx5 chain (xcb-imdkit + fcitx5 core/gtk/qt + librime +
+# leveldb/opencc/marisa/trie) existed only because fcitx5 has no EL RPM at all.
+# The IBus stack is fully packaged — ibus/ibus-gtk3/ibus-gtk4/ibus-wayland in
+# AppStream, ibus-rime + librime + brise in EPEL 10 (verified 2026-10 by listing
+# the repo package indexes) — so the whole chain, its pins and its helper
+# functions are gone. See install_ibus_ime().
+
+# System components (from other desktop environments) to disable when restoring
+# on a multi-DE target machine.  Only masked / hidden, NEVER uninstalled — the user
+# can switch back to the other DE at any time.  Each item is existence-checked first
+# so it is safe on Arch (most entries won't exist) and RHEL/Debian alike.
+# type: autostart  — write ~/.config/autostart/<name> with Hidden=true as override + kill process
+#       userunit   — systemctl --user mask <name> + systemctl --user stop <name>
+#       systemunit — systemctl mask <name> + systemctl stop <name>
+DISABLE_SYS=(
+    # --- notification daemons (replaced by mako) ---
+    "userunit|evolution-alarm-notify.service|GNOME notifications"
+    "autostart|evolution-alarm-notify.desktop|GNOME notifications"
+    "userunit|xfce4-notifyd.service|XFCE notifications"
+    "autostart|xfce4-notifyd.desktop|XFCE notifications"
+    
+    # --- GNOME settings daemon (replaced by waybar + power-profiles-daemon) ---
+    "autostart|org.gnome.SettingsDaemon.MediaKeys.desktop|GNOME media keys daemon"
+    "autostart|org.gnome.SettingsDaemon.Power.desktop|GNOME power daemon (replaced by hypridle)"
+    "autostart|org.gnome.SettingsDaemon.Sound.desktop|GNOME sound daemon"
+    "autostart|org.gnome.SettingsDaemon.Clipboard.desktop|GNOME clipboard daemon"
+    "userunit|org.gnome.SettingsDaemon.MediaKeys.service|GNOME media keys service"
+    "userunit|org.gnome.SettingsDaemon.Power.service|GNOME power service (replaced by hypridle)"
+    "userunit|org.gnome.SettingsDaemon.Sound.service|GNOME sound service"
+    "userunit|org.gnome.SettingsDaemon.Clipboard.service|GNOME clipboard service"
+    
+    # --- GNOME screensaver / lock screen (replaced by hyprlock + hypridle) ---
+    "userunit|org.gnome.ScreenSaver.service|GNOME screensaver (replaced by hyprlock)"
+    "autostart|org.gnome.ScreenSaver.desktop|GNOME screensaver (replaced by hyprlock)"
+    "systemunit|gnome-screensaver.service|GNOME screensaver system service (replaced by hyprlock)"
+    
+    # --- GDM / display manager session helpers (niri handles display) ---
+    # Do NOT mask GDM Wayland session on RHEL系 — this causes black screen on login.
+    # Only mask if the user explicitly wants to switch back to another DE.
+    # "systemunit|gdm-launch-environment.service|GDM launch environment"
+    # "systemunit|gdm-x11-session.service|GDM X11 session"
+    # "systemunit|gdm-wayland-session.service|GDM Wayland session"
+    
+    # --- misc GNOME system services ---
+    "systemunit|gnome-remote-desktop.service|GNOME remote desktop"
+    
+    # --- PulseAudio (Ubuntu 24.04+ uses PipeWire by default, but legacy units may exist) ---
+    "userunit|pulseaudio.service|PulseAudio service (replaced by PipeWire)"
+    "userunit|pulseaudio.socket|PulseAudio socket (replaced by PipeWire)"
+    "systemunit|pulseaudio.service|PulseAudio system service (replaced by PipeWire)"
+    
+    # --- XFCE power management (replaced by power-profiles-daemon) ---
+    "userunit|xfce4-power-manager.service|XFCE power manager"
+    "autostart|xfce4-power-manager.desktop|XFCE power manager (replaced by power-profiles-daemon)"
+    
+    # --- KDE power management (replaced by power-profiles-daemon) ---
+    "userunit|org.kde.powerdevil.service|KDE power manager"
+    "autostart|org.kde.powerdevil.desktop|KDE power manager (replaced by power-profiles-daemon)"
+
+    # --- tuned vs power-profiles-daemon (RHEL 8/9) ---
+    # tuned is the RHEL default power-management service and conflicts with
+    # power-profiles-daemon.service (both ride the same power framework), so with
+    # tuned running power-profiles-daemon fails to start. Masked on RHEL (existence-
+    # checked — absent on Arch/Debian, harmless there); user can enable tuned again.
+    "systemunit|tuned.service|tuned (RHEL default power mgmt, conflicts with power-profiles-daemon)"
+    
+    # --- XFCE screen saver (replaced by hyprlock + hypridle) ---
+    "userunit|xfce4-screensaver.service|XFCE screensaver (replaced by hyprlock)"
+    "autostart|xfce4-screensaver.desktop|XFCE screensaver (replaced by hyprlock)"
+    "systemunit|xfce4-screensaver.service|XFCE screensaver system (replaced by hyprlock)"
+    
+    # --- KDE screen locker (replaced by hyprlock + hypridle) ---
+    "systemunit|kscreenlocker.service|KDE screen locker (replaced by hyprlock)"
+    "autostart|kscreenlocker.desktop|KDE screen locker (replaced by hyprlock)"
+)
+
+
+# Summary report collectors
+INSTALLED_PKGS=() SKIPPED_PKGS=() FAILED_PKGS=() MANUAL_ITEMS=() ENABLED_SVCS=()
+DRY_PKGS=() DRY_SVCS=()  # items "that would be executed" in dry-run mode; kept separate to avoid inflated counts
+# logical pkg name -> real RPM name resolved by resolve_rhel_package (e.g.
+# polkit-agent -> mate-polkit); stage_verify audits the REAL name, not the alias.
+declare -A RESOLVED_PKG_NAME=()
+
+
+# 4. restore mode — reproduce desktop on new system (run as root)
+# ==============================================================================
+
+DISTRO_FAMILY=""   # arch | rhel | debian
+DISTRO_ID=""       # os-release ID (e.g. ubuntu, debian, arch)
+DISTRO_ID_LIKE=""  # os-release ID_LIKE (detect Ubuntu-derived distros like openkylin/deepin)
+TARGET_USER=""
+HOME_DIR=""
+
+# --- 4.0 basics ---
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        error "$(_t "restore requires root. Use: sudo ./RHEL-install.sh restore" "restore requires root. Use: sudo ./RHEL-install.sh restore")"
+        exit 1
+    fi
+}
+
+detect_distro() {
+    local id_like="" id=""
+    if [ -f /etc/os-release ]; then
+        id=$(. /etc/os-release; echo "${ID:-}")
+        id_like=$(. /etc/os-release; echo "${ID_LIKE:-}")
+    fi
+    DISTRO_ID="$id"
+    DISTRO_ID_LIKE="$id_like"
+    case " $id $id_like " in
+        *rhel*|*fedora*|*centos*) DISTRO_FAMILY=rhel ;;
+        *)
+            error "This script is for Fedora / Rocky / Alma / CentOS Stream / RHEL (ID=$id ID_LIKE=$id_like). Use ./arch-install.sh or ./deb-install.sh instead."
+            exit 1
+            ;;
+    esac
+    info_kv "$(_t "Distro" "Distro")" "$DISTRO_FAMILY" "(ID=$id)"
+}
+
+pkg_installed() { # $1 = package name
+    rpm -q "$1" &>/dev/null
+}
+
+# Extra dnf --enablerepo flags filled by ensure_rhel_repos (epel/crb/powertools).
+RHEL_DNF_ENABLEREPO=()
+
+pm_install() { # $@ = package names
+    exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$@"
+}
+
+# Install as many packages of a batch as possible; return non-zero only when one or more
+# names are genuinely unavailable. Used for build-deps batches that must be resilient to a
+# few absent names (so a single renamed -devel package no longer aborts the whole build).
+BDEPS_MISSING=()
+# Extra cmake -D args for the current source build (e.g. copyq's -DWITH_QCA=OFF
+# when qca-qt6-devel is unavailable); reset per build by install_source_package.
+CMAKE_EXTRA_ARGS=()
+dnf_install_tolerant() {
+    BDEPS_MISSING=()
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$@"); return "$DRY_RUN_RC"; }
+    if exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$@" 2>>"$LOG_DIR/dnf-errors.log"; then
+        return 0   # whole batch installed
+    fi
+    local p erc
+    for p in "$@"; do
+        erc=0
+        exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$p" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
+        [ "$erc" -ne 0 ] && BDEPS_MISSING+=("$p")
+    done
+    [ ${#BDEPS_MISSING[@]} -eq 0 ]
+}
+
+as_user() {
+    runuser -u "$TARGET_USER" -- "$@"
+}
+
+# Resume support (dry-run does not read/write the progress file).
+# The progress file carries a script-version marker; progress files written by older
+# script versions are ignored (stages are re-run instead of being silently skipped).
+PROGRESS_VERSION="v49"
+stage_done() {
+    [ "$DRY_RUN" -eq 1 ] && return 1
+    grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
+    grep -qx "$1" "$STATE_FILE" 2>/dev/null
+}
+stage_mark() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    # reset stale progress files (missing marker = written by an older script version)
+    if ! grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null; then
+        echo "# eilniri-progress $PROGRESS_VERSION" > "$STATE_FILE"
+    fi
+    grep -qx "$1" "$STATE_FILE" 2>/dev/null || echo "$1" >> "$STATE_FILE"
+}
+
+# Target user detection (simplified detect_target_user)
+detect_target_user() {
+    local uid1000
+    uid1000=$(awk -F: '$3 == 1000 {print $1}' /etc/passwd | head -n 1)
+    mapfile -t HUMAN_USERS < <(awk -F: '$3 >= 1000 && $3 < 60000 {print $1}' /etc/passwd)
+
+    # dry-run: skip interaction, auto-pick UID 1000 / first regular user
+    if [ "$DRY_RUN" -eq 1 ]; then
+        if [ ${#HUMAN_USERS[@]} -gt 0 ]; then
+            TARGET_USER="${uid1000:-${HUMAN_USERS[0]}}"
+            log "$(_t "[DRY-RUN] auto-selecting target user: " "[DRY-RUN] auto-selecting target user: ") $TARGET_USER"
+        else
+            TARGET_USER="eilniri-dryrun"
+            log "$(_t "[DRY-RUN] no regular users found, using placeholder: " "[DRY-RUN] no regular users found, using placeholder: ") $TARGET_USER"
+        fi
+        HOME_DIR=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
+        [ -z "$HOME_DIR" ] && HOME_DIR="/home/$TARGET_USER"
+        export TARGET_USER HOME_DIR
+        info_kv "$(_t "Target User" "Target User")" "$TARGET_USER" "($HOME_DIR)"
+        return
+    fi
+
+    if [ ${#HUMAN_USERS[@]} -gt 0 ]; then
+        local default_user="${uid1000:-${HUMAN_USERS[0]}}"
+        echo -e "   ${H_YELLOW}$(_t ">>> Existing users found, select target:" ">>> Existing users found, select target:")${NC}"
+        local i
+        for i in "${!HUMAN_USERS[@]}"; do
+            local mark=""
+            [ "${HUMAN_USERS[$i]}" = "$default_user" ] && mark="${H_CYAN}*${NC}"
+            echo -e "       [$((i+1))] ${mark}${HUMAN_USERS[$i]}"
+        done
+        echo -e "       [0] ${H_GREEN}$(_t "Create New User ++" "Create New User ++")${NC}"
+
+        local idx
+        while true; do
+            echo -ne "   ${H_CYAN}$(_t "Enter number [0-${#HUMAN_USERS[@]}] (default ${default_user}, 30s timeout): " "Enter number [0-${#HUMAN_USERS[@]}] (default ${default_user}, 30s timeout): ")${NC}"
+            if ! read -t 30 -r idx; then
+                echo ""
+                TARGET_USER="$default_user"
+                log "$(_t "Timeout, auto-selecting: " "Timeout, auto-selecting: ")$TARGET_USER"
+                break
+            fi
+            if [ -z "$idx" ]; then TARGET_USER="$default_user"; break; fi
+            if [ "$idx" = "0" ]; then TARGET_USER=""; break; fi
+            if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#HUMAN_USERS[@]}" ]; then
+                TARGET_USER="${HUMAN_USERS[$((idx-1))]}"
+                break
+            fi
+            warn "$(_t "Invalid input." "Invalid input.")"
+        done
+    fi
+
+    if [ -z "$TARGET_USER" ]; then
+        local new_user
+        while true; do
+            echo -ne "   ${H_GREEN}$(_t "Enter new username: " "Enter new username: ")${NC} "
+            read -r new_user
+            if [[ "$new_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+                if exe useradd -m -s /bin/bash "$new_user"; then
+                    TARGET_USER="$new_user"
+                    warn "Set a password later with: passwd $new_user"
+                    break
+                fi
+                warn "$(_t "User creation failed (may already exist), retry." "User creation failed (may already exist), retry.")"
+                continue
+            fi
+            warn "$(_t "Invalid username format." "Invalid username format.")"
+        done
+    fi
+
+    HOME_DIR=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+    # in dry-run the new user is not created yet; fall back to the default home path when getent is empty
+    [ -z "$HOME_DIR" ] && HOME_DIR="/home/$TARGET_USER"
+    export TARGET_USER HOME_DIR
+    info_kv "$(_t "Target User" "Target User")" "$TARGET_USER" "($HOME_DIR)"
+}
+
+ensure_fzf() {
+    if command -v fzf &>/dev/null; then return 0; fi
+    log "$(_t "Installing interactive menu dependency: fzf ..." "Installing interactive menu dependency: fzf ...")"
+    local _saved_dry="$DRY_RUN"
+    DRY_RUN=0  # fzf is required for interaction, so install it even in --dry-run
+    if pm_install fzf; then
+        DRY_RUN="$_saved_dry"
+        return 0
+    fi
+    # Minimal RHEL images may not have fzf in the enabled repositories. Use the
+    # official release asset as a fallback instead of aborting the whole restore.
+    if [ "$DISTRO_FAMILY" = rhel ] && command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+        local _arch _asset _tmp _work _url _fzf_bin
+        case "$(uname -m)" in
+            x86_64)  _arch=linux_amd64 ;;
+            aarch64) _arch=linux_arm64 ;;
+            *)       _arch="" ;;
+        esac
+        if [ -n "$_arch" ]; then
+            _asset="fzf-${_arch}.tar.gz"
+            _tmp=$(mktemp)
+            _work=$(mktemp -d)
+            register_temp_path "$_tmp"
+            register_temp_path "$_work"
+            _url="https://github.com/junegunn/fzf/releases/latest/download/${_asset}"
+            if download_gh "$_url" "$_tmp" && tar xzf "$_tmp" -C "$_work" 2>/dev/null; then
+                _fzf_bin="$_work/fzf"
+                if [ -x "$_fzf_bin" ]; then
+                    exe install -Dm755 "$_fzf_bin" /usr/local/bin/fzf
+                    if command -v fzf >/dev/null 2>&1; then
+                        DRY_RUN="$_saved_dry"
+                        log "$(_t "Installed fzf from the official release archive." "Installed fzf from the official release archive.")"
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+    fi
+    DRY_RUN="$_saved_dry"
+    # Never abort the whole restore over a UI nicety: every fzf consumer
+    # (fzf_multi) falls back to plain numbered menus when fzf is
+    # absent, so the worst case is a less pretty install, not a dead one.
+    warn "$(_t "fzf unavailable — falling back to plain numbered menus. Install it later with: dnf install fzf" "fzf unavailable — falling back to plain numbered menus. Install it later with: dnf install fzf")"
+    return 1
+}
+
+# Plain numbered menu used when fzf is unavailable. stdin = candidate lines
+# ("col1\tcol2..."), stdout = the selected lines; prompts go to stderr so the
+# command-substitution callers only ever receive the selection.
+_menu_numbered() { # $1 = multi|single, $2 = header
+    local mode="$1" header="$2"
+    local -a lines=()
+    mapfile -t lines || return 1
+    [ ${#lines[@]} -eq 0 ] && return 1
+    local i num tok sel
+    {
+        echo ""
+        echo "  $header"
+        echo "  ------------------------------------------------------------"
+        for i in "${!lines[@]}"; do
+            printf '  %3d) %s\n' "$((i + 1))" "$(printf '%s' "${lines[$i]}" | cut -f1,2 | tr '\t' '  ')"
+        done
+        if [ "$mode" = multi ]; then
+            printf '  输入序号（空格分隔；直接回车=全选）: '
+        else
+            printf '  输入序号（直接回车=1）: '
+        fi
+    } >&2
+    sel=""
+    if { :; } </dev/tty 2>/dev/null; then   # only prompt when a real TTY exists
+        read -r sel </dev/tty || sel=""
+    fi
+    if [ "$mode" = multi ] && [ -z "$sel" ]; then
+        printf '%s\n' "${lines[@]}"
+        return 0
+    fi
+    [ "$mode" = single ] && [ -z "$sel" ] && sel="1"
+    local -a picks=()
+    for tok in $sel; do
+        [[ "$tok" =~ ^[0-9]+$ ]] || continue
+        num=$((tok))
+        (("$num" >= 1 && "$num" <= ${#lines[@]})) || continue
+        picks+=("${lines[$((num - 1))]}")
+    done
+    [ ${#picks[@]} -eq 0 ] && return 1
+    printf '%s\n' "${picks[@]}"
+}
+
+# fzf multi-select (see 99-apps.sh: select all by default / TAB toggle / Ctrl-A select all / Ctrl-D deselect all)
+#  stdin: lines of "field1\tfield2"; stdout: lines selected by the user
+fzf_multi() {
+    if command -v fzf >/dev/null 2>&1; then
+        fzf --multi --layout=reverse --border=rounded --margin=1,2 \
+            --delimiter=$'\t' --with-nth=1,2 \
+            --bind 'load:select-all' \
+            --bind 'ctrl-a:select-all,ctrl-d:deselect-all,j:down,k:up' \
+            --pointer=">" --marker="* " --ansi \
+            --header="$1"
+    else
+        _menu_numbered multi "$1"
+    fi
+}
+
+# Resolve the DRM connector at session startup, after GDM has handed the device
+# to the user session. Installation-time detection can see a different connector
+# (or no connector at all) on virtual machines.
+# IMPORTANT: the file MUST be installed as /usr/local/bin/niri-session — that is the
+# exact bare name niri.desktop's "Exec=niri-session" tells the display manager to run.
+# The previous version only wrote "eilniri-niri-session" (a name nothing ever calls)
+# plus "niri-session.real", so logging in from GDM found no niri-session in PATH and
+# aborted immediately with no output, while a TTY login still worked (the shell had
+# already resolved the command). The non-standard name is kept as a compat alias.
+install_niri_output_wrapper() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _wrapper=/usr/local/bin/niri-session
+    local _real=/usr/local/bin/niri-session.real
+    # The wrapper delegates to the upstream script; if the build never installed it
+    # (distro package layout, interrupted run), fall back to an already-working
+    # niri-session from the system so login cannot end up with no target at all.
+    local _delegate="$_real"
+    if [ ! -x "$_real" ]; then
+        local _sys
+        for _sys in /usr/bin/niri-session /usr/local/bin/niri-session.orig; do
+            [ -x "$_sys" ] && { _delegate="$_sys"; break; }
+        done
+    fi
+    cat > "$_wrapper" <<WRAPEOF
+#!/usr/bin/env bash
+set -u
+
+# eilNiri: niri session entry point (niri.desktop -> Exec=niri-session).
+# Sets the VM-safe renderer/cursor env and pins the output mode, then hands over
+# to the upstream niri-session, which starts niri through the systemd user units.
+# Regenerated on every restore; edits here are overwritten.
+
+# /usr/local/bin is NOT on the default PATH on RHEL/Debian, but both "niri" (which
+# niri.service runs as ExecStart=niri --session) and this script live there.
+PATH="/usr/local/bin:/usr/local/sbin:\$PATH"
+export PATH
+
+cfg="\${XDG_CONFIG_HOME:-\$HOME/.config}/niri/config.kdl"
+tmp="\${cfg}.eilniri-output.\$\$"
+export WLR_NO_HARDWARE_CURSORS=1
+export WLR_RENDERER_ALLOW_SOFTWARE=1
+out=""; mode=""
+for status in /sys/class/drm/card*-*/status; do
+    [ -f "\$status" ] || continue
+    [ "\$(<"\$status")" = connected ] || continue
+    dir=\${status%/status}
+    candidate=\${dir##*/}
+    candidate=\${candidate#card[0-9]-}
+    candidate_mode=\$(sed -n '1p' "\$dir/modes" 2>/dev/null || true)
+    [ -n "\$candidate" ] && [ -n "\$candidate_mode" ] || continue
+    out="\$candidate"; mode="\$candidate_mode"; break
+done
+
+if [ -n "\$out" ] && [ -n "\$mode" ] && [ -f "\$cfg" ]; then
+    w=\${mode%x*}; h=\${mode#*x}; mode_line="mode \\"\${w}x\${h}@60\\""
+    awk -v output="\$out" -v mode_line="\$mode_line" '
+        BEGIN { replaced=0; inside=0 }
+        !replaced && \$0 ~ /^[[:space:]]*output[[:space:]]+"/ {
+            print "output \\"" output "\\" {"; print "    " mode_line
+            replaced=1; inside=1; next
+        }
+        inside && \$0 ~ /^[[:space:]]*}/ { print "}"; inside=0; next }
+        inside { next }
+        { print }
+    ' "\$cfg" > "\$tmp" && mv "\$tmp" "\$cfg"
+fi
+
+delegate="$_delegate"
+if [ ! -x "\$delegate" ]; then
+    for c in niri-session.real /usr/bin/niri-session /usr/local/bin/niri-session.real; do
+        [ -x "\$c" ] && { delegate="\$c"; break; }
+    done
+fi
+if [ ! -x "\$delegate" ]; then
+    echo "eilNiri: no niri-session implementation found" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Session log. This MUST NEVER abort the session:
+#   "exec >>\$log" fails when the log file cannot be created, and bash then
+#   exits at that line, which is exactly how a display-manager login died with
+#   a bare "niri-session: line 58" and no session at all. The directory is
+#   created by the installer as root, so a stale root-owned
+#   ~/.local/state/eilNiri made every user login fail while a TTY login still
+#   worked (different state dir / already-owned files).
+# Strategy: try the preferred dir, fall back to XDG_RUNTIME_DIR, /tmp, then run
+# with no log at all. Always continue.
+# ---------------------------------------------------------------------------
+state_root="\${XDG_STATE_HOME:-\$HOME/.local/state}"
+logfile=""
+for d in "\$state_root/eilNiri" "\${XDG_RUNTIME_DIR:-/tmp}/eilNiri-\$(id -u)" "/tmp/eilNiri-\$(id -u)"; do
+    # -p fails on a root-owned dir; a writable+depth-1 dir is what we need.
+    if mkdir -p "\$d" 2>/dev/null && [ -w "\$d" ]; then
+        logfile="\$d/session.log"
+        # Probe the file itself: -w on the dir is not enough when session.log is
+        # root-owned from an earlier installer run.
+        if { : >>"\$logfile"; } 2>/dev/null; then
+            break
+        fi
+        logfile=""
+    fi
+done
+
+if [ -n "\$logfile" ]; then
+    printf '\n=== niri-session start %s (delegate=%s) ===\n' \
+        "\$(date '+%F %T')" "\$delegate" >>"\$logfile" 2>/dev/null || logfile=""
+fi
+
+if [ -n "\$logfile" ]; then
+    exec "\$delegate" "\$@" >>"\$logfile" 2>&1
+fi
+# No usable log file: run anyway rather than dying here.
+echo "eilNiri: session log not writable; starting niri without logging" >&2
+exec "\$delegate" "\$@"
+WRAPEOF
+    chmod 755 "$_wrapper" 2>/dev/null || true
+    # Compat alias (older docs / manual invocations used this name).
+    ln -sf "$_wrapper" /usr/local/bin/eilniri-niri-session 2>/dev/null || true
+}
+
+# --- Debian/Ubuntu apt mirror switch (offered when apt-get update or install fails ---
+# with 404 / 无法下载 / connection errors).  Rewrites the apt host in the source
+# files (both deb-format .list and deb822 .sources) to a selected mirror, backs up
+# the originals, then reruns apt-get update and VERIFIES the previously-missing
+# .deb is actually served by the new mirror (curl probe).
+# NOTE: fzf may not be installed yet at this point (ensure_fzf runs after
+# preflight, and apt being broken can block its install), so this falls back to a
+# plain numbered prompt when fzf is absent.
+_rhel_refresh_enablerepo() {
+    RHEL_DNF_ENABLEREPO=()
+    local _ids _id
+    # repolist WITHOUT --all: only ENABLED repos. Using --all resurrected repos
+    # we deliberately disabled (epel-testing) as explicit --enablerepo= flags,
+    # re-triggering their metadata failures on every single dnf call.
+    _ids=$(dnf repolist 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /(^epel|crb|powertools|codeready|copr)/ {print $1}')
+    for _id in $_ids; do
+        RHEL_DNF_ENABLEREPO+=("--enablerepo=$_id")
+    done
+}
+
+resolve_rhel_package() { # $1 = logical package name; prints an installable candidate
+    local logical="$1" candidate
+    for candidate in ${RHEL_CANDIDATES[$logical]:-$logical}; do
+        rpm -q "$candidate" >/dev/null 2>&1 && { printf '%s\n' "$candidate"; return 0; }
+        if dnf repoquery --available --qf '%{name}' "$candidate" 2>/dev/null \
+            | grep -Fxq "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Enable EPEL + CRB/PowerTools on RHEL family so -devel packages (and EPEL apps)
+# are available. Rocky/Alma 8 use "powertools"; 9/10 and CentOS Stream use "crb";
+# RHEL itself uses CodeReady Builder / RHUI IDs. Fedora already has most packages
+# in the official repos — extra enables are best-effort and ignored if absent.
+ensure_rhel_repos() {
+    [ "$DRY_RUN" -eq 1 ] && { log "$(_t "[DRY-RUN] would enable EPEL + CRB/PowerTools repos." "[DRY-RUN] would enable EPEL + CRB/PowerTools repos.")"; return 0; }
+    if [ ! -f /etc/yum.repos.d/epel.repo ] && ! rpm -q epel-release >/dev/null 2>&1; then
+        log "$(_t "Enabling EPEL..." "Enabling EPEL...")"
+        # NOTE: stderr goes to the error log instead of /dev/null. On EL10 the most
+        # common failure is the EPEL GPG key / metalink not being usable yet, and
+        # swallowing that message left "EPEL is NOT active" as the only clue.
+        if ! exe dnf install -y epel-release 2>>"$LOG_DIR/dnf-errors.log"; then
+            # dnf path failed (mirror/CDN trouble): grab the epel-release RPM
+            # straight from a CN mirror of the EPEL Everything repo.
+            warn "$(_t "dnf epel-release failed — trying direct RPM from CN mirrors..." "dnf epel-release failed — trying direct RPM from CN mirrors...")"
+            local _maj _mirror _erpm
+            _maj=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
+            for _mirror in "https://mirrors.aliyun.com/epel" "https://mirrors.tuna.tsinghua.edu.cn/epel" "https://mirrors.ustc.edu.cn/epel"; do
+                _erpm=$(curl -fsSL --connect-timeout 8 --max-time 30 "${_mirror}/${_maj}/Everything/x86_64/Packages/e/" 2>/dev/null \
+                    | grep -oE 'epel-release-[0-9][^"]*\.noarch\.rpm' | sort -V | tail -1)
+                if [ -n "$_erpm" ] && exe dnf install -y "${_mirror}/${_maj}/Everything/x86_64/Packages/e/${_erpm}" 2>>"$LOG_DIR/dnf-errors.log"; then
+                    break
+                fi
+                _erpm=""
+            done
+            [ -z "$_erpm" ] && warn "$(_t "EPEL enable failed; -devel/EPEL packages will be unavailable and source builds will fail." "EPEL enable failed; -devel/EPEL packages will be unavailable and source builds will fail.")"
+        fi
+    fi
+    if ! command -v dnf >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! dnf config-manager --help >/dev/null 2>&1; then
+        dnf install -y dnf-plugins-core 2>/dev/null || true
+    fi
+    # *-testing repos (epel-testing, ...) often ship incomplete metadata on fresh
+    # minor releases, and dnf aborts EVERY install while ANY enabled repo fails
+    # to download its metadata ("为仓库 ... 下载元数据失败"). This install never
+    # wants -testing packages — disable them idempotently so a broken testing
+    # mirror can never wedge the whole restore.
+    local _trepo _tdisabled=0
+    for _trepo in $(dnf repolist --all 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /-testing(\/|$)/ {print $1}'); do
+        dnf config-manager setopt "${_trepo}.enabled=0" >/dev/null 2>&1 || true
+        dnf config-manager --set-disabled "$_trepo" >/dev/null 2>&1 || true
+        _tdisabled=1
+        log "$(_t "Disabled -testing repo (avoids dnf metadata failures): " "Disabled -testing repo (avoids dnf metadata failures): ") $_trepo"
+    done
+    [ "$_tdisabled" -eq 1 ] && dnf clean all >/dev/null 2>/dev/null || true
+    log "$(_t "Enabling CRB / PowerTools (CodeReady Builder)..." "Enabling CRB / PowerTools (CodeReady Builder)...")"
+    # Rocky ships a `crb enable` helper; try it first.
+    command -v crb >/dev/null 2>&1 && crb enable >/dev/null 2>&1 || true
+    # dnf5
+    dnf config-manager setopt crb.enabled=1 2>/dev/null || true
+    dnf config-manager setopt powertools.enabled=1 2>/dev/null || true
+    # dnf4 — try every historical ID; unknown IDs fail quietly
+    local _rid
+    for _rid in crb CRB powertools PowerTools \
+        codeready-builder-for-rhel-8-rhui-rpms \
+        codeready-builder-for-rhel-9-rhui-rpms \
+        codeready-builder-for-rhel-10-rhui-rpms; do
+        dnf config-manager --set-enabled "$_rid" 2>/dev/null || true
+    done
+    dnf clean all >/dev/null 2>/dev/null || true
+    dnf makecache --refresh >/dev/null 2>&1 || true
+    _rhel_refresh_enablerepo
+    # Report EPEL and CRB separately: EPEL carries the app packages, CRB the
+    # -devel headers every source build needs. Missing either one degrades a
+    # different slice of the install, so say WHICH one is missing.
+    if dnf repolist 2>/dev/null | grep -qiE '(^|/)epel'; then
+        log "$(_t "Extra repos active:" "Extra repos active:") $(dnf repolist 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /(epel|crb|powertools|codeready)/ {printf "%s ", $1}')"
+    else
+        # Self-heal before giving up: the package can be installed while the repo
+        # never becomes active — epel.repo exists but `enabled=0` (cloud images,
+        # copied repo files), or the EPEL GPG key could not be imported because
+        # CRB was off while it was downloaded. Handle both, then re-check.
+        if [ -f /etc/yum.repos.d/epel.repo ]; then
+            _any_disabled=$(awk -F= '/^\[/{sec=$0} /^enabled=0/{if (sec ~ /epel/) print $0}' \
+                /etc/yum.repos.d/epel.repo 2>/dev/null | head -1)
+            sed -i '/^\[epel\]$/,/^\[/ s/^enabled=0$/enabled=1/' /etc/yum.repos.d/epel.repo 2>/dev/null || true
+            dnf config-manager setopt epel.enabled=1 >/dev/null 2>&1 || true
+            dnf config-manager --set-enabled epel >/dev/null 2>&1 || true
+            [ -n "$_any_disabled" ] && log "$(_t "epel.repo was disabled — re-enabled it" "epel.repo was disabled — re-enabled it")"
+            # EPEL 10's GPG key lives in the epel-release payload; without CRB the
+            # import can have been skipped, which makes every EPEL package fail.
+            if command -v rpm >/dev/null 2>&1 && ! rpm -q gpg-pubkey --qf '%{summary}\n' 2>/dev/null | grep -qi 'epel'; then
+                for _ekey in /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-* /usr/share/doc/epel-release/RPM-GPG-KEY-EPEL-*; do
+                    [ -f "$_ekey" ] || continue
+                    rpm --import "$_ekey" 2>>"$LOG_DIR/dnf-errors.log" && \
+                        log "$(_t "Imported EPEL GPG key: " "Imported EPEL GPG key: ")$_ekey"
+                    break
+                done
+            fi
+            dnf clean all >/dev/null 2>&1 || true
+            dnf makecache --refresh >/dev/null 2>&1 || true
+        fi
+        if dnf repolist 2>/dev/null | grep -qiE '(^|/)epel'; then
+            log "$(_t "EPEL recovered and is now active." "EPEL recovered and is now active.")"
+        else
+            # Last resort: import EPEL's signing key directly and retry the
+            # package once. A missing key is the classic reason an otherwise
+            # installed EPEL repo refuses every package.
+            if command -v rpm >/dev/null 2>&1 && ! rpm -q gpg-pubkey --qf '%{summary}\n' 2>/dev/null | grep -qi 'epel'; then
+                if curl -fsSL --connect-timeout 8 --max-time 20 \
+                        "https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-10" 2>/dev/null \
+                        | rpm --import /dev/stdin 2>>"$LOG_DIR/dnf-errors.log"; then
+                    log "$(_t "Imported the EPEL 10 signing key" "Imported the EPEL 10 signing key")"
+                    dnf clean all >/dev/null 2>&1 || true
+                    dnf makecache --refresh >/dev/null 2>&1 || true
+                fi
+            fi
+            if dnf repolist 2>/dev/null | grep -qiE '(^|/)epel'; then
+                log "$(_t "EPEL recovered after importing its signing key." "EPEL recovered after importing its signing key.")"
+            else
+                warn "$(_t "EPEL is NOT active — packages that only EPEL carries (e.g. ibus-rime on EL10) will fall back or fail. Cause: see $LOG_DIR/dnf-errors.log" "EPEL is NOT active — EPEL-only packages will fall back or fail. See the error log.")"
+                MANUAL_ITEMS+=("EPEL 仓库未启用 — 手动执行 'sudo dnf install -y epel-release && sudo dnf clean all && sudo dnf makecache'；若报 GPG 错误: 'sudo rpm --import https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-10'。装好后重跑 restore 即可补上 ibus-rime")
+            fi
+        fi
+    fi
+    if [ "${DISTRO_ID:-}" != fedora ] \
+        && ! dnf repolist 2>/dev/null | grep -qiE 'crb|powertools|codeready'; then
+        warn "$(_t "CRB/PowerTools is NOT active — source builds (waybar/fuzzel/hyprlock/...) will fail for lack of -devel packages. Try: dnf config-manager --set-enabled crb" "CRB/PowerTools is NOT active — source builds will fail for lack of -devel packages. Try: dnf config-manager --set-enabled crb")"
+        MANUAL_ITEMS+=("CRB/PowerTools 仓库未启用 — 源码编译（waybar/fuzzel/hyprlock 等）必需；运行 'dnf config-manager --set-enabled crb'（Rocky 8 为 powertools）后重跑")
+    fi
+    # EPEL being *enabled* is not enough: a stale/unsynced mirror or a releasever
+    # mismatch leaves the repo visible but EMPTY for this system — every EPEL
+    # package then fails with "没有任何匹配: <pkg>" (observed on EL10: scdoc,
+    # dav1d-devel, copyq all missing at once). Probe a small package EPEL 10
+    # definitely carries so this is caught HERE with actionable advice instead
+    # of cascading as dozens of unrelated failures later.
+    if dnf repolist 2>/dev/null | grep -qiE '(^|/)epel'; then
+        if ! dnf -q --disablerepo='*' --enablerepo='epel*' list available scdoc >/dev/null 2>&1; then
+            warn "$(_t "EPEL repo is enabled but NO packages can be queried from it (probed: scdoc) — metadata is broken or releasever does not match. Fix and rerun, or EPEL apps (copyq/playerctl/brightnessctl) and -devel builds will all fail." "EPEL repo is enabled but NO packages can be queried from it (probed: scdoc).")"
+            MANUAL_ITEMS+=("EPEL 仓库已启用但查不到任何包（探测 scdoc 失败）——metadata 损坏或 releasever 不匹配。检查 'dnf repolist -v epel' 与 /etc/yum.repos.d/epel.repo 的 baseurl/\$releasever，修正后执行 'dnf clean all && dnf makecache' 再重跑 restore")
+        fi
+    fi
+    # Fedora already has niri/waybar/hypr* in official repos — skip COPR there.
+    # Rocky/Alma/CentOS Stream 10: enable COPRs once so later dnf installs succeed.
+    if [ "${DISTRO_ID:-}" != fedora ]; then
+        ensure_rhel_coprs
+    fi
+}
+
+# COPR chroot for the running system: epel-<major>-<arch> on the RHEL family,
+# nothing on Fedora (COPR is never used there — official repos cover everything).
+rhel_copr_chroot() {
+    [ "${DISTRO_ID:-}" = fedora ] && return 0
+    local _maj _arch
+    _maj=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
+    _arch=$(uname -m)
+    [ -n "$_maj" ] && [ -n "$_arch" ] && printf 'epel-%s-%s\n' "$_maj" "$_arch"
+}
+
+# Enable the COPRs that carry packages missing from base/EPEL on EL. Idempotent:
+# already-enabled COPRs succeed quickly. Before touching dnf, every candidate is
+# probed over HTTP for THIS system's chroot (e.g. epel-10-x86_64) — a 404 means
+# the project never built for it, and we skip cleanly instead of letting
+# `dnf copr enable` die with "Chroot not found" (the classic EL failure). The
+# explicit chroot is also passed to dnf so its auto-detection can never guess wrong.
+ensure_rhel_coprs() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    if ! dnf copr --help >/dev/null 2>&1; then
+        dnf install -y dnf-plugins-core 2>/dev/null || true
+    fi
+    if ! dnf copr --help >/dev/null 2>&1; then
+        warn "$(_t "dnf copr not available — EL packages missing from base/EPEL will fall back to source builds." "dnf copr not available — EL packages missing from base/EPEL will fall back to source builds.")"
+        return 1
+    fi
+    local _copr _copr_log="$LOG_DIR/copr.log" _chroot _probe_url
+    _chroot=$(rhel_copr_chroot)
+    if [ -z "$_chroot" ]; then
+        warn "$(_t "Cannot determine the EPEL COPR chroot for this system — skipping COPR; source fallback will be used." "Cannot determine the EPEL COPR chroot for this system — skipping COPR; source fallback will be used.")"
+        return 1
+    fi
+    for _copr in yalter/niri; do
+        _probe_url="https://copr.fedorainfracloud.org/coprs/${_copr}/repo/${_chroot}/dnf.repo"
+        if ! curl -fsSL --connect-timeout 10 --max-time 30 -o /dev/null "$_probe_url" 2>/dev/null; then
+            warn "$(_t "COPR " "COPR ") $_copr $(_t "has no " "has no ") $_chroot $(_t "chroot (or copr.fedorainfracloud.org is unreachable) — skipping; source-build fallback will be used." "chroot (or copr.fedorainfracloud.org is unreachable) — skipping; source-build fallback will be used.")"
+            continue
+        fi
+        log "$(_t "Enabling COPR " "Enabling COPR ") $_copr $(_t "(chroot " "(chroot ") $_chroot) ..."
+        if dnf -y copr enable "$_copr" "$_chroot" >>"$_copr_log" 2>&1 || dnf copr enable -y "$_copr" "$_chroot" >>"$_copr_log" 2>&1; then
+            log "$(_t "COPR enabled: " "COPR enabled: ") $_copr ($_chroot)"
+        else
+            warn "$(_t "COPR enable failed; source fallback will be used: " "COPR enable failed; source fallback will be used: ") $_copr"
+        fi
+    done
+    dnf makecache --refresh >/dev/null 2>&1 || true
+    _rhel_refresh_enablerepo
+    # Availability check: "copr enable" succeeding only means the REPO is known to
+    # dnf — the chroot may still build no usable packages. The yalter/niri project
+    # builds exactly ONE package (niri); xwayland-satellite is not in it (verified
+    # 2026-10), so only niri is probed here — xwayland-satellite always takes the
+    # cargo source-build path and warning about it every run is just noise.
+    if dnf repolist 2>/dev/null | grep -qi 'yalter'; then
+        if dnf -q --disablerepo='*' --enablerepo='*yalter*' list available niri >/dev/null 2>&1; then
+            log "$(_t "COPR package check OK: " "COPR package check OK: ") niri $(_t "is available from yalter/niri" "is available from yalter/niri")"
+        else
+            warn "$(_t "COPR yalter/niri is enabled but 'niri' cannot be queried from it (chroot may have no current build) — it will fall back to the cargo source build." "COPR yalter/niri is enabled but 'niri' cannot be queried from it.")"
+            MANUAL_ITEMS+=("COPR yalter/niri 已启用但查不到 niri（该 chroot 可能没有当前构建）——将自动走 cargo 源码编译兜底；若想用 COPR 包请检查 https://copr.fedorainfracloud.org/coprs/yalter/niri/ 的构建状态后重跑")
+        fi
+    fi
+}
+
+ensure_rhel_graphics_runtime() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("${RHEL_GRAPHICS_RUNTIME[@]}")
+        return "$DRY_RUN_RC"
+    fi
+    local _pkg _missing=()
+    for _pkg in "${RHEL_GRAPHICS_RUNTIME[@]}"; do
+        pkg_installed "$_pkg" || _missing+=("$_pkg")
+    done
+    [ ${#_missing[@]} -eq 0 ] && return 0
+    log "$(_t "Installing RHEL graphics runtime for niri..." "Installing RHEL graphics runtime for niri...")"
+    pm_install "${_missing[@]}" || warn "$(_t "Some Mesa/DRM runtime packages could not be installed; niri may not start on a virtual GPU." "Some Mesa/DRM runtime packages could not be installed; niri may not start on a virtual GPU.")"
+    return 0
+}
+
+stage_preflight() {
+    section "$(_t "Pre-Flight" "Pre-Flight")" "$(_t "System Update" "System Update")"
+    if stage_done preflight; then
+        log "$(_t "Pre-flight done, skipping (delete .replicate_progress to force rerun)." "Pre-flight done, skipping (delete .replicate_progress to force rerun).")"
+        return
+    fi
+            ensure_rhel_repos   # enable EPEL + CRB so -devel build packages are available
+            ensure_rhel_graphics_runtime
+            # Install the Rime engine before the optional dictionary stage. The
+            # dictionary is useless without it and must not hide the real dnf error.
+            if printf '%s\n' "${REPO_SEL[@]+${REPO_SEL[@]}}" | grep -qx 'rime-ice-pinyin-git'; then
+                dnf_install_tolerant "${RHEL_OPTIONAL_DEPS[@]}" || true
+            fi
+            if [ "$DRY_RUN" -eq 1 ]; then
+                log "$(_t "[DRY-RUN] Skipping system upgrade." "[DRY-RUN] Skipping system upgrade.")"
+            elif ! exe dnf -y upgrade --refresh; then
+                warn "$(_t "System update partially failed, continuing." "System update partially failed, continuing.")"
+            fi
+        success "$(_t "System ready." "System ready.")"
+    stage_mark preflight
+}
+
+# --- 4.2 app selection ---
+
+REPO_UNIVERSE=()
+
+load_app_universe() {
+    # Built-in authoritative package list (no snapshot/pkglist in the snapshot-free mode)
+    local g raw
+    for g in "${GROUP_ORDER[@]}"; do
+        for raw in ${GROUP_PKGS[$g]:-}; do
+            REPO_UNIVERSE+=("$raw")
+        done
+    done
+}
+
+group_tag() { # $1 = pkg
+    local g="${PKG_GROUP[$1]:-}"
+    if [ -n "$g" ]; then
+        echo "[${GROUP_EN[$g]}]"
+    else
+        echo "[Snapshot]"
+    fi
+}
+
+stage_apps_select() {
+    section "$(_t "App Selection" "App Selection")" "$(_t "TAB toggle | Select All | Ctrl-D deselect | Enter" "TAB toggle | Select All | Ctrl-D deselect | Enter")"
+    load_app_universe
+
+    # Chinese component selection
+    # The Chinese IME is IBus + Rime on this family (engine = ibus-rime from EPEL,
+    # dictionary = rime-ice). fcitx5 exists in no EL repository, so it is NOT an
+    # option here — that is the whole reason the script uses IBus. ibus / ibus-gtk3
+    # / ibus-gtk4 / ibus-wayland live in AppStream (base OS), only the Rime engine
+    # needs EPEL — which ensure_rhel_repos has already enabled at this point.
+    info_kv "$(_t "Chinese IME" "Chinese IME")" "IBus (rime, 或 libpinyin)" "$(_t "fcitx5 has no EL package; the engine is chosen from what the repos provide" "fcitx5 has no EL package; the engine is chosen from what the repos provide")"
+    if ! confirm "$(_t "Install Chinese IME (ibus+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):" "Install Chinese IME (ibus+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):")" "Y" 15; then
+        local _cn_exclude=(ibus ibus-gtk3 ibus-gtk4 ibus-qt ibus-rime rime-ice-pinyin-git wqy-zenhei)
+        local _tmp_arr=() _p
+        for _p in ${REPO_UNIVERSE[@]+"${REPO_UNIVERSE[@]}"}; do
+            local _keep=1 _ex
+            for _ex in "${_cn_exclude[@]}"; do
+                [ "$_p" = "$_ex" ] && { _keep=0; break; }
+            done
+            [ "$_keep" -eq 1 ] && _tmp_arr+=("$_p")
+        done
+        REPO_UNIVERSE=("${_tmp_arr[@]}")
+    fi
+
+    local lines=() p
+    for p in ${REPO_UNIVERSE[@]+"${REPO_UNIVERSE[@]}"}; do
+        lines+=("$p"$'\t'"$(group_tag "$p")")
+    done
+
+    # dry-run: skip fzf interaction, select everything (same as the fzf load:select-all default)
+    if [ "$DRY_RUN" -eq 1 ]; then
+        REPO_SEL=("${REPO_UNIVERSE[@]}")
+        log "$(_t "[DRY-RUN] auto-selected all: ${#REPO_SEL[@]} packages" "[DRY-RUN] auto-selected all: ${#REPO_SEL[@]} packages")"
+        info_kv "$(_t "Selected" "Selected")" "${#REPO_SEL[@]} packages" ""
+        return 0
+    fi
+
+    # Empty list guard: fzf with empty input returns non-zero silently, so skip to avoid a false "user aborted"
+    if [ ${#lines[@]} -eq 0 ]; then
+        warn "$(_t "Package list is empty, skipping app install." "Package list is empty, skipping app install.")"
+        return 1
+    fi
+
+    local selected
+    selected=$(printf "%s\n" "${lines[@]}" | fzf_multi " Select niri suite apps to install ") || {
+        error "$(_t "User aborted selection." "User aborted selection.")"
+        exit 130
+    }
+    if [ -z "$selected" ]; then
+        warn "$(_t "No apps selected, skipping install." "No apps selected, skipping install.")"
+        return 1
+    fi
+
+    REPO_SEL=()
+    local raw
+    while IFS= read -r raw; do
+        local name
+        name=$(echo "$raw" | cut -f1 -d"$(printf '\t')" | xargs)
+        [ -z "$name" ] && continue
+        REPO_SEL+=("$name")
+    done <<< "$selected"
+    info_kv "$(_t "Selected" "Selected")" "${#REPO_SEL[@]} packages" ""
+    return 0
+}
+
+# --- 4.3 app install ---
+
+install_rhel() {
+    local p name erc resolved
+    local all=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
+
+    # pip fallback pre-check
+    local has_pip_target=0
+    for p in "${all[@]}"; do
+        if [ -n "${PIP_PKGS[$p]:-}" ]; then has_pip_target=1; break; fi
+    done
+    if [ "$has_pip_target" -eq 1 ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            DRY_PKGS+=("python3-pip")
+        else
+            pm_install python3-pip
+        fi
+        if [ "$DRY_RUN" -eq 0 ] && ! command -v pip3 &>/dev/null; then
+            MANUAL_ITEMS+=("python3-pip — pip3 not installed, run: sudo dnf install python3-pip")
+        fi
+    fi
+
+    for p in ${all[@]+"${all[@]}"}; do
+        # awww/satty: no RPM in any RHEL-family repo (prebuilt binary / cargo build)
+        if [ "$p" = "awww" ]; then
+            install_awww
+            continue
+        fi
+        if [ "$p" = "satty" ]; then
+            install_satty
+            continue
+        fi
+        # rime-ice: no RPM; deploy the dictionary from GitHub (the ibus-rime package
+        # from EPEL provides the engine that consumes it)
+        if [ "$p" = "rime-ice-pinyin-git" ]; then
+            install_rime_ice
+            continue
+        fi
+        # EL has no fcitx5 packages at all (not in EPEL, no COPR epel-10 chroot —
+        # verified 2026-10), so the IME is IBus instead: ibus/ibus-gtk3/ibus-gtk4
+        # come from AppStream and the Rime engine (ibus-rime + librime + brise)
+        # from EPEL. The whole stack is RPM-packaged — nothing is compiled any
+        # more. install_ibus_ime runs ONCE, from the "ibus" entry, and covers the
+        # rest of the family (gtk/qt frontends, the rime engine and the non-
+        # interactive dconf/engine configuration); the other members are only
+        # bookkeeping here so the work is not repeated four times.
+        if [[ "$p" =~ ^ibus($|-) ]]; then
+            case "$p" in
+                ibus) install_ibus_ime ;;
+                *)    SKIPPED_PKGS+=("$p (随 ibus 栈统一安装/配置)") ;;
+            esac
+            continue
+        fi
+        if [ -n "${RHEL_MANUAL[$p]:-}" ]; then
+            MANUAL_ITEMS+=("$p — ${RHEL_MANUAL[$p]}")
+            continue
+        fi
+        if [ -n "${PIP_PKGS[$p]:-}" ]; then
+            if [ "$DRY_RUN" -eq 1 ]; then
+                DRY_PKGS+=("$p (pip)")
+                continue
+            fi
+            if ! command -v pip3 &>/dev/null; then
+                MANUAL_ITEMS+=("$p — pip3 not installed, run: sudo dnf install python3-pip")
+                continue
+            fi
+            erc=0
+            exe as_user pip3 install --user "${PIP_PKGS[$p]}" || erc=$?
+            if [ "$erc" -eq 0 ]; then
+                INSTALLED_PKGS+=("$p (pip)")
+            else
+                MANUAL_ITEMS+=("$p — pip install failed, do it manually: pip3 install --user ${PIP_PKGS[$p]}")
+            fi
+            continue
+        fi
+        name="${RHEL_MAP[$p]:-$p}"
+        erc=0
+        if [ -n "${RHEL_CANDIDATES[$p]:-}" ]; then
+            resolved=$(resolve_rhel_package "$p") || {
+                warn "$(_t "No RHEL package candidate for " "No RHEL package candidate for ") $p"
+                FAILED_PKGS+=("dnf:$p (no candidate in enabled repos — 需要 EPEL/CRB?)")
+                continue
+            }
+            name="$resolved"
+            RESOLVED_PKG_NAME["$p"]="$resolved"
+        fi
+        # EL-only COPR shortcut for niri/xwayland-satellite (yalter/niri is the one
+        # project that builds an epel-10 chroot). Fedora ships both in official
+        # repos, so COPR is never attempted there — attempting it on a chroot the
+        # project never built is exactly what made `dnf copr enable` blow up.
+        if [ "$DISTRO_ID" != fedora ] && [ -n "${RHEL_COPR_PKG[$p]:-}" ]; then
+            local _copr_first=0
+            install_rhel_copr_pkg "$name" "${RHEL_COPR_PKG[$p]}" "$(rhel_copr_chroot)" || _copr_first=$?
+            if [ "$_copr_first" -eq 0 ]; then
+                INSTALLED_PKGS+=("$name (COPR)")
+                continue
+            fi
+        fi
+        if pkg_installed "$name"; then
+            SKIPPED_PKGS+=("$name (already installed)")
+            continue
+        fi
+        erc=0
+        pm_install "$name" || erc=$?
+        if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
+            local _is_epel=0 _e
+            for _e in "${RHEL_EPEL_PKGS[@]}"; do
+                [ "$_e" = "$p" ] || [ "$_e" = "$name" ] && _is_epel=1
+            done
+            if [ "$_is_epel" -eq 1 ]; then
+                log "$(_t "Retrying " "Retrying ") $name$(_t " with EPEL explicitly enabled..." " with EPEL explicitly enabled...")"
+                erc=0
+                exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$name" || erc=$?
+            fi
+        fi
+        if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] && [ "$DISTRO_ID" != fedora ] && [ -n "${RHEL_COPR_PKG[$p]:-}" ]; then
+            local _crc=0
+            install_rhel_copr_pkg "$name" "${RHEL_COPR_PKG[$p]}" "$(rhel_copr_chroot)" || _crc=$?
+            if [ "$_crc" -eq 0 ]; then
+                INSTALLED_PKGS+=("$name (COPR)")
+                continue
+            elif [ "$_crc" -eq "$DRY_RUN_RC" ]; then
+                DRY_PKGS+=("$name (COPR)")
+                continue
+            fi
+            erc=$_crc
+        fi
+        if [ "$erc" -eq 0 ]; then
+            INSTALLED_PKGS+=("$name")
+        elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
+            DRY_PKGS+=("$name")
+        else
+            if [ "$p" = "niri" ]; then
+                warn "$(_t "No niri package in dnf/COPR — falling back to source build..." "No niri package in dnf/COPR — falling back to source build...")"
+                install_niri_binary
+            elif [ "$p" = "xwayland-satellite" ]; then
+                warn "$(_t "No xwayland-satellite package in dnf/COPR, falling back to cargo install..." "No xwayland-satellite package in dnf/COPR, falling back to cargo install...")"
+                install_xwayland_satellite
+            elif [ -n "${SOURCE_PKGS[$p]:-}" ]; then
+                warn "$(_t "No dnf/COPR package for " "No dnf/COPR package for ") $p, building from source..."
+                install_source_package "$p" "${SOURCE_PKGS[$p]}"
+            elif [ "$p" = "ttf-jetbrains-mono-nerd" ]; then
+                log "$(_t "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead." "jetbrains-mono-nerd-fonts not in dnf — will fetch the official Nerd Font release instead.")"
+            elif [ -n "${RHEL_FAIL_HINT[$p]:-}" ]; then
+                MANUAL_ITEMS+=("$name — not available in repo. ${RHEL_FAIL_HINT[$p]}")
+            else
+                local _dnferr
+                _dnferr=$(tail -n 2 "$LOG_DIR/dnf-errors.log" 2>/dev/null | tr '\n' ' ')
+                FAILED_PKGS+=("dnf:$name (${_dnferr:-见 $LOG_DIR/dnf-errors.log})")
+            fi
+        fi
+    done
+}
+
+# Enable a COPR and install one package. Best-effort: missing copr plugin or
+# missing chroot for this EL version returns 1 quickly (caller falls back).
+install_rhel_copr_pkg() { # $1=pkg $2=copr (owner/name) [$3=chroot, e.g. epel-10-x86_64]
+    local _pkg="$1" _copr="$2" _chroot="${3:-}"
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$_pkg (COPR $_copr)"); return "$DRY_RUN_RC"; }
+    if ! dnf copr --help >/dev/null 2>&1; then
+        dnf install -y dnf-plugins-core 2>/dev/null || true
+    fi
+    if ! dnf copr --help >/dev/null 2>&1; then
+        return 1
+    fi
+    # An explicit chroot avoids dnf's auto-detection ("Chroot not found" on EL
+    # derivatives); without one the historical dnf4/dnf5 argument orders are tried.
+    if [ -n "$_chroot" ]; then
+        if ! exe dnf -y copr enable "$_copr" "$_chroot" && ! exe dnf copr enable -y "$_copr" "$_chroot"; then
+            return 1
+        fi
+    elif ! exe dnf -y copr enable "$_copr" && ! exe dnf copr enable -y "$_copr"; then
+        return 1
+    fi
+    _rhel_refresh_enablerepo
+    local _erc=0
+    exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$_pkg" || _erc=$?
+    if [ "$_erc" -ne 0 ]; then
+        exe dnf install -y --enablerepo='*copr*' --enablerepo='epel*' "$_pkg" || _erc=$?
+    fi
+    return "$_erc"
+}
+
+# Install niri from the author's COPR on EL10 (Rocky/Alma/CentOS Stream 10).
+# yalter/niri only builds the epel-10 chroot (plus Fedora), so this path is taken
+# only when the running RHEL-family system is EL10 and `dnf copr` is usable.
+# Returns 0 on success, 1 on failure, DRY_RUN_RC in dry-run (caller handles it).
+install_niri_copr() {
+    local _maj
+    _maj=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
+    if [ "$_maj" != "10" ]; then
+        log "$(_t "yalter/niri COPR builds only for EL10 (this is EL$_maj) — skipping COPR path." "yalter/niri COPR builds only for EL10 (this is EL$_maj) — skipping COPR path.")"
+        return 1
+    fi
+    install_rhel_copr_pkg niri yalter/niri "$(rhel_copr_chroot)"
+}
+
+# --- GitHub download (official direct; resume + retries + timeouts) ---
+CURL_DL_FLAGS=(-fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 1800 -C -)
+
+# Reliable GitHub-release mirror proxies for CN, ordered by measured availability
+# (206 range-supported). mirror.ghproxy.com and github.moeyy.xyz were found
+# unreachable and are omitted. Override the whole list via EILNIRI_GH_PROXY.
+GH_MIRRORS="https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/ https://gh.llkk.cc/"
+
+# Bounded best-effort GitHub-release download for large release assets (e.g. the
+# ~50MB Nerd Font zip). Tries direct then each mirror, hard-capped at $3 seconds
+# per attempt so a slow/stalled origin can never hang the whole install. Returns
+# 0 only when a full, non-empty file was written (curl -o truncates, so a partial
+# direct download never leaks into a later mirror attempt).
+_dl_gh_bounded() { # $1=github asset url, $2=outfile, $3=seconds cap (default 90)
+    local url="$1" out="$2" cap="${3:-90}" prox full
+    [ -n "$url" ] && [ -n "$out" ] || return 1
+    rm -f "$out"
+    if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$url" 2>/dev/null && [ -s "$out" ]; then
+        return 0
+    fi
+    for prox in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
+        full="${prox%/}/$url"
+        rm -f "$out"
+        if curl -fsSL --retry 1 --connect-timeout 8 --max-time "$cap" -o "$out" "$full" 2>/dev/null && [ -s "$out" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Vendored subprojects (e.g. fuzzel's fcft/tllist, hyprwm components) are git
+# submodules; a plain clone leaves those dirs empty and the build dies with
+# "subproject exists but has no meson.build". Fetch them best-effort after ANY
+# successful clone — failure is non-fatal here (a project that truly needs a
+# submodule fails in its own build step with a clearer, logged error).
+_git_clone_submodules() { # $1 = repo dir
+    git -C "$1" submodule update --init --recursive --depth 1 >/dev/null 2>&1 || \
+        warn "$(_t "git submodule fetch failed for " "git submodule fetch failed for ")$(basename "$1")$(_t " — build may fail if it vendors deps as submodules" " — build may fail if it vendors deps as submodules")"
+}
+
+# Clone a GitHub repo, falling back to the CN mirror proxies when direct git fails
+# (git smart-HTTP works through ghfast.top and friends; verified with git ls-remote).
+# Bounded so a blocked GitHub never hangs the install (git has no default timeout).
+git_clone_gh() { # $1 = github repo URL, $2 = dest dir, [$3 = branch/tag ref]; returns 0 on success
+    local repo="$1" dest="$2" ref="${3:-}" prox full
+    local -a _br=()
+    [ -n "$ref" ] && _br=(--branch "$ref")
+    [ -n "$repo" ] && [ -n "$dest" ] || return 1
+    if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+        clone --depth 1 ${_br[@]+"${_br[@]}"} "$repo" "$dest" >/dev/null 2>&1; then
+        _git_clone_submodules "$dest"
+        return 0
+    fi
+    for prox in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
+        full="${prox%/}/$repo"
+        rm -rf "$dest"
+        if git -c http.connectTimeout=15 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+            clone --depth 1 ${_br[@]+"${_br[@]}"} "$full" "$dest" >/dev/null 2>&1; then
+            _git_clone_submodules "$dest"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# one download attempt with resume support; rc 33 = server rejects range requests -> restart
+try_dl() { # $1 = URL, $2 = output file; returns 0 on success
+    local url="$1" out="$2" rc
+    curl "${CURL_DL_FLAGS[@]}" -C - -o "$out" "$url" 2>/dev/null
+    rc=$?
+    if [ "$rc" -eq 33 ]; then
+        rm -f "$out"
+        curl "${CURL_DL_FLAGS[@]}" -o "$out" "$url" 2>/dev/null
+        rc=$?
+    fi
+    return "$rc"
+}
+
+download_gh() { # $1 = URL, $2 = output file; returns 0 on success, else the curl exit code
+    local url="$1" out="$2"
+    if try_dl "$url" "$out"; then
+        return 0
+    fi
+    local rc=$?
+    # direct download failed — try mirror proxies (CN-friendly; configurable via EILNIRI_GH_PROXY)
+    log "$(_t "Direct download failed (curl " "Direct download failed (curl ") $rc), trying mirror proxies..."
+    local proxy prefix
+    for proxy in ${EILNIRI_GH_PROXY:-$GH_MIRRORS}; do
+        prefix="${proxy%/}"
+        if try_dl "${prefix}/${url}" "$out"; then
+            return 0
+        fi
+    done
+    log "$(_t "Download failed after all proxies (last curl exit code: " "Download failed after all proxies (last curl exit code: ") $rc)"
+    return "$rc"
+}
+
+# Cargo/rustup mirror for CN timezones (builds fetch from crates.io / static.rust-lang.org).
+# Sets CRATES_IO_OK=1 when at least one registry (crates.io or rsproxy) is reachable —
+# install_niri_binary uses it to pick the network build vs the vendored-dependencies offline build.
+CRATES_IO_OK=0
+apply_cargo_mirror() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local tz
+    tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+    local cn=0
+    [[ "$tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]] && cn=1
+    if [ "$cn" -eq 0 ]; then
+        if curl -fsS --max-time 8 -o /dev/null https://index.crates.io/config.json 2>/dev/null; then
+            CRATES_IO_OK=1   # crates.io reachable, no mirror needed
+            return 0
+        fi
+        log "$(_t "crates.io unreachable, enabling rsproxy mirror as fallback" "crates.io unreachable, enabling rsproxy mirror as fallback")"
+    fi
+    mkdir -p "$HOME/.cargo"
+    cat > "$HOME/.cargo/config.toml" <<'EOF'
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+EOF
+    if curl -fsS --max-time 8 -o /dev/null https://rsproxy.cn/index/config.json 2>/dev/null; then
+        CRATES_IO_OK=1   # rsproxy mirror works, network build viable
+    else
+        CRATES_IO_OK=0   # no registry reachable -> niri must build offline from vendored deps
+        log "$(_t "rsproxy also unreachable — niri will use the vendored-dependencies archive" "rsproxy also unreachable — niri will use the vendored-dependencies archive")"
+    fi
+    export RUSTUP_DIST_SERVER="https://rsproxy.cn" RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+    log "$(_t "CN timezone detected: cargo/rustup mirror enabled (rsproxy.cn)" "CN timezone detected: cargo/rustup mirror enabled (rsproxy.cn)")"
+}
+
+# --- niri install (common to the non-Fedora RHEL family; these repos have no niri) ---
+# Strategy: 1) official prebuilt binary (if this release provides it) 2) offline cargo build from the official vendored source archive 3) manual report
+# Fedora's official repo already has niri, so dnf succeeds and this is never reached
+NIRI_GH="https://github.com/niri-wm/niri/releases"
+
+# niri system build dependencies (RHEL/Fedora names; some need EPEL/CRB — fall back to the manual report when missing)
+NIRI_BUILD_DEPS_RHEL=(gcc gcc-c++ pkgconf-pkg-config curl tar clang libclang-devel \
+    libxkbcommon-devel libxkbcommon-x11-devel libwayland-devel wayland-protocols-devel \
+    libinput-devel display-info-devel systemd-devel libseat-devel \
+    mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel \
+    pipewire-devel dbus-devel \
+    libxcb-devel xcb-util-devel xcb-util-wm-devel xcb-util-image-devel xcb-util-renderutil-devel xcb-util-keysyms-devel)
+
+# Ensure a usable Rust toolchain (use rustup for the latest stable when the distro version is too old)
+ensure_rust() {
+    # Re-apply rsproxy mirror env for CN timezones so the rustup toolchain download is not blocked.
+    # apply_cargo_mirror may already have set these, but ensure_rust can be called directly too.
+    local _tz
+    _tz=$(readlink -f /etc/localtime 2>/dev/null || echo "")
+    if [[ "$_tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]]; then
+        export RUSTUP_DIST_SERVER="https://rsproxy.cn" RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+    fi
+    if ! command -v rustup &>/dev/null; then
+        log "$(_t "Installing Rust toolchain (rustup)..." "Installing Rust toolchain (rustup)...")"
+        exe bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable' || return 1
+    fi
+    export PATH="$HOME/.cargo/bin:$PATH"
+    exe rustup default stable 2>/dev/null || true
+    if ! command -v cargo >/dev/null 2>&1; then
+        error "$(_t "cargo not available after rustup setup — check network to static.rust-lang.org" "cargo not available after rustup setup — check network to static.rust-lang.org")"
+        return 1
+    fi
+    # Hard guard: never build niri with a distro cargo.  Debian 12 / Ubuntu 22.04
+    # ship rustc 1.63/1.75 via apt; if the rustup shim or its default toolchain is
+    # missing, `cargo` silently resolves to /usr/bin/cargo and the build dies with
+    # obscure "edition 2024" errors.  Verify a recent version and retry the update
+    # once before failing loudly.
+    local _cver
+    _cver=$(cargo --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$_cver" ] && awk -v v="$_cver" 'BEGIN{exit !(v < 1.85)}'; then
+        warn "$(_t "cargo $_cver too old for niri (needs >= 1.85); retrying rustup toolchain update..." "cargo $_cver too old for niri (needs >= 1.85); retrying rustup toolchain update...")"
+        exe rustup update stable 2>/dev/null || true
+        exe rustup default stable 2>/dev/null || true
+        _cver=$(cargo --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    fi
+    if [ -n "$_cver" ] && awk -v v="$_cver" 'BEGIN{exit !(v < 1.85)}'; then
+        error "$(_t "Rust toolchain still too old (cargo $_cver, need >= 1.85) — install rustup manually and rerun" "Rust toolchain still too old (cargo $_cver, need >= 1.85) — install rustup manually and rerun")"
+        return 1
+    fi
+    command -v cargo >/dev/null
+}
+
+# Lightweight repair: niri binary is already installed but the session file (niri.desktop)
+# is missing. Downloads the source tarball (~1MB) and extracts only the desktop file.
+# This is much faster than re-submitting a full cargo build (10-20 min).
+_repair_niri_session() {
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("niri (session file repair)"); return "$DRY_RUN_RC"; }
+    local ver
+    ver=$(curl -fsSI --retry 2 https://github.com/niri-wm/niri/releases/latest 2>/dev/null \
+        | grep -i '^location:' | sed -n 's#.*/tag/\(v[^/]*\).*#\1#p' | head -n 1 | sed 's/^v//' | tr -d '\r')
+    if [ -z "$ver" ]; then
+        ver=$(curl -fsSL https://api.github.com/repos/niri-wm/niri/releases/latest 2>/dev/null \
+            | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/' | tr -d '\r')
+    fi
+    if [ -z "$ver" ]; then
+        MANUAL_ITEMS+=("niri — session file repair: could not fetch latest version; create /usr/share/wayland-sessions/niri.desktop manually")
+        return 1
+    fi
+    local tmp work url desktop_file
+    tmp=$(mktemp)
+    work=$(mktemp -d)
+    register_temp_path "$tmp"
+    register_temp_path "$work"
+    url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
+    if ! download_gh "$url" "$tmp"; then
+        MANUAL_ITEMS+=("niri — session file repair: source tarball download failed; create /usr/share/wayland-sessions/niri.desktop manually")
+        return 1
+    fi
+    if tar xzf "$tmp" -C "$work" 2>/dev/null; then
+        desktop_file=$(find "$work" -name niri.desktop -type f 2>/dev/null | head -1)
+        if [ -n "$desktop_file" ] && [ -s "$desktop_file" ]; then
+            mkdir -p /usr/local/share/wayland-sessions /usr/share/wayland-sessions
+            exe install -Dm644 "$desktop_file" /usr/local/share/wayland-sessions/niri.desktop
+            exe install -Dm644 "$desktop_file" /usr/share/wayland-sessions/niri.desktop
+            # 顺手补上 niri-session 启动器（niri.desktop 的 Exec=niri-session 依赖它）：
+            # 缺失会直接黑屏。
+            for _sess in "$work"/*/resources/niri-session "$work"/*/resources/niri-session.sh; do
+                [ -f "$_sess" ] || continue
+                exe install -Dm755 "$_sess" /usr/local/bin/niri-session.real 2>/dev/null || true
+                install_niri_output_wrapper
+                break
+            done
+            # 顺手补上 systemd user units（GDM 登录循环的根因：缺 niri.service）
+            mkdir -p /usr/lib/systemd/user
+            local _unit
+            for _unit in "$work"/*/resources/*.service "$work"/*/resources/*.target; do
+                [ -f "$_unit" ] || continue
+                exe install -Dm644 "$_unit" "/usr/lib/systemd/user/$(basename "$_unit")" 2>/dev/null || true
+            done
+            INSTALLED_PKGS+=("niri (session file repaired from source v$ver)")
+            success "$(_t "niri session file repaired" "niri session file repaired")"
+            return 0
+        fi
+    fi
+    MANUAL_ITEMS+=("niri — session file repair: extraction failed; create /usr/share/wayland-sessions/niri.desktop manually")
+    return 1
+}
+
+# --- 通用 .pc 预检 + Debian 自愈（niri / awww / xwayland-satellite 共用）---
+# 缺失的 .pc 在 Debian 系会自动安装对应的 -dev 包（新旧命名都试，apt-cache 探测
+# 哪个存在装哪个），装完重新校验；仍缺则把清单放进 PC_STILL_MISSING。
+PC_STILL_MISSING=()
+PC_AUTO_INSTALLED=0
+PC_NO_CANDIDATE=0   # _pc_auto_install 未找到任何 apt 候选包时置 1
+PC_FAIL_HINT=""   # ensure_pc_deps 失败时的原因说明（apt 报错尾部 / 候选包不在列表等）
+# 已知的 .pc 命名分歧补丁：Ubuntu 26.04 的 libxcb-render-util0-dev 装的是上游原名
+# xcb-renderutil.pc，而 Debian 系传统命名（和 niri 构建探测）用 xcb-render-util.pc。
+# 双向补符号链接，让两种名字都能被 pkg-config 解析。
+_pc_alias_patch() {
+    local _dir
+    for _dir in /usr/lib/*/pkgconfig /usr/lib/pkgconfig /usr/share/pkgconfig; do
+        [ -d "$_dir" ] || continue
+        [ -f "$_dir/xcb-renderutil.pc" ] && [ ! -e "$_dir/xcb-render-util.pc" ] \
+            && ln -sf xcb-renderutil.pc "$_dir/xcb-render-util.pc" 2>/dev/null
+        [ -f "$_dir/xcb-render-util.pc" ] && [ ! -e "$_dir/xcb-renderutil.pc" ] \
+            && ln -sf xcb-render-util.pc "$_dir/xcb-renderutil.pc" 2>/dev/null
+    done
+}
+# 确保 Ubuntu 的 universe 组件已启用（很多构建 -dev 包在 universe，如 libxcb-render-util0-dev）。
+# 返回 0 = universe 可见；1 = 仍不可见。
+# 是否为 Ubuntu 或 Ubuntu 衍生发行版（openkylin/deepin/UOS 等 ID_LIKE 含 ubuntu）
+_pc_pkg_map_rhel() { # $1 = .pc 名; echo 候选 -devel 包名
+    case "$1" in
+        libdisplay-info)  echo "libdisplay-info-devel display-info-devel" ;;
+        xkbcommon)         echo "libxkbcommon-devel" ;;
+        xkbcommon-x11)     echo "libxkbcommon-x11-devel" ;;
+        wayland-client)    echo "wayland-devel libwayland-devel" ;;
+        wayland-server)    echo "wayland-devel libwayland-devel" ;;
+        libinput)          echo "libinput-devel" ;;
+        libseat)           echo "libseat-devel seatd-devel" ;;
+        libpipewire-0.3)   echo "pipewire-devel" ;;
+        dbus-1)            echo "dbus-devel" ;;
+        pango)             echo "pango-devel" ;;
+        gbm)               echo "mesa-libgbm-devel" ;;
+        egl)               echo "mesa-libEGL-devel" ;;
+        liblz4)            echo "lz4-devel" ;;
+        lz4)               echo "lz4-devel" ;;
+        dav1d)             echo "dav1d-devel" ;;
+        xcb-cursor)        echo "xcb-util-cursor-devel" ;;
+        xcb-composite)     echo "libxcb-devel" ;;
+        xcb-ewmh)          echo "xcb-util-wm-devel" ;;
+        xcb-icccm)         echo "xcb-util-wm-devel" ;;
+        xcb-randr)         echo "libxcb-devel" ;;
+        xcb-xfixes)        echo "libxcb-devel" ;;
+        xcb-present)       echo "libxcb-devel" ;;
+        xcb-render-util)   echo "xcb-util-renderutil-devel" ;;
+        xcb-res)           echo "libxcb-devel" ;;
+        xcb-shape)         echo "libxcb-devel" ;;
+        xcb-util)          echo "xcb-util-devel" ;;
+        xcb-xkb)           echo "libxcb-devel" ;;
+        xcb-xinerama)      echo "libxcb-devel" ;;
+        *)                 echo "" ;;
+    esac
+}
+_pc_auto_install_rhel() { # $1 = .pc 名
+    local _cand
+    for _cand in $(_pc_pkg_map_rhel "$1"); do
+        [ -z "$_cand" ] && continue
+        log "$(_t "Auto-installing missing build dep: " "Auto-installing missing build dep: ") $_cand"
+        dnf_install_tolerant "$_cand" || true
+        pkg-config --exists "$1" 2>/dev/null && return 0
+    done
+    return 1
+}
+ensure_pc_deps() { # $@ = .pc 名列表; 返回 0=全部就绪, 1=仍缺（PC_STILL_MISSING 列出）
+    PC_STILL_MISSING=()
+    _pc_alias_patch   # xcb-renderutil.pc ↔ xcb-render-util.pc 命名分歧兼容
+    command -v pkg-config >/dev/null 2>&1 || pm_install pkg-config 2>/dev/null || true
+    command -v pkg-config >/dev/null 2>&1 || return 1
+    local _attempt=0 _pc
+    while [ "$_attempt" -lt 2 ]; do
+        PC_STILL_MISSING=()
+        # pass 1: 收集缺失 + Debian 自愈
+        for _pc in "$@"; do
+            if ! pkg-config --exists "$_pc" 2>/dev/null; then
+                warn "$(_t "build prerequisite missing: " "build prerequisite missing: ") $_pc.pc"
+                if [ "$DRY_RUN" -eq 0 ]; then
+                    _pc_auto_install_rhel "$_pc"
+                fi
+            fi
+        done
+        # pass 2: 重新校验
+        for _pc in "$@"; do
+            if ! pkg-config --exists "$_pc" 2>/dev/null; then
+                PC_STILL_MISSING+=("$_pc.pc")
+            fi
+        done
+        [ ${#PC_STILL_MISSING[@]} -eq 0 ] && return 0
+        break
+    done
+    # 失败原因说明（RHEL 系：通常是 -devel 包不在 base 仓库，需 EPEL/CRB）
+    local _hint
+    _hint="dnf 里没有提供该 .pc 的 -devel 包（xcb-cursor 对应 xcb-util-cursor-devel；需 EPEL/CRB）。可运行 'dnf install --enablerepo=epel,crb xcb-util-cursor-devel' 后重跑"
+    PC_FAIL_HINT="$_hint"
+    [ ${#PC_STILL_MISSING[@]} -eq 0 ]
+}
+
+# /usr/local/bin is commonly NOT on PATH in GDM Wayland sessions and systemd user
+# sessions on RHEL/Debian, so bare Exec=niri-session / ExecStart=niri resolve to
+# nothing → the greeter handoff ends in a black screen. Bake /usr/local/bin into
+# /etc/environment (used by GDM and systemd user managers) idempotently.
+ensure_localbin_on_path() {
+    [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
+    [ -f /etc/environment ] || touch /etc/environment
+    local probe
+    probe=$(grep -E '^PATH=' /etc/environment 2>/dev/null | head -1)
+    if [ -n "$probe" ]; then
+        if ! echo "$probe" | grep -qE '/usr/local/bin'; then
+            sed -i 's|^PATH=.*|&:/usr/local/bin|' /etc/environment
+            log "$(_t "Added /usr/local/bin to PATH in /etc/environment" "Added /usr/local/bin to PATH in /etc/environment")"
+        fi
+    else
+        printf 'PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin\n' >> /etc/environment
+        log "$(_t "Set PATH (incl. /usr/local/bin) in /etc/environment" "Set PATH (incl. /usr/local/bin) in /etc/environment")"
+    fi
+    # systemd will pick the new PATH on the next session start.
+}
+
+# niri 已装但 systemd user units 缺失时（旧版脚本装的 niri / 手动装的）补装：
+# niri-session 启动需要 systemctl --user start niri.service，缺 unit 会 GDM 登录循环。
+# 下载源码 tarball，从 resources/ 提取 *.service / *.target 到 /usr/lib/systemd/user/。
+_ensure_niri_units() {
+    [ -x /usr/local/bin/niri ] || return 0
+    [ -f /usr/lib/systemd/user/niri.service ] && [ -f /usr/lib/systemd/user/niri-shutdown.target ] && return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("niri (systemd user units)")
+        return "$DRY_RUN_RC"
+    fi
+    log "$(_t "niri installed but systemd user units missing — installing..." "niri installed but systemd user units missing — installing...")"
+    local ver tmp work url _unit _ok=0
+    ver=$(curl -fsSI --retry 2 https://github.com/niri-wm/niri/releases/latest 2>/dev/null \
+        | grep -i '^location:' | sed -n 's#.*/tag/\(v[^/]*\).*#\1#p' | head -n 1 | sed 's/^v//' | tr -d '\r')
+    if [ -z "$ver" ]; then
+        ver=$(curl -fsSL https://api.github.com/repos/niri-wm/niri/releases/latest 2>/dev/null \
+            | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/' | tr -d '\r')
+    fi
+    if [ -z "$ver" ]; then
+        MANUAL_ITEMS+=("niri — 无法获取版本号来自动补装 systemd user units; 手动创建 /usr/lib/systemd/user/niri.service 与 niri-shutdown.target（见 README）")
+        return 1
+    fi
+    tmp=$(mktemp); work=$(mktemp -d)
+    register_temp_path "$tmp"; register_temp_path "$work"
+    url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
+    if download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; then
+        mkdir -p /usr/lib/systemd/user
+        for _unit in "$work"/*/resources/*.service "$work"/*/resources/*.target; do
+            [ -f "$_unit" ] || continue
+            exe install -Dm644 "$_unit" "/usr/lib/systemd/user/$(basename "$_unit")" 2>/dev/null && _ok=1
+        done
+    fi
+    if [ "$_ok" -eq 1 ]; then
+        log "$(_t "niri systemd user units installed (/usr/lib/systemd/user)" "niri systemd user units installed (/usr/lib/systemd/user)")"
+        return 0
+    fi
+    MANUAL_ITEMS+=("niri — 未能自动补装 systemd user units; 手动创建 /usr/lib/systemd/user/niri.service 与 niri-shutdown.target")
+    return 1
+}
+
+install_niri_binary() {
+    if command -v niri >/dev/null 2>&1; then
+        if [ -f /usr/share/wayland-sessions/niri.desktop ] || [ -f /usr/local/share/wayland-sessions/niri.desktop ]; then
+            SKIPPED_PKGS+=("niri (already installed)")
+            ensure_localbin_on_path
+            _ensure_niri_units   # 旧版脚本/手动装的 niri 可能缺 systemd units → GDM 登录循环
+            # niri came from the distro or an earlier run: make sure the
+            # "niri-session" command name that niri.desktop exec's actually exists.
+            # Older eilNiri versions only wrote niri-session.real, which made a GDM
+            # login abort instantly (no output) while a TTY login still worked.
+            _ensure_niri_session_cmd
+            return 0
+        fi
+        log "$(_t "niri binary found but niri.desktop missing; repairing session file..." "niri binary found but niri.desktop missing; repairing session file...")"
+        ensure_localbin_on_path
+        _repair_niri_session
+        return $?
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("niri (official prebuilt or source build)")
+        return "$DRY_RUN_RC"
+    fi
+
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch=x86_64 ;;
+        aarch64) arch=aarch64 ;;
+        *)
+            MANUAL_ITEMS+=("niri — unsupported architecture $(uname -m), install manually: $NIRI_GH")
+            return 1
+            ;;
+    esac
+
+    # Resolve the latest version: prefer the /releases/latest redirect (no API), fall back to the GitHub API.
+    # NOTE: GitHub HTTP headers are CRLF-terminated — the extracted tag must be stripped of \r,
+    # otherwise it embeds a control character in the download URL and curl fails with exit code 3.
+    local ver url tmp work srcdir
+    ver=$(curl -fsSI --retry 2 https://github.com/niri-wm/niri/releases/latest 2>/dev/null \
+        | grep -i '^location:' | sed -n 's#.*/tag/\(v[^/]*\).*#\1#p' | head -n 1 | sed 's/^v//' | tr -d '\r')
+    if [ -z "$ver" ]; then
+        ver=$(curl -fsSL https://api.github.com/repos/niri-wm/niri/releases/latest 2>/dev/null \
+            | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/' | tr -d '\r')
+    fi
+    if [ -z "$ver" ]; then
+        MANUAL_ITEMS+=("niri — could not fetch latest version (network or GitHub restricted), install manually: $NIRI_GH")
+        return 1
+    fi
+    tmp=$(mktemp)
+    work=$(mktemp -d)
+    register_temp_path "$tmp"
+    register_temp_path "$work"
+
+    # --- source build ---
+    # The source tarball (~1MB) is the primary download; the 40MB vendored-dependencies archive
+    # contains ONLY dependency crates (no niri source!), so it is used just as an offline depot
+    # when no cargo registry (crates.io / rsproxy) is reachable.
+    log "$(_t "Building niri from source (10-20 min)..." "Building niri from source (10-20 min)...")"
+    url="https://github.com/niri-wm/niri/archive/refs/tags/v${ver}.tar.gz"
+    
+    local _dl_attempts=3 _dl_delay=15 _dlrc=0
+    for (( _attempt=1; _attempt<=$_dl_attempts; _attempt++ )); do
+        if download_gh "$url" "$tmp"; then
+            _dlrc=0
+            break
+        fi
+        _dlrc=$?
+        if [ "$_attempt" -lt "$_dl_attempts" ]; then
+            log "$(_t "Download attempt $_attempt/$_dl_attempts failed (code $?), retrying in ${_dl_delay}s..." "Download attempt $_attempt/$_dl_attempts failed (code $?), retrying in ${_dl_delay}s...")"
+            sleep "$_dl_delay"
+        fi
+    done
+    
+    if [ "$_dlrc" -ne 0 ]; then
+        MANUAL_ITEMS+=("niri — source tarball download failed after $_dl_attempts attempts (curl exit code $_dlrc); check network and try: $NIRI_GH")
+        return 1
+    fi
+    if ! tar xzf "$tmp" -C "$work" 2>/dev/null; then
+        # 解压失败 = 下载损坏（代理/断点续传可能产生坏文件）：删掉重下一次（强制全新），再解压一次
+        log "$(_t "Extraction failed (corrupt download?), re-downloading once..." "Extraction failed (corrupt download?), re-downloading once...")"
+        rm -f "$tmp"
+        if download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; then
+            :   # 重试成功
+        else
+            local _ft2 _fs2
+            _ft2=$(file -b "$tmp" 2>/dev/null || echo unknown)
+            _fs2=$(stat -c%s "$tmp" 2>/dev/null || echo "?")
+            MANUAL_ITEMS+=("niri — source archive extraction failed (file type: $_ft2, size: $_fs2 bytes, url: $url); 下载可能被代理损坏，手动下载后安装: $NIRI_GH")
+            return 1
+        fi
+    fi
+
+    # Locate the source root (top level may be the source directly or wrapped in a version dir)
+    srcdir="$work"
+    for d in "$work"/*/; do
+        [ -f "$d/Cargo.toml" ] && { srcdir="$d"; break; }
+    done
+    # Hard validation: never start a cargo build without the manifest. A corrupted/mismatched
+    # download (HTML error page, resumed-across-URLs garbage) extracts fine but lacks Cargo.toml.
+    if [ ! -f "$srcdir/Cargo.toml" ]; then
+        local ftype fsize
+        ftype=$(file -b "$tmp" 2>/dev/null || echo unknown)
+        fsize=$(stat -c%s "$tmp" 2>/dev/null || echo "?")
+        MANUAL_ITEMS+=("niri — downloaded archive is unusable (no Cargo.toml after extraction; file type: $ftype, size: $fsize bytes, downloaded from: $url); install manually: $NIRI_GH")
+        return 1
+    fi
+
+    # Probe cargo registry reachability NOW, right before deciding the build strategy.
+    # Doing it after the source download ensures the network is still alive and avoids
+    # a stale probe from minutes earlier.
+    if [ "${CRATES_IO_OK:-0}" -eq 0 ]; then
+        # apply_cargo_mirror may not have run (e.g. direct invocation); probe crates.io now
+        if curl -fsS --max-time 8 -o /dev/null https://index.crates.io/config.json 2>/dev/null; then
+            CRATES_IO_OK=1
+        fi
+    fi
+    local offline=0
+    [ "$CRATES_IO_OK" -eq 0 ] && offline=1
+
+    # Offline depot: when no cargo registry is reachable, fetch the vendored-dependencies archive
+    # (dependency crates only) and wire it up as the cargo source so the build needs no network.
+    if [ "$offline" -eq 1 ]; then
+        log "$(_t "No cargo registry reachable, downloading vendored dependencies for an offline build..." "No cargo registry reachable, downloading vendored dependencies for an offline build...")"
+        local vtmp _vdl_attempts=3 _vdl_delay=15 _vdlrc=0
+        vtmp=$(mktemp)
+        register_temp_path "$vtmp"
+        url="$NIRI_GH/download/v${ver}/niri-${ver}-vendored-dependencies.tar.xz"
+        
+        for (( _vattempt=1; _vattempt<=$_vdl_attempts; _vattempt++ )); do
+            if download_gh "$url" "$vtmp"; then
+                _vdlrc=0
+                break
+            fi
+            _vdlrc=$?
+            if [ "$_vattempt" -lt "$_vdl_attempts" ]; then
+                log "$(_t "Vendored deps download attempt $_vattempt/$_vdl_attempts failed (code $_vdlrc), retrying in ${_vdl_delay}s..." "Vendored deps download attempt $_vattempt/$_vdl_attempts failed (code $_vdlrc), retrying in ${_vdl_delay}s...")"
+                sleep "$_vdl_delay"
+            fi
+        done
+        
+        if [ "$_vdlrc" -ne 0 ]; then
+            MANUAL_ITEMS+=("niri — vendored dependencies download failed after $_vdl_attempts attempts (curl exit code $_vdlrc); try online build or install manually: $NIRI_GH")
+            return 1
+        fi
+        mkdir -p "$srcdir/vendor"
+        if ! tar xJf "$vtmp" -C "$srcdir/vendor" 2>/dev/null || [ ! -d "$srcdir/vendor/vendor" ]; then
+            MANUAL_ITEMS+=("niri — vendored dependencies extraction failed; install manually: $NIRI_GH")
+            return 1
+        fi
+        # point cargo at the vendored crates so the build is fully offline
+        mkdir -p "$srcdir/.cargo"
+        # IMPORTANT: cargo resolves relative paths in config.toml against the
+        # *config file's* directory, not the cwd — `directory = "vendor/vendor"`
+        # here would look in $srcdir/.cargo/vendor/vendor and fail with
+        # "failed to load source".  Always emit an absolute path.
+        cat > "$srcdir/.cargo/config.toml" <<EOF
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "$srcdir/vendor/vendor"
+EOF
+        log "$(_t "Vendored dependencies ready — building fully offline." "Vendored dependencies ready — building fully offline.")"
+    fi
+
+    # Install build dependencies + Rust toolchain (foreground, fast)
+    if ! ensure_rust; then
+        MANUAL_ITEMS+=("niri — Rust toolchain install failed, build manually: $NIRI_GH")
+        return 1
+    fi
+    
+    local bdeps_rc=0
+    dnf_install_tolerant "${NIRI_BUILD_DEPS_RHEL[@]}" || bdeps_rc=$?
+    if [ "$bdeps_rc" -ne 0 ]; then
+        MANUAL_ITEMS+=("niri — build dependencies install failed, build manually: $NIRI_GH")
+        return 1
+    fi
+
+    # pkg-config pre-check: verify every .pc file the build needs actually exists
+    # BEFORE starting the 10-20 min background build. A missing .pc surfaces as
+    # "The system library X required by crate Y was not found" only at the end of
+    # the build — this catches it in seconds instead.
+    if ! ensure_pc_deps libdisplay-info xkbcommon wayland-client \
+            libinput libseat libpipewire-0.3 dbus-1 pango gbm egl \
+            xcb-composite xcb-ewmh xcb-icccm xcb-randr xcb-xfixes \
+            xcb-present xcb-render-util xcb-res xcb-shape xcb-util xcb-xkb xcb-xinerama; then
+        error "$(_t "niri — required system libraries still missing: " "niri — required system libraries still missing: ") ${PC_STILL_MISSING[*]}$(_t " — install the -dev/-devel packages, then rerun: $NIRI_GH" " — install the -dev/-devel packages, then rerun: $NIRI_GH")"
+        MANUAL_ITEMS+=("niri — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -dev 包后重跑: $NIRI_GH")
+        return 1
+    fi
+    [ "$PC_AUTO_INSTALLED" -gt 0 ] && log "$(_t "pkg-config pre-check passed after auto-install." "pkg-config pre-check passed after auto-install.")"
+
+    # Build in background so the rest of the install (packages/services/config) proceeds meanwhile
+    log "$(_t "Building niri in background; continuing install..." "Building niri in background; continuing install...")"
+    bg_build_start niri "$srcdir" "$LOG_DIR/niri-build.log" \
+        bash -c "cd '$srcdir' && RUST_LOG=info cargo build --release -vv -j $(cargo_jobs) 2>&1"
+    return "$BG_PENDING_RC"
+}
+
+# RAM-aware cargo parallelism: cap jobs so big builds (niri needs ~1.5-2GB/job) don't OOM small VMs
+cargo_jobs() { # echoes the job count to use
+    local ram_mb jobs max_by_ram
+    ram_mb=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
+    jobs=$(nproc 2>/dev/null || echo 2)
+    [ "${ram_mb:-0}" -gt 0 ] || ram_mb=4096
+    max_by_ram=$(( ram_mb / 1536 ))
+    [ "$max_by_ram" -lt 1 ] && max_by_ram=1
+    [ "$jobs" -gt "$max_by_ram" ] && jobs="$max_by_ram"
+    echo "$jobs"
+}
+
+# Install the binaries produced by the background niri build (runs in stage_wait_builds)
+install_niri_from_build() { # $1 = srcdir, $2 = logfile
+    local srcdir="$1" logfile="$2"
+    if [ -x "$srcdir/target/release/niri" ]; then
+        exe install -Dm755 "$srcdir/target/release/niri" /usr/local/bin/niri
+        # niri.desktop's Exec=niri-session and niri.service's ExecStart=niri are bare
+        # names resolved via PATH. Install niri-session and make /usr/local/bin visible
+        # to GDM + the user systemd session on RHEL/Debian (where /usr/local/bin is
+        # commonly NOT on the default PATH) — without it login goes straight to black.
+        exe install -Dm755 "$srcdir/resources/niri-session" /usr/local/bin/niri-session.real 2>/dev/null || true
+        install_niri_output_wrapper
+        ensure_localbin_on_path
+        exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/local/share/wayland-sessions/niri.desktop 2>/dev/null || true
+        exe install -Dm644 "$srcdir/resources/niri.desktop" /usr/share/wayland-sessions/niri.desktop 2>/dev/null || true
+        exe install -Dm644 "$srcdir/resources/niri-portals.conf" /usr/local/share/xdg-desktop-portal/niri-portals.conf 2>/dev/null || true
+        # 关键：niri-session 用 systemd user session 启动 niri（systemctl --user start niri.service）。
+        # 必须把 niri 源码 resources/ 里的 systemd user unit 装到 /usr/lib/systemd/user/，
+        # 否则 GDM 登录时 "Unit niri.service not found" → niri 起不来 → 跳回登录界面（登录循环）。
+        local _unit _unit_installed=0
+        mkdir -p /usr/lib/systemd/user
+        for _unit in "$srcdir"/resources/*.service "$srcdir"/resources/*.target "$srcdir"/resources/niri.session; do
+            [ -f "$_unit" ] || continue
+            exe install -Dm644 "$_unit" "/usr/lib/systemd/user/$(basename "$_unit")" 2>/dev/null && _unit_installed=1
+        done
+        if [ "$_unit_installed" -eq 1 ]; then
+            log "$(_t "niri systemd user units installed (/usr/lib/systemd/user)" "niri systemd user units installed (/usr/lib/systemd/user)")"
+        else
+            warn "$(_t "niri systemd user units not found in source resources/ — GDM 登录可能循环; 手动创建 /usr/lib/systemd/user/niri.service 与 niri-shutdown.target" "niri systemd user units not found in source resources/ — GDM 登录可能循环; 手动创建 /usr/lib/systemd/user/niri.service 与 niri-shutdown.target")"
+        fi
+        INSTALLED_PKGS+=("niri (source build)")
+        success "$(_t "niri built from source" "niri built from source")"
+        return 0
+    fi
+    local tailmsg
+    tailmsg=$(tail -n 6 "$logfile" 2>/dev/null | tr '\n' ' ')
+    MANUAL_ITEMS+=("niri — build failed ($tailmsg); build manually: $NIRI_GH")
+    return 1
+}
+
+# --- awww install (Debian/RHEL families; no package, no prebuilt binary) ---
+# awww moved from GitHub to Codeberg and now replaces swww. No release binaries are published,
+# so the only option outside Arch/Fedora repos is a cargo build from the upstream source (~5 min).
+AWWW_REPO="https://codeberg.org/LGFae/awww"
+
+install_awww() {
+    if command -v awww >/dev/null 2>&1 && command -v awww-daemon >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("awww (already installed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("awww (cargo build from codeberg)")
+        return "$DRY_RUN_RC"
+    fi
+
+    # build deps: wayland protocol XML via pkg-config is required by upstream;
+    # the `common` crate links lz4 (needs the -devel package providing liblz4.pc);
+    # dav1d/lz4 runtime libs are best effort.
+    local bdeps_rc=0
+    # RHEL: awww's common crate links xkbcommon + lz4 (mandatory); dav1d is an
+    # optional runtime codec, so only lz4/xkbcommon are hard pre-checks. Tolerant
+    # so a missing name (e.g. dav1d-devel on older EL) never aborts the batch.
+    # dav1d(-devel) entered EPEL only in a later 10.x minor — on earlier minors
+    # it is simply not there; probing first keeps the log free of a guaranteed
+    # "没有任何匹配: dav1d-devel" line on every run.
+    local _awww_bdeps=(git wayland-devel wayland-protocols-devel lz4-devel \
+        libxkbcommon-devel libdrm-devel mesa-libgbm-devel)
+    if dnf -q --disablerepo='*' --enablerepo='epel*' list available dav1d-devel >/dev/null 2>&1; then
+        _awww_bdeps+=(dav1d-devel)
+    fi
+    dnf_install_tolerant "${_awww_bdeps[@]}" || bdeps_rc=$?
+    if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+        warn "$(_t "Some awww build deps unavailable (continuing):" "Some awww build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+    fi
+    exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} dav1d lz4 2>/dev/null || true
+    # pkg-config 预检（只校验不自愈）：wayland-client / xkbcommon / liblz4
+    # 必装；dav1d 可选，缺了不阻塞（awww 仍能编译/运行）。
+    if ! ensure_pc_deps wayland-client xkbcommon liblz4; then
+        MANUAL_ITEMS+=("awww — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -devel 包后重跑: $AWWW_REPO")
+        return 1
+    fi
+    if [ "$bdeps_rc" -ne 0 ] && [ ${#BDEPS_MISSING[@]} -gt 0 ] && [ ${#PC_STILL_MISSING[@]} -gt 0 ]; then
+        MANUAL_ITEMS+=("awww — build dependencies install failed, build manually: $AWWW_REPO")
+        return 1
+    fi
+    if ! ensure_rust; then
+        MANUAL_ITEMS+=("awww — Rust toolchain install failed, build manually: $AWWW_REPO")
+        return 1
+    fi
+
+    local work
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    log "$(_t "Cloning awww source (codeberg)..." "Cloning awww source (codeberg)...")"
+    
+    local _clone_attempts=3 _clone_delay=10 _clonerc=0
+    for (( _cattempt=1; _cattempt<=$_clone_attempts; _cattempt++ )); do
+        if exe git clone --depth 1 "$AWWW_REPO" "$work/awww" 2>/dev/null; then
+            _clonerc=0
+            break
+        fi
+        _clonerc=$?
+        if [ "$_cattempt" -lt "$_clone_attempts" ]; then
+            log "$(_t "Clone attempt $_cattempt/$_clone_attempts failed, retrying in ${_clone_delay}s..." "Clone attempt $_cattempt/$_clone_attempts failed, retrying in ${_clone_delay}s...")"
+            sleep "$_clone_delay"
+            rm -rf "$work/awww"
+        fi
+    done
+    
+    if [ "$_clonerc" -ne 0 ]; then
+        MANUAL_ITEMS+=("awww — git clone failed after $_clone_attempts attempts (network or Codeberg blocked), build manually: $AWWW_REPO")
+        return 1
+    fi
+
+    # Build in background so the rest of the install proceeds meanwhile.
+    # On low-RAM machines, wait for the niri build to finish first (avoids OOM from two parallel cargo builds).
+    local awww_cmd ram_mb niri_pid
+    awww_cmd="cd '$work/awww' && cargo build --release --workspace -j $(cargo_jobs)"
+    ram_mb=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
+    if [ "${ram_mb:-0}" -lt 8192 ] && [ ${#BG_JOBS[@]} -gt 0 ]; then
+        niri_pid=$(echo "${BG_JOBS[0]}" | awk '{print $2}')
+        awww_cmd="while kill -0 '$niri_pid' 2>/dev/null; do sleep 15; done; $awww_cmd"
+        log "$(_t "Low RAM detected: awww build will wait for niri to finish first." "Low RAM detected: awww build will wait for niri to finish first.")"
+    fi
+    log "$(_t "Building awww in background (~5 min); continuing install..." "Building awww in background (~5 min); continuing install...")"
+    bg_build_start awww "$work/awww" "$LOG_DIR/awww-build.log" bash -c "$awww_cmd"
+    return "$BG_PENDING_RC"
+}
+
+# Install the binaries produced by the background awww build (runs in stage_wait_builds)
+install_awww_from_build() { # $1 = srcdir, $2 = logfile
+    local srcdir="$1" logfile="$2" b found=0
+    for b in "$srcdir"/target/release/awww*; do
+        [ -x "$b" ] && [ -f "$b" ] || continue
+        exe install -Dm755 "$b" /usr/local/bin/"$(basename "$b")"
+        found=1
+    done
+    if [ "$found" -eq 1 ] && [ -x /usr/local/bin/awww ]; then
+        INSTALLED_PKGS+=("awww (cargo build)")
+        success "$(_t "awww built from source" "awww built from source")"
+        return 0
+    fi
+    local tailmsg
+    tailmsg=$(tail -n 6 "$logfile" 2>/dev/null | tr '\n' ' ')
+    MANUAL_ITEMS+=("awww — build failed ($tailmsg); build manually: $AWWW_REPO")
+    return 1
+}
+
+# 壁纸缺失自愈：参考机的壁纸图片不在 configs/ 内，新机器上 awww-daemon 无图可设，
+# 导致壁纸不生效（awww-daemon 必须启动时就有壁纸状态，见 mylinuxforwork/dotfiles#1574）。
+# 优先使用仓库根目录的壁纸图（复制到 ~/.local/share/backgrounds/，同时作为锁屏壁纸），
+# 没有则找现有图片，再没有就生成一张深蓝紫渐变 PNG（python3 标准库，无 PIL 依赖）；
+# 写入 awww 状态文件 ~/.config/awww/wallpaper 供 awww-daemon 加载；
+# 修正 waypaper config.ini 与 hyprlock.conf（锁屏壁纸）里指向参考机的绝对路径。
+_ensure_wallpaper() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    command -v awww >/dev/null 2>&1 || return 0   # awww 缺失由 install_awww 处理
+
+    local _img="" _cand _ext=""
+    # 1) 固定使用仓库根目录的壁纸图（用户放在 script 旁的那张 QQ图片.../wallpaper 图）。
+    #    每次部署都会把它复制到 ~/.local/share/backgrounds/wallpaper.<ext>（若文件已存在且
+    #    相同则跳过；之前不显示是因为早退逻辑/未主动 set——这里不早退，并最终主动 set）。
+    for _cand in "$BASE_DIR"/*.jpg "$BASE_DIR"/*.jpeg "$BASE_DIR"/*.png "$BASE_DIR"/*.webp; do
+        [ -f "$_cand" ] || continue
+        case "$_cand" in *.jpg|*.jpeg) _ext=jpg;; *.png) _ext=png;; *.webp) _ext=webp;; *) continue;; esac
+        mkdir -p "$HOME_DIR/.local/share/backgrounds"
+        _img="$HOME_DIR/.local/share/backgrounds/wallpaper.$_ext"
+        if [ ! -f "$_img" ] || ! cmp -s "$_cand" "$_img" 2>/dev/null; then
+            cp -f "$_cand" "$_img" 2>/dev/null || true
+        fi
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_img" 2>/dev/null || true
+        log "$(_t "Wallpaper deployed from repo: " "Wallpaper deployed from repo: ") $(basename "$_cand") -> $_img"
+        break
+    done
+    # 2) 仓库没有图 → 用现有图片
+    if [ -z "$_img" ]; then
+        for _cand in "$HOME_DIR"/Pictures/*.png "$HOME_DIR"/Pictures/*.jpg "$HOME_DIR"/Pictures/*.jpeg \
+                     "$HOME_DIR"/.local/share/backgrounds/*.png "$HOME_DIR"/.local/share/backgrounds/*.jpg; do
+            [ -f "$_cand" ] && { _img="$_cand"; break; }
+        done
+    fi
+    # 3) 都没有 → 生成默认渐变壁纸
+    if [ -z "$_img" ]; then
+        _img="$HOME_DIR/.local/share/backgrounds/eilniri-default.png"
+        mkdir -p "$(dirname "$_img")"
+        log "$(_t "No wallpaper found — generating a default gradient wallpaper..." "No wallpaper found — generating a default gradient wallpaper...")"
+        exe python3 - "$_img" <<'PYEOF' 2>/dev/null || true
+import struct, zlib, sys
+w, h = 1920, 1080
+out = sys.argv[1]
+def chunk(t, data):
+    c = t + data
+    return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+raw = bytearray()
+for y in range(h):
+    raw.append(0)
+    for x in range(w):
+        t = y / h
+        raw.extend((int(18 + 30*t), int(28 + 55*t), int(58 + 130*t)))
+png = b'\x89PNG\r\n\x1a\n'
+png += chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+png += chunk(b'IDAT', zlib.compress(bytes(raw), 6))
+png += chunk(b'IEND', b'')
+open(out, 'wb').write(png)
+PYEOF
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_img" 2>/dev/null || true
+    fi
+
+    if [ -f "$_img" ]; then
+        mkdir -p "$HOME_DIR/.config/awww"
+        printf '%s\n' "$_img" > "$HOME_DIR/.config/awww/wallpaper"
+        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/awww" 2>/dev/null || true
+        log "$(_t "Wallpaper state written: " "Wallpaper state written: ") $_img"
+        # 修正 waypaper config.ini 里指向参考机的绝对路径（新机器上不存在则换成壁纸图）
+        local _wpconf="$HOME_DIR/.config/waypaper/config.ini"
+        if [ -f "$_wpconf" ]; then
+            local _oldwp
+            _oldwp=$(grep -E '^wallpaper\s*=' "$_wpconf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \r')
+            if [ -n "$_oldwp" ] && [ ! -f "$_oldwp" ]; then
+                log "$(_t "waypaper config.ini points to missing path " "waypaper config.ini points to missing path ") $_oldwp$(_t " -> " " -> ") $_img"
+                sed -i "s#^wallpaper\s*=.*#wallpaper = $_img#" "$_wpconf" 2>/dev/null || true
+            fi
+            # stylesheet 键：配置里的参考机绝对路径通常是 $HOME 字面量，这里展开成绝对路径
+            local _oldss
+            _oldss=$(grep -E '^stylesheet\s*=' "$_wpconf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \r')
+            if [ -n "$_oldss" ] && [ ! -f "$_oldss" ]; then
+                local _newss="${_oldss/#\~/$HOME_DIR}"
+                if [ -f "$_newss" ]; then
+                    sed -i "s#^stylesheet\s*=.*#stylesheet = $_newss#" "$_wpconf" 2>/dev/null || true
+                fi
+            fi
+            chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_wpconf" 2>/dev/null || true
+        fi
+        # 修正 hyprlock 锁屏壁纸路径（参考机绝对路径在新机器上无效 → 锁屏背景空白）
+        local _hlconf="$HOME_DIR/.config/hypr/hyprlock.conf"
+        if [ -f "$_hlconf" ] && grep -qE '^\s*path\s*=' "$_hlconf" 2>/dev/null; then
+            log "$(_t "hyprlock wallpaper path -> " "hyprlock wallpaper path -> ") $_img"
+            sed -i -E "s#^(\s*path\s*=).*#\1 $_img#" "$_hlconf" 2>/dev/null || true
+            chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_hlconf" 2>/dev/null || true
+        fi
+        # 主动 set：只写状态文件不够——显式让 awww-daemon 应用这张壁纸（daemon 若已响应
+        # 自己读状态文件并应用；此处再主动调用一次确保生效，失败不影响已写状态）。
+        if [ -x /usr/local/bin/awww-daemon ] && command -v as_user >/dev/null 2>&1; then
+            exe as_user awww-daemon set-wallpaper "$_img" 2>>"$LOG_DIR/awww-set.log" || \
+                exe as_user awww set-wallpaper "$_img" 2>>"$LOG_DIR/awww-set.log" || true
+            log "$(_t "awww set-wallpaper invoked: " "awww set-wallpaper invoked: ") $_img"
+        fi
+    fi
+}
+
+# pip --user 装的 waypaper 没有 .desktop 入口 → fuzzel 启动器里不显示/无图标。
+# 生成一个标准桌面入口（图标用 Adwaita 的 preferences-desktop-wallpaper）。
+_ensure_waypaper_desktop() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    command -v waypaper >/dev/null 2>&1 || [ -x "$HOME_DIR/.local/bin/waypaper" ] || return 0
+    local _wp
+    _wp=$(command -v waypaper 2>/dev/null || echo "$HOME_DIR/.local/bin/waypaper")
+    mkdir -p "$HOME_DIR/.local/share/applications"
+    local _wpd="$HOME_DIR/.local/share/applications/waypaper.desktop"
+    if [ ! -f "$_wpd" ] || ! grep -q "^Exec=" "$_wpd" 2>/dev/null; then
+        cat > "$_wpd" <<EOF
+[Desktop Entry]
+Name=Waypaper
+Comment=Wallpaper manager (awww/swww)
+Exec=$_wp
+Icon=preferences-desktop-wallpaper
+Terminal=false
+Type=Application
+Categories=Utility;Graphics;
+EOF
+        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_wpd" 2>/dev/null || true
+        log "$(_t "waypaper.desktop created (fuzzel icon)" "waypaper.desktop created (fuzzel icon)")"
+    fi
+}
+
+# --- satty install (Debian/RHEL families; no package) ---
+# Strategy: 1) official prebuilt binary from GitHub releases (satty-<arch>-unknown-linux-gnu.tar.gz)
+#           2) cargo install fallback (needs GTK4/libadwaita/librsvg dev packages) 3) manual report
+SATTY_GH="https://github.com/Satty-org/Satty/releases"
+
+install_satty() {
+    if command -v satty >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("satty (already installed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("satty (official prebuilt or cargo)")
+        return "$DRY_RUN_RC"
+    fi
+
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch=x86_64 ;;
+        aarch64) arch=aarch64 ;;
+        *)
+            MANUAL_ITEMS+=("satty — unsupported architecture $(uname -m), install manually: $SATTY_GH")
+            return 1
+            ;;
+    esac
+
+    # runtime libraries the prebuilt binary links against (best effort)
+    exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} gtk4 libadwaita librsvg2 || warn "$(_t "satty runtime libraries failed to install; the binary may not start." "satty runtime libraries failed to install; the binary may not start.")"
+
+    # --- Strategy 1: official prebuilt binary ---
+    # Direct "latest/download" URL (no API call), GitHub direct
+    local url tmp work b satty_bin
+    tmp=$(mktemp)
+    work=$(mktemp -d)
+    register_temp_path "$tmp"
+    register_temp_path "$work"
+    url="$SATTY_GH/latest/download/satty-${arch}-unknown-linux-gnu.tar.gz"
+    log "$(_t "Downloading satty official prebuilt binary..." "Downloading satty official prebuilt binary...")"
+    
+    local _satty_attempts=3 _satty_delay=10 _sattyrc=0
+    for (( _sattempt=1; _sattempt<=$_satty_attempts; _sattempt++ )); do
+        if download_gh "$url" "$tmp" && tar xzf "$tmp" -C "$work" 2>/dev/null; then
+            _sattyrc=0
+            break
+        fi
+        _sattyrc=$?
+        if [ "$_sattempt" -lt "$_satty_attempts" ]; then
+            log "$(_t "Satty download attempt $_sattempt/$_satty_attempts failed, retrying in ${_satty_delay}s..." "Satty download attempt $_sattempt/$_satty_attempts failed, retrying in ${_satty_delay}s...")"
+            sleep "$_satty_delay"
+            rm -f "$tmp"
+            tmp=$(mktemp)
+            rm -rf "$work"
+            work=$(mktemp -d)
+        fi
+    done
+    
+    if [ "$_sattyrc" -eq 0 ]; then
+        satty_bin=""
+        if [ -d "$work/bin" ]; then
+            for b in "$work"/bin/*; do
+                [ -x "$b" ] && satty_bin="$b"
+            done
+        elif [ -x "$work/satty" ]; then
+            satty_bin="$work/satty"
+        else
+            # fall back to any executable named satty anywhere in the archive
+            satty_bin=$(find "$work" -type f -name satty -perm -u+x 2>/dev/null | head -n 1)
+        fi
+        if [ -n "$satty_bin" ]; then
+            exe install -Dm755 "$satty_bin" /usr/local/bin/satty
+            [ -d "$work/share" ] && exe cp -r "$work"/share/. /usr/local/share/ 2>/dev/null || true
+            INSTALLED_PKGS+=("satty (official prebuilt)")
+            success "$(_t "satty installed" "satty installed")"
+            return 0
+        fi
+    fi
+    warn "$(_t "Prebuilt satty download failed, falling back to cargo." "Prebuilt satty download failed, falling back to cargo.")"
+
+    # --- Strategy 2: cargo install (crates.io) ---
+    local bdeps_rc=0
+    dnf_install_tolerant gcc pkgconf-pkg-config gtk4-devel libadwaita-devel librsvg2-devel || bdeps_rc=$?
+    if [ "$bdeps_rc" -ne 0 ]; then
+        MANUAL_ITEMS+=("satty — build dependencies install failed, install manually: $SATTY_GH")
+        return 1
+    fi
+    if ! ensure_rust; then
+        MANUAL_ITEMS+=("satty — Rust toolchain install failed, install manually: $SATTY_GH")
+        return 1
+    fi
+    log "$(_t "Building satty via cargo (about 5 min)..." "Building satty via cargo (about 5 min)...")"
+    if exe cargo install --root /usr/local satty; then
+        INSTALLED_PKGS+=("satty (cargo build)")
+        success "$(_t "satty built from source" "satty built from source")"
+        return 0
+    fi
+    MANUAL_ITEMS+=("satty — build failed, install manually: $SATTY_GH")
+    return 1
+}
+
+# --- rime-ice (Lùsōng) dictionary deploy (RHEL family) ---
+# No RPM exists for the dictionary; upstream ships a release zip (the official
+# install method): download full.zip, extract, copy into the Rime USER data dir.
+# The engine (ibus-rime, EPEL) reads ~/.config/ibus/rime — verified against
+# ibus-rime's rime_main.c (get_ibus_rime_user_data_dir -> $HOME/.config/ibus/rime),
+# which is the ibus counterpart of fcitx5's ~/.local/share/fcitx5/rime.
+RIME_ICE_REPO="https://github.com/iDvel/rime-ice"
+RIME_ICE_ZIP_URL="https://github.com/iDvel/rime-ice/releases/latest/download/full.zip"
+RIME_IBUS_USER_DIR_SUFFIX=".config/ibus/rime"
+RIME_FCITX_USER_DIR_SUFFIX=".local/share/fcitx5/rime"
+
+# --- IBus IME stack (EL + Fedora) ---
+# Replaces the former fcitx5 source-build chain. Everything here is an RPM:
+#   ibus/ibus-libs/ibus-gtk3/ibus-gtk4/ibus-wayland/ibus-panel  -> AppStream (base OS)
+#   ibus-rime + librime + brise (stock Rime schemas)            -> EPEL 10 / Fedora
+# Called ONCE from install_rhel when the "ibus" entry is selected; covers the whole
+# [ime] group. The per-user runtime knobs live in two places:
+#   * /etc/dconf/db/ibus.d/00-eilniri-ime — the ibus dconf profile is
+#     "user-db:user + system-db:ibus" (shipped by the ibus RPM), so a system db
+#     entry is the ONE way to preconfigure IBus non-interactively as root; the
+#     user's own ~/.config/dconf/user still has priority for later changes.
+#   * ~/.config/ibus/rime/{default.custom.yaml,ibus_rime.yaml} — Rime frontend
+#     behaviour (the rime data itself is deployed by install_rime_ice).
+# IBUS_DCONF_KEYFILE / IBUS_IME_CONF are shared with stage_configs (env fallback).
+IBUS_DCONF_KEYFILE="/etc/dconf/db/ibus.d/00-eilniri-ime"
+IBUS_IME_CONF=""
+IBUS_CONFIG_DONE=0
+IBUS_ENGINE=""        # resolved by _ibus_pick_engine: "rime" | "libpinyin" | ""
+IBUS_DICT_READY=0     # 1 once rime-ice landed in ~/.config/ibus/rime
+IBUS_RIME_FAILED=0    # 1 after rime was proven unavailable (skips pointless retries)
+
+install_ibus_ime() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("ibus ibus-panel ibus-gtk3 ibus-gtk4 ibus-wayland ibus-rime (RPM stack + dconf/engine config)")
+        return "$DRY_RUN_RC"
+    fi
+
+    # 1) Install the IBus base stack. These are all in the BASE repositories on
+    #    every supported release (AppStream, plus ibus-panel from CRB on EL10), so
+    #    this part never depends on EPEL. Tolerant: a missing optional member
+    #    (ibus-qt on EL) must not abort the IME.
+    local pkgs=(ibus ibus-panel ibus-gtk3 ibus-gtk4 ibus-wayland)
+    [ "$DISTRO_ID" != fedora ] || pkgs+=(ibus-qt)
+    log "$(_t "Installing the IBus framework (RPM packages from the base repo, nothing is compiled)..." "Installing the IBus framework (RPM packages from the base repo, nothing is compiled)...")"
+    dnf_install_tolerant "${pkgs[@]}" || true
+    if pkg_installed ibus; then
+        INSTALLED_PKGS+=("ibus (RPM)")
+        RESOLVED_PKG_NAME["ibus"]="ibus"
+    else
+        FAILED_PKGS+=("dnf:ibus (IBus 输入法框架未安装成功，中文输入不可用；见 $LOG_DIR/dnf-errors.log)")
+        return 1
+    fi
+    # The panel is what reads preload-engines and activates the first engine, and
+    # ibus-daemon refuses to start without it — check it explicitly.
+    if pkg_installed ibus-panel || [ -x /usr/libexec/ibus-ui-gtk3 ]; then
+        INSTALLED_PKGS+=("ibus-panel (RPM)")
+    else
+        MANUAL_ITEMS+=("ibus-panel — 未安装（EL10 在 CRB 仓库）。缺它时 ibus-daemon 会报 \"Can not execute default panel program\" 而退出，中文输入无法激活；手动: sudo dnf install --enablerepo=crb ibus-panel")
+    fi
+
+    # 2) Engine chain. rime is PREFERRED (it carries the rime-ice dictionary), but
+    #    it is packaged only on Fedora and EPEL 10 / EPEL 8 — EPEL 9 never built
+    #    it, so on EL9 no amount of EPEL tuning can install it. Hence the fallback:
+    #    ibus-libpinyin, which sits in the base AppStream repo of EL9/EL10/Fedora.
+    #    Net effect: every supported release ends up with a working Chinese IME.
+    log "$(_t "Installing the Rime engine (ibus-rime — EPEL on EL, official on Fedora)..." "Installing the Rime engine (ibus-rime)...")"
+    dnf_install_tolerant ibus-rime librime librime-lua brise || true
+    if [ "$DISTRO_ID" != fedora ] && ! pkg_installed ibus-rime; then
+        log "$(_t "Retrying ibus-rime with EPEL enabled explicitly..." "Retrying ibus-rime with EPEL enabled explicitly...")"
+        exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' ibus-rime librime librime-lua brise \
+            2>>"$LOG_DIR/dnf-errors.log" || true
+    fi
+    if pkg_installed ibus-rime || _ibus_pick_engine 2>/dev/null | grep -qx rime; then
+        INSTALLED_PKGS+=("ibus-rime (RPM)")
+        log "$(_t "Rime engine ready — the 雾凇拼音 dictionary will be deployed next." "Rime engine ready — the rime-ice dictionary will be deployed next.")"
+    else
+        # Remember the failure so install_rime_ice / ibus_write_ime_config do not
+        # repeat the identical dnf attempts (they would all fail the same way).
+        IBUS_RIME_FAILED=1
+        # Diagnose WHY before falling back, so the message is actionable.
+        local _el_major="" _epel_ok=0
+        _el_major=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
+        if dnf repolist 2>/dev/null | grep -qiE '(^|/)epel'; then _epel_ok=1; fi
+        if [ "$DISTRO_ID" != fedora ] && [ "$_el_major" = "9" ]; then
+            warn "$(_t "ibus-rime is not available on EL9 at all (EPEL 9 has no librime/ibus-rime — verified 2026-10). Falling back to ibus-libpinyin (base repo)." "ibus-rime is not available on EL9 at all. Falling back to ibus-libpinyin.")"
+        elif [ "$DISTRO_ID" != fedora ] && [ "$_epel_ok" -eq 0 ]; then
+            warn "$(_t "ibus-rime needs EPEL, and EPEL is NOT active on this system — falling back to ibus-libpinyin (base repo). Run 'sudo dnf install -y epel-release && sudo dnf clean all && sudo dnf makecache', then rerun restore to get rime + the rime-ice dictionary." "ibus-rime needs EPEL and EPEL is not active — falling back to ibus-libpinyin. Install epel-release and rerun restore for rime.")"
+            MANUAL_ITEMS+=("EPEL 未启用，因此没装上 ibus-rime（已自动降级 ibus-libpinyin）。修复: 'sudo dnf install -y epel-release && sudo dnf clean all && sudo dnf makecache' 后重跑 restore → 自动换成 rime + 雾凇拼音")
+        else
+            warn "$(_t "ibus-rime could not be installed from the enabled repos — falling back to ibus-libpinyin (base repo). Cause is in $LOG_DIR/dnf-errors.log." "ibus-rime could not be installed from the enabled repos — falling back to ibus-libpinyin.")"
+        fi
+        log "$(_t "Installing the fallback pinyin engine (ibus-libpinyin, base AppStream repo)..." "Installing the fallback pinyin engine (ibus-libpinyin)...")"
+        dnf_install_tolerant ibus-libpinyin || true
+        if pkg_installed ibus-libpinyin || _ibus_pick_engine 2>/dev/null | grep -qx libpinyin; then
+            INSTALLED_PKGS+=("ibus-libpinyin (RPM, rime fallback)")
+            success "$(_t "ibus-libpinyin installed — Chinese input works, but with the libpinyin engine (no rime-ice dictionary)." "ibus-libpinyin installed — Chinese input works (libpinyin engine, no rime-ice dictionary).")"
+            MANUAL_ITEMS+=("rime-ice 词典未部署 — 当前用 ibus-libpinyin 整句拼音。若想要雾凇拼音：在 EPEL 10+/Fedora 上安装 ibus-rime 后重跑 restore（EL9 官方无 ibus-rime，需自行编译）")
+        else
+            FAILED_PKGS+=("ibus engine (rime 与 libpinyin 均未装成 — 中文输入不可用；见 $LOG_DIR/dnf-errors.log)")
+        fi
+    fi
+
+    # 3) Non-interactive configuration. Runs LAST so it writes the engine that
+    #    actually got installed (rime, or libpinyin on EL9). A working engine list
+    #    is the difference between "IBus runs" and "the user must run ibus-setup".
+    ibus_write_ime_config
+    success "$(_t "IBus ready (engine: ${IBUS_ENGINE:-none})" "IBus ready (engine: ${IBUS_ENGINE:-none})")"
+    return 0
+}
+
+# Write every non-package piece of the IBus setup. Idempotent, so it is safe to
+# call from more than one place: install_ibus_ime (the [ime] group) and
+# install_rime_ice (when only the dictionary entry was selected — without this the
+# engine would be installed but never configured).
+ibus_write_ime_config() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    # Called from both the [ime] group and the dictionary entry, and rpm/dconf work
+    # is not free — do it once per run.
+    [ "${IBUS_CONFIG_DONE:-0}" -eq 1 ] && return 0
+    IBUS_CONFIG_DONE=1
+    _ibus_write_dconf_profile || true
+    # Rime is the preferred engine (it carries the rime-ice dictionary). Make one
+    # last attempt here when it is still missing — this function is the end of the
+    # IME setup, so it is the right place to try before falling back. Skipped when
+    # an earlier step already proved rime unavailable on this release.
+    if [ "${IBUS_RIME_FAILED:-0}" -eq 0 ] \
+        && ! _ibus_pick_engine 2>/dev/null | grep -qx rime && ! pkg_installed ibus-rime; then
+        dnf_install_tolerant ibus-rime librime librime-lua brise || true
+        if [ "$DISTRO_ID" != fedora ] && ! pkg_installed ibus-rime; then
+            exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' ibus-rime librime brise \
+                2>>"$LOG_DIR/dnf-errors.log" || true
+        fi
+        if ! pkg_installed ibus-rime && ! _ibus_pick_engine 2>/dev/null | grep -qx rime; then
+            IBUS_RIME_FAILED=1
+        fi
+    fi
+    # Decide the engine from what actually landed on disk, NOT from what we tried
+    # to install: on EL9 ibus-rime does not exist at all, so hard-coding "rime"
+    # here would leave the desktop with no working Chinese input.
+    local _eng _tmp
+    _eng=$(_ibus_pick_engine || true)
+    if [ -z "$_eng" ]; then
+        # No engine at all: last-ditch fallback, the base repo always has libpinyin.
+        log "$(_t "No engine yet — installing the ibus-libpinyin fallback..." "No engine yet — installing the ibus-libpinyin fallback...")"
+        dnf_install_tolerant ibus-libpinyin || true
+        _eng=$(_ibus_pick_engine || true)
+    fi
+    if [ -z "$_eng" ]; then
+        warn "$(_t "No usable IBus engine found (neither ibus-rime nor ibus-libpinyin) — Chinese input will not work." "No usable IBus engine found (neither ibus-rime nor ibus-libpinyin) — Chinese input will not work.")"
+        MANUAL_ITEMS+=("IBus 引擎缺失 — 装 rime（EL10 需 EPEL: sudo dnf install ibus-rime）或后备引擎（任意版本官方源: sudo dnf install ibus-libpinyin）后重跑 restore")
+        return 0
+    fi
+    log "$(_t "IBus engine in use: " "IBus engine in use: ")$_eng"
+    IBUS_ENGINE="$_eng"
+    # dconf keyfile is rendered to a temp file first so a partial write can never
+    # corrupt the system db input.
+    _tmp="$IBUS_IME_CONF"
+    if [ -z "$_tmp" ] || [ ! -f "$_tmp" ]; then
+        _tmp="$(mktemp)"; register_temp_path "$_tmp"
+        IBUS_IME_CONF="$_tmp"
+    fi
+    if _ibus_render_config "$_eng" > "$_tmp" 2>/dev/null; then
+        _ibus_install_system_dconf "$_tmp" || true
+    fi
+    _ibus_deploy_user_config || true
+    _ibus_ensure_engine_component || true
+    return 0
+}
+
+# Copy the repo's IBus snapshot into the user's ~/.config/ibus.
+_ibus_deploy_user_config() {
+    [ -n "${HOME_DIR:-}" ] || return 0
+    local snap="${BASE_DIR:-}/configs/.config/ibus"
+    [ -d "$snap" ] || return 0
+    local _ibd="$HOME_DIR/.config/ibus" _own
+    _own="$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
+    mkdir -p "$_ibd"
+
+    # ~/.config/ibus/config — a human-readable snapshot of the dconf values
+    # (IBus itself ignores it). Refreshed when it differs, with a backup.
+    if [ -f "$snap/config" ]; then
+        if [ -f "$_ibd/config" ] && ! cmp -s "$snap/config" "$_ibd/config"; then
+            cp -f "$_ibd/config" "$_ibd/config.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+        fi
+        cp -f "$snap/config" "$_ibd/config" 2>/dev/null || true
+        chmod 0644 "$_ibd/config" 2>/dev/null || true
+        chown "$_own" "$_ibd/config" 2>/dev/null || true
+    fi
+
+    # Rime user config (default.custom.yaml / ibus_rime.yaml) is written by
+    # install_rime_ice when absent, so a user's own tuning is never overwritten.
+    log "$(_t "Deployed ~/.config/ibus config snapshot" "Deployed ~/.config/ibus config snapshot")"
+    return 0
+}
+
+# Register the Rime engine if (and only if) the RPM did not. The engine name MUST
+# stay "rime" — it is what the dconf preload-engines value refers to.
+_ibus_ensure_engine_component() {
+    [ -n "${HOME_DIR:-}" ] || return 0
+    [ -f /usr/share/ibus/component/rime.xml ] && return 0
+    local _bin=""
+    if command -v rpm >/dev/null 2>&1 && pkg_installed ibus-rime; then
+        _bin=$(rpm -ql ibus-rime 2>/dev/null | grep -m1 '/ibus-engine-rime$')
+    fi
+    [ -n "$_bin" ] || _bin=$(find /usr/libexec /usr/lib /usr/lib64 -maxdepth 3 -name 'ibus-engine-rime' -type f 2>/dev/null | head -n 1)
+    local _icon=""
+    _icon=$(find /usr/share/ibus-rime /usr/share/ibus -maxdepth 3 -name 'rime.png' 2>/dev/null | head -n 1)
+    if [ -z "$_bin" ]; then
+        # No rime engine: on the libpinyin fallback path there is nothing to
+        # register (ibus-libpinyin ships its own component XML), so this is only
+        # worth a quiet note — not a warning that looks like a broken install.
+        log "$(_t "No ibus-rime binary found — skipping the Rime engine registration (fallback engine path)." "No ibus-rime binary found — skipping the Rime engine registration.")"
+        return 0
+    fi
+    [ -n "$_icon" ] || _icon="/usr/share/ibus-rime/icons/rime.png"
+    local _cdir="$HOME_DIR/.config/ibus/component"
+    mkdir -p "$_cdir"
+    cat > "$_cdir/rime.xml" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<!-- eilNiri: fallback engine registration for ibus-rime (the RPM normally ships
+     this as /usr/share/ibus/component/rime.xml). Generated from the detected
+     binary path $_bin -->
+<component>
+	<name>im.rime.Rime</name>
+	<description>Rime Component</description>
+	<exec>$_bin --ibus</exec>
+	<version>1.0</version>
+	<author>GONG Chen &lt;chen.sst@gmail.com&gt;</author>
+	<license>GPL</license>
+	<homepage>https://rime.im</homepage>
+	<textdomain>ibus-rime</textdomain>
+	<engines>
+		<engine>
+			<name>rime</name>
+			<language>zh</language>
+			<license>GPL</license>
+			<author>GONG Chen &lt;chen.sst@gmail.com&gt;</author>
+			<icon>$_icon</icon>
+			<layout>default</layout>
+			<longname>Rime</longname>
+			<description>Rime Input Method Engine</description>
+			<rank>0</rank>
+			<symbol>&#x37A2;</symbol>
+		</engine>
+	</engines>
+</component>
+EOF
+    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cdir" 2>/dev/null || true
+    log "$(_t "Wrote the fallback IBus engine registration (~/.config/ibus/component/rime.xml)" "Wrote the fallback IBus engine registration")"
+    return 0
+}
+
+# dconf profile for IBus: "user-db:user + system-db:ibus". Shipped by the ibus RPM;
+# recreated here only if a minimal/derived image lost it (dconf aborts on an
+# unresolvable DCONF_PROFILE=ibus, which would break IBus configuration entirely).
+_ibus_write_dconf_profile() {
+    local p="/etc/dconf/profile/ibus"
+    [ -f "$p" ] && return 0
+    mkdir -p /etc/dconf/profile
+    printf 'user-db:user\nsystem-db:ibus\n' > "$p"
+    log "$(_t "Recreated /etc/dconf/profile/ibus" "Recreated /etc/dconf/profile/ibus")"
+}
+
+# Render the IBus settings as a dconf keyfile on stdout. Mirrors the values the
+# fcitx5 config used to carry (see configs/.config/ibus/README.md for the mapping).
+# $1 = engine name: "rime" (preferred, needs ibus-rime) or "libpinyin" (fallback
+#      engine, shipped by the base AppStream repo on EL9/EL10/Fedora).
+_ibus_render_config() { # $1 = engine name
+    local _eng="${1:-rime}"
+    cat <<DCONFEOF
+# eilNiri: IBus IME defaults (managed file — rerun restore to regenerate)
+# Group names are dconf paths; /desktop/ibus/... is what gsettings calls
+# org.freedesktop.ibus.*
+[general]
+# Input sources: the engine this script could actually install.
+#   rime      = ibus-rime (EPEL 10 / Fedora); dictionary = rime-ice 雾凇拼音
+#   libpinyin = ibus-libpinyin (AppStream on EL9/EL10/Fedora); no rime dictionary
+# The engine owns the US/ASCII state internally, which is why no separate
+# keyboard-us entry is needed.
+preload-engines=['${_eng}']
+engines-order=['${_eng}']
+# Mirrors fcitx5 'ActiveByDefault=False' + Shift toggling inside the engine.
+enable-by-default=false
+# Share the IME state between windows (fcitx5 ShareInputState=No -> false).
+use-global-engine=false
+# fcitx5 PreeditEnabledByDefault=False kept the composition OUT of the app's
+# entry field; false here does the same for engines that honour it (Rime is
+# configured separately in ~/.config/ibus/rime/ibus_rime.yaml).
+embed-preedit-text=false
+# fcitx5 OverrideXkbOption=False — use the compositor's XKB layout as-is.
+use-system-keyboard-layout=true
+
+[general/hotkey]
+# fcitx5 TriggerKeys=Shift+Shift_L / AltTriggerKeys=Shift_L are Rime-level
+# (ascii_mode) and stay inside the engine; these are the IBus-level switches.
+trigger=['Control+space']
+# fcitx5 EnumerateGroupForwardKeys=Super+space
+triggers=['<Super>space']
+next-engine=['Alt+Shift_L']
+prev-engine=['Control+Shift_L']
+
+[panel]
+# fcitx5 conf/classicui.conf "Vertical Candidate List=False" -> horizontal.
+lookup-table-orientation=0
+# Do not pop the language property panel on every focus change.
+show=0
+DCONFEOF
+}
+
+# Which engine did this machine actually end up with? Echoes "rime",
+# "libpinyin" or "" (neither). This is the single place that decides the engine,
+# so ibus-rime being unavailable never leaves the desktop without Chinese input:
+#   rime      -> EPEL 10 / Fedora (EPEL 9 has NO ibus-rime: never built there)
+#   libpinyin -> AppStream on EL9/EL10/Fedora — the always-available fallback
+#   ""        -> nothing usable, the caller reports it
+_ibus_pick_engine() {
+    # 1) Rime: the preferred engine (carries the rime-ice dictionary).
+    if pkg_installed ibus-rime || pkg_installed librime \
+        || [ -f /usr/libexec/ibus-rime/ibus-engine-rime ] \
+        || find /usr/lib64 /usr/lib -maxdepth 1 -name 'libRime*' -print -quit 2>/dev/null | grep -q .; then
+        printf 'rime\n'
+        return 0
+    fi
+    # 2) libpinyin: in the base repo on every supported release.
+    if pkg_installed ibus-libpinyin || [ -f /usr/share/ibus/component/libpinyin.xml ] \
+        || find /usr/lib/ibus /usr/lib64/ibus -maxdepth 1 -iname '*libpinyin*' -print -quit 2>/dev/null | grep -q .; then
+        printf 'libpinyin\n'
+        return 0
+    fi
+    printf '\n'
+    return 1
+}
+
+# Install the rendered keyfile into the system dconf db of the ibus profile and
+# compile it. dconf ships system databases as compiled blobs built from the
+# <db>.d/* text keyfiles by `dconf update`.
+_ibus_install_system_dconf() { # $1 = rendered keyfile
+    local src="$1"
+    [ -s "$src" ] || return 0
+    mkdir -p /etc/dconf/db/ibus.d
+    install -m 0644 "$src" "$IBUS_DCONF_KEYFILE" || return 1
+    if command -v dconf >/dev/null 2>&1; then
+        if exe dconf update; then
+            log "$(_t "IBus defaults written to the system dconf db (/etc/dconf/db/ibus.d)" "IBus defaults written to the system dconf db")"
+        else
+            warn "$(_t "dconf update failed — IBus defaults are on disk but not compiled; run 'sudo dconf update' manually." "dconf update failed — run 'sudo dconf update' manually.")"
+        fi
+    else
+        warn "$(_t "dconf tool not found — run 'sudo dconf update' once the dconf package is available." "dconf tool not found — run 'sudo dconf update'.")"
+    fi
+}
+
+install_rime_ice() {
+    local dest="$HOME_DIR/$RIME_IBUS_USER_DIR_SUFFIX"
+    if [ -f "$dest/rime_ice.schema.yaml" ]; then
+        SKIPPED_PKGS+=("rime-ice (already deployed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("rime-ice (dictionary deploy -> $RIME_IBUS_USER_DIR_SUFFIX)")
+        return "$DRY_RUN_RC"
+    fi
+    if [ -z "$TARGET_USER" ] || [ -z "$HOME_DIR" ]; then
+        MANUAL_ITEMS+=("rime-ice — target user not detected yet, deploy manually: git clone $RIME_ICE_REPO -> $dest")
+        return 1
+    fi
+
+    # The dictionary is Rime data and is ONLY usable by a Rime engine. Probe for
+    # the actual engine instead of a package name (ibus-rime can be present while
+    # librime is not, and on EL9 neither exists at all — there ibus-libpinyin is
+    # the engine, so deploying ~80MB of Rime schemas would be pure waste).
+    if ! _ibus_pick_engine 2>/dev/null | grep -qx rime; then
+        # Not there yet: try once (the [ime] group runs before/after this entry in
+        # arbitrary order, so the engine may simply not have been installed yet).
+        # Skip when a previous step already proved rime unavailable on this release.
+        if ! pkg_installed ibus-rime && [ "${IBUS_RIME_FAILED:-0}" -eq 0 ]; then
+            log "$(_t "No Rime engine yet — trying to install ibus-rime before deploying the dictionary..." "No Rime engine yet — trying to install ibus-rime before deploying the dictionary...")"
+            dnf_install_tolerant ibus-rime librime librime-lua brise || true
+            if [ "$DISTRO_FAMILY" = rhel ] && ! pkg_installed ibus-rime; then
+                exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' ibus-rime librime brise \
+                    2>>"$LOG_DIR/dnf-errors.log" || true
+            fi
+            if ! pkg_installed ibus-rime && ! _ibus_pick_engine 2>/dev/null | grep -qx rime; then
+                IBUS_RIME_FAILED=1
+            fi
+        fi
+    fi
+    if ! _ibus_pick_engine 2>/dev/null | grep -qx rime; then
+        local _el_major=""
+        _el_major=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
+        if [ "$DISTRO_ID" != fedora ] && [ "$_el_major" = "9" ]; then
+            warn "$(_t "rime-ice skipped — EL9 has no ibus-rime in any repo (EPEL 9 never packaged it); the desktop uses ibus-libpinyin instead." "rime-ice skipped — EL9 has no ibus-rime in any repo; ibus-libpinyin is used instead.")"
+            MANUAL_ITEMS+=("rime-ice 词典跳过 — EL9 无 ibus-rime（EPEL9 未打包），当前使用 ibus-libpinyin；如需雾凇拼音需自行编译 ibus-rime+librime")
+        else
+            warn "$(_t "rime-ice skipped — no Rime engine on this system; the desktop uses the fallback pinyin engine." "rime-ice skipped — no Rime engine on this system.")"
+            MANUAL_ITEMS+=("rime-ice 词典跳过 — 系统无 rime 引擎（见 $LOG_DIR/dnf-errors.log）。可用后备引擎 ibus-libpinyin，或装好 ibus-rime 后重跑 restore 自动补齐词典")
+        fi
+        return 1
+    fi
+
+    # --- migrate an existing fcitx5 Rime profile (this script used fcitx5 before) ---
+    # Rime data is frontend-agnostic, so whatever the user built up (custom schemas,
+    # learned words, user dicts) keeps working under IBus — only the host directory
+    # changes. build/ is deliberately dropped: Rime regenerates it on first start.
+    local _legacy="$HOME_DIR/$RIME_FCITX_USER_DIR_SUFFIX"
+    if [ ! -e "$dest/rime_ice.schema.yaml" ] && [ -d "$_legacy" ]; then
+        log "$(_t "Found an existing fcitx5 Rime profile — migrating it to ~/.config/ibus/rime..." "Found an existing fcitx5 Rime profile — migrating it to ~/.config/ibus/rime...")"
+        mkdir -p "$dest"
+        local _mig _mb
+        shopt -s nullglob dotglob
+        for _mig in "$_legacy"/*; do
+            _mb=$(basename "$_mig")
+            [ "$_mb" = "build" ] && continue
+            [ -e "$dest/$_mb" ] && continue      # never overwrite an ibus-side file
+            exe cp -r "$_mig" "$dest/" 2>/dev/null || true
+        done
+        shopt -u nullglob dotglob
+        if [ -f "$dest/rime_ice.schema.yaml" ]; then
+            INSTALLED_PKGS+=("rime-ice (migrated from ~/.local/share/fcitx5/rime)")
+            success "$(_t "fcitx5 Rime profile migrated to ~/.config/ibus/rime" "fcitx5 Rime profile migrated to ~/.config/ibus/rime")"
+            _rime_ibus_write_custom "$dest"
+            IBUS_DICT_READY=1
+            return 0
+        fi
+        log "$(_t "Legacy profile contained no rime-ice schema — continuing with the upstream zip." "Legacy profile contained no rime-ice schema — continuing with the upstream zip.")"
+    fi
+
+    if ! command -v unzip &>/dev/null; then
+        pm_install unzip || { MANUAL_ITEMS+=("rime-ice — unzip missing, deploy manually: $RIME_ICE_REPO"); return 1; }
+    fi
+
+
+    # Official release zip (much faster than git clone), GitHub direct
+    local zipfile unzipdir item b
+    zipfile=$(mktemp)
+    unzipdir=$(mktemp -d)
+    register_temp_path "$zipfile"
+    register_temp_path "$unzipdir"
+    log "$(_t "Downloading rime-ice release zip..." "Downloading rime-ice release zip...")"
+    
+    local _rime_attempts=3 _rime_delay=10 _rimerc=0
+    for (( _rattempt=1; _rattempt<=$_rime_attempts; _rattempt++ )); do
+        if download_gh "$RIME_ICE_ZIP_URL" "$zipfile"; then
+            _rimerc=0
+            break
+        fi
+        _rimerc=$?
+        if [ "$_rattempt" -lt "$_rime_attempts" ]; then
+            log "$(_t "Rime-ice download attempt $_rattempt/$_rime_attempts failed, retrying in ${_rime_delay}s..." "Rime-ice download attempt $_rattempt/$_rime_attempts failed, retrying in ${_rime_delay}s...")"
+            sleep "$_rime_delay"
+            rm -f "$zipfile"
+            zipfile=$(mktemp)
+        fi
+    done
+    
+    if [ "$_rimerc" -ne 0 ]; then
+        MANUAL_ITEMS+=("rime-ice — download failed after $_rime_attempts attempts, deploy manually: $RIME_ICE_REPO")
+        return 1
+    fi
+    if ! exe unzip -q "$zipfile" -d "$unzipdir"; then
+        MANUAL_ITEMS+=("rime-ice — zip extraction failed, deploy manually: $RIME_ICE_REPO")
+        return 1
+    fi
+
+    exe mkdir -p "$dest"
+    for item in "$unzipdir"/*; do
+        [ -e "$item" ] || continue
+        b=$(basename "$item")
+        case "$b" in
+            .git|.github|build|README.md|LICENSE|AGENTS.md|recipe.yaml) continue ;;
+        esac
+        exe cp -r "$item" "$dest/"
+    done
+    exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dest" 2>/dev/null || true
+
+    if [ -f "$dest/rime_ice.schema.yaml" ]; then
+        _rime_ibus_write_custom "$dest"
+        IBUS_DICT_READY=1
+        INSTALLED_PKGS+=("rime-ice (deployed to $dest)")
+        success "$(_t "rime-ice deployed" "rime-ice deployed")"
+        return 0
+    fi
+    MANUAL_ITEMS+=("rime-ice — deploy failed, do it manually: $RIME_ICE_REPO $dest")
+    return 1
+}
+
+# Write the IBus-side Rime frontend overrides into the user data dir. Only created
+# when absent so a user's own tuning survives a rerun.
+#   default.custom.yaml — schema list + menu/page_size:5 (the fcitx5 config used
+#                         DefaultPageSize=5; rime-ice already ships 5, this pins it)
+#   ibus_rime.yaml      — ibus-rime stops overwriting this file once it carries a
+#                         version (rime_main.c: deploy_config_file only when the
+#                         installed copy has no version field), so our values win.
+_rime_ibus_write_custom() { # $1 = rime user dir
+    local d="$1" _own
+    [ -n "$d" ] || return 0
+    # Only meaningful for the Rime engine — with the libpinyin fallback these files
+    # would be dead weight (and would confuse the next rime install).
+    if ! _ibus_pick_engine 2>/dev/null | grep -qx rime; then
+        return 0
+    fi
+    _own="$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
+    mkdir -p "$d" 2>/dev/null || return 0
+
+    if [ ! -f "$d/default.custom.yaml" ]; then
+        cat > "$d/default.custom.yaml" <<'RIMEEOF'
+# eilNiri: IBus + Rime defaults (managed file — delete to fall back to upstream)
+# Mirrors the fcitx5 settings this script shipped before the IBus migration.
+patch:
+  # Candidate page size (fcitx5: DefaultPageSize=5)
+  menu/page_size: 5
+  # Keep rime-ice as the only schema; ibus preload-engines=['rime'] selects it.
+  schema_list:
+    - schema: rime_ice
+  # Do NOT reset the switch state when the focus changes — the fcitx5 build ran
+  # with resetStateWhenFocusIn=Program and rime-ice ships reset commented out.
+  # (rime-ice may re-add its own copy on update; harmless either way.)
+RIMEEOF
+        chown "$_own" "$d/default.custom.yaml" 2>/dev/null || true
+    fi
+
+    if [ ! -f "$d/ibus_rime.yaml" ]; then
+        cat > "$d/ibus_rime.yaml" <<'RIMEEOF'
+# ibus-rime frontend configuration (generated by eilNiri)
+# The version field makes ibus-rime keep this file instead of overwriting it.
+config_version: '1.7'
+
+style:
+  # Candidate list layout. IBus/IBus-Rime orientation is also pinned by the
+  # dconf key /desktop/ibus/panel/lookup-table-orientation=0 (horizontal).
+  horizontal: true
+  # Embed the composition text in the application's entry field (false) or show
+  # it in the candidate window (true). fcitx5 ran with PreeditEnabledByDefault=
+  # False to work around Wayland apps that render in-app preedit badly; match it.
+  inline_preedit: false
+  preedit_style: composition
+  cursor_type: insert
+  # Show the IME status hint at the cursor (Rime's own, independent of the
+  # IBus language panel which is disabled below).
+  status_hint: false
+RIMEEOF
+        chown "$_own" "$d/ibus_rime.yaml" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# --- xwayland-satellite (Debian family & Rocky/Alma; Fedora's official repo already has it) ---
+# NOT published on crates.io (verified 404) — install from the upstream GitHub repo via cargo --git.
+XWS_REPO="https://github.com/Supreeeme/xwayland-satellite"
+install_xwayland_satellite() {
+    if command -v xwayland-satellite >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("xwayland-satellite (already installed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("xwayland-satellite (cargo --git)")
+        return "$DRY_RUN_RC"
+    fi
+    # the Xwayland server it wraps (best effort; binary still installs without it)
+    if ! command -v Xwayland >/dev/null 2>&1; then
+        pm_install xwayland 2>/dev/null || warn "$(_t "xwayland package not available; xwayland-satellite needs Xwayland at runtime." "xwayland package not available; xwayland-satellite needs Xwayland at runtime.")"
+    fi
+    # build deps: upstream needs clang (bindgen) + xcb-cursor dev headers + git
+    # (cargo --git); wayland-client / xkbcommon / xcb-util .pc 也由下面的
+    # ensure_pc_deps 兜底
+    local bdeps_rc=0
+    # RHEL: also need the wayland/xkbcommon/xcb-util dev headers for the .pc the
+    # build links against; tolerant so a missing name never aborts the batch.
+    dnf_install_tolerant git clang libclang-devel xcb-util-cursor-devel \
+        wayland-devel wayland-protocols-devel libxkbcommon-devel xcb-util-devel \
+        xcb-util-wm-devel libxcb-devel libdrm-devel mesa-libgbm-devel || bdeps_rc=$?
+    if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+        warn "$(_t "Some xwayland-satellite build deps unavailable (continuing):" "Some xwayland-satellite build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+    fi
+    # pkg-config 预检（只校验不自愈）
+    if ! ensure_pc_deps wayland-client xkbcommon xcb-cursor; then
+        MANUAL_ITEMS+=("xwayland-satellite — 系统库缺失: ${PC_STILL_MISSING[*]}（$PC_FAIL_HINT）; 手动安装对应 -devel 包后重跑: $XWS_REPO")
+        return 1
+    fi
+    if [ "$bdeps_rc" -ne 0 ] && [ ${#PC_STILL_MISSING[@]} -gt 0 ]; then
+        MANUAL_ITEMS+=("xwayland-satellite — build dependencies install failed (git/clang/xcb-util-cursor-devel); install manually: $XWS_REPO")
+        return 1
+    fi
+    if ! ensure_rust; then
+        MANUAL_ITEMS+=("xwayland-satellite — Rust toolchain install failed; install manually: $XWS_REPO")
+        return 1
+    fi
+    # NOT on crates.io (verified 404) — clone via CN mirrors (direct GitHub git fetch is
+    # often blocked) and install from the local checkout instead of `cargo install --git`.
+    local work logf
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    log "$(_t "Cloning xwayland-satellite (GitHub, via CN mirror if needed)..." "Cloning xwayland-satellite (GitHub, via CN mirror if needed)...")"
+    if ! git_clone_gh "$XWS_REPO" "$work/xws"; then
+        MANUAL_ITEMS+=("xwayland-satellite — git clone failed (direct + CN mirrors); install manually: $XWS_REPO (or Fedora repo)")
+        return 1
+    fi
+    logf="$LOG_DIR/xwayland-satellite-build.log"
+    log "$(_t "Building xwayland-satellite via cargo (about 3 min)..." "Building xwayland-satellite via cargo (about 3 min)...")"
+    ( cd "$work/xws" && cargo install --path . --locked --root /usr/local xwayland-satellite ) 2>&1 | tee "$logf"
+    local crc=${PIPESTATUS[0]}
+    if [ "$crc" -eq 0 ]; then
+        INSTALLED_PKGS+=("xwayland-satellite (cargo build)")
+        success "$(_t "xwayland-satellite installed" "xwayland-satellite installed")"
+        return 0
+    fi
+    local tailmsg
+    tailmsg=$(tail -n 6 "$logf" 2>/dev/null | tr '\n' ' ')
+    MANUAL_ITEMS+=("xwayland-satellite — build failed ($tailmsg); install manually: $XWS_REPO (or Fedora repo)")
+    return 1
+}
+
+# C++23 toolchain gate for the hyprwm stack: verify a candidate compiler actually
+# accepts -std=c++23 and export CXX/CC for all downstream hypr builds.
+ensure_hypr_cxx_toolchain() {
+    command -v cmake >/dev/null 2>&1 || return 1
+    command -v ninja >/dev/null 2>&1 || return 1
+    local _cand
+    for _cand in g++ clang++ c++; do
+        command -v "$_cand" >/dev/null 2>&1 || continue
+        printf 'int main(){return 0;}\n' | "$_cand" -std=c++23 -fsyntax-only -x c++ - >/dev/null 2>&1 || continue
+        export CXX="$_cand"
+        case "$_cand" in
+            g++|c++) export CC=gcc ;;
+            clang++) export CC=clang ;;
+        esac
+        return 0
+    done
+    return 1
+}
+
+# Build the hypr C++ build-tool stack that hyprlock/hypridle require, from source,
+# in dependency order. On distros where the stack is packaged (Fedora base) these
+# -devel packages were already installed above and this whole function is a no-op.
+# On Rocky/Alma/CentOS Stream none of it is packaged, so we compile the stack and
+# install each piece to /usr (cmake configs land in /usr/lib64/cmake/), letting
+# each later component's find_package resolve in the default search path.
+# Each component is skipped if it is already resolvable (installed as a package).
+#
+# Ported from deb-install.sh, whose battle-tested version fixes three problems
+# the old all-cmake RHEL build had:
+#   1. hyprland-protocols is a meson-only project (no CMakeLists.txt) — the old
+#      code fed it to cmake and the whole stack failed on the FIRST component;
+#   2. every component was cloned from master — hyprutils master needs C++26
+#      while EL10's g++ tops out at C++23, so all components are now pinned
+#      (HYPR_PIN_* / hypr_git_ref), including hyprlock/hypridle themselves;
+#   3. clone output went to /dev/null and there was a single log file, so a
+#      failed component left no trace — now per-component logs + main-log tails.
+# $1 = optional target (hyprlock|hypridle|all): only hyprlock needs hyprgraphics.
+build_hypr_stack() {
+    local _want="${1:-all}"
+    [ "$DRY_RUN" -eq 1 ] && return "$DRY_RUN_RC"
+
+    if ! ensure_hypr_cxx_toolchain; then
+        MANUAL_ITEMS+=("hypr C++ 栈 — 未找到支持 C++23 的编译器（g++/clang++）；请安装 gcc-c++ 后重跑 restore")
+        return 1
+    fi
+
+    local _log="$LOG_DIR/hypr-stack.log"
+    local _work
+    _work=$(mktemp -d)
+    register_temp_path "$_work"
+    echo "=== hypr stack (want=$_want cxx=${CXX:-default}) $(date '+%F %T') ===" >> "$_log"
+
+    # Build+install one component into /usr with its pinned tag. Per-component
+    # log; failures append a tail of it to the main log and warn with the path.
+    _build_hypr_one() { # $1 = name
+        local n="$1" ref
+        ref=$(hypr_git_ref "$n")
+        if [ -z "$ref" ]; then
+            echo "no pin for $n — refusing to build master" >> "$_log"
+            warn "$(_t "hypr stack: no pinned ref for " "hypr stack: no pinned ref for ") $n"
+            return 1
+        fi
+        echo "=== $n (ref=$ref cxx=${CXX:-default}) ===" >> "$_log"
+        local _clog="$LOG_DIR/hypr-stack-$n.log"
+        if ! git_clone_gh "https://github.com/hyprwm/$n" "$_work/$n" "$ref" >>"$_clog" 2>&1; then
+            warn "$(_t "hypr stack: clone failed for " "hypr stack: clone failed for ") $n $(_t "(see " "(see ") $_clog)"
+            return 1
+        fi
+        # Build-system probe: hyprland-protocols is meson-only (no CMakeLists.txt).
+        local _rc=1
+        if [ -f "$_work/$n/CMakeLists.txt" ]; then
+            ( cd "$_work/$n" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CXX_COMPILER="${CXX:-g++}" -DCMAKE_C_COMPILER="${CC:-gcc}" \
+                -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+                && cmake --build build -j"$(nproc)" \
+                && cmake --install build ) >>"$_clog" 2>&1 && _rc=0
+        elif [ -f "$_work/$n/meson.build" ]; then
+            command -v meson >/dev/null 2>&1 || pm_install meson ninja-build >/dev/null 2>&1 || true
+            ( cd "$_work/$n" && meson setup build --prefix=/usr --libdir=lib64 --buildtype=release \
+                && meson compile -C build -j"$(nproc)" \
+                && meson install -C build ) >>"$_clog" 2>&1 && _rc=0
+        else
+            echo "empty or corrupt clone (no CMakeLists.txt / meson.build)" >> "$_clog"
+        fi
+        if [ "$_rc" -ne 0 ]; then
+            echo "--- $n build failed (tail 40 of $_clog) ---" >> "$_log"
+            tail -n 40 "$_clog" >> "$_log" 2>/dev/null || true
+            warn "$(_t "hypr stack: " "hypr stack: ") $n $(_t "build failed — see " "build failed — see ") $_clog"
+            return 1
+        fi
+        ldconfig 2>/dev/null || true
+        INSTALLED_PKGS+=("hypr-$n (source build, $ref)")
+        log "$(_t "Built " "Built ") hypr-$n $(_t "from source" "from source") ($ref)"
+        return 0
+    }
+
+    # Skip a component when it is already resolvable:
+    #   hyprwayland-scanner  -> `hyprwayland-scanner` binary on PATH
+    #   others               -> pkg-config module (hyprland-protocols is
+    #                           pc-only, lives in /usr/share/pkgconfig) or its
+    #                           cmake config under /usr/lib{,64}/cmake/<name>/
+    _hypr_ok() { # $1 = name (also the cmake config dir basename)
+        local n="$1" d
+        case "$n" in
+            hyprwayland-scanner) command -v hyprwayland-scanner >/dev/null 2>&1 && return 0 ;;
+            *)
+                pkg-config --exists "$n" 2>/dev/null && return 0
+                for d in /usr/lib/cmake/"$n" /usr/lib64/cmake/"$n" /usr/local/lib/cmake/"$n" /usr/local/lib64/cmake/"$n"; do
+                    [ -d "$d" ] && find "$d" -maxdepth 1 -iname '*.cmake' 2>/dev/null | grep -qi . && return 0
+                done
+                ;;
+        esac
+        return 1
+    }
+
+    # External backstops first (all are hard deps EL may not package):
+    #   pugixml    — required by hyprwayland-scanner
+    #   sdbus-c++  — required by hyprlock/hypridle
+    #   libspng    — required by hyprgraphics (hyprlock only); EL has no libspng
+    #                package and hyprgraphics' CMakeLists marks spng REQUIRED
+    #                with no option to turn it off
+    if ! pkg-config --exists pugixml 2>/dev/null; then
+        log "$(_t "[hypr 0a] building pugixml (not in this repo set)..." "[hypr 0a] building pugixml (not in this repo set)...")"
+        if git_clone_gh "https://github.com/zeux/pugixml" "$_work/pugixml" "v1.14" \
+           && ( cd "$_work/pugixml" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+                && cmake --build build -j"$(nproc)" && cmake --install build ) >>"$LOG_DIR/pugixml-build.log" 2>&1; then
+            ldconfig 2>/dev/null || true
+            INSTALLED_PKGS+=("pugixml (source build)")
+        else
+            MANUAL_ITEMS+=("pugixml — source build failed; hyprwayland-scanner 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/pugixml-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/pugixml-build.log)")
+            return 1
+        fi
+    fi
+    if ! pkg-config --exists sdbus-c++ 2>/dev/null; then
+        log "$(_t "[hypr 0b] building sdbus-c++ (not in this repo set)..." "[hypr 0b] building sdbus-c++ (not in this repo set)...")"
+        if git_clone_gh "https://github.com/Kistler-Group/sdbus-cpp" "$_work/sdbus-cpp" "v2.1.0" \
+           && ( cd "$_work/sdbus-cpp" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+                -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_DOCS=OFF -DBUILD_CODEGEN=OFF \
+                && cmake --build build -j"$(nproc)" && cmake --install build ) >>"$LOG_DIR/sdbus-cpp-build.log" 2>&1; then
+            ldconfig 2>/dev/null || true
+            INSTALLED_PKGS+=("sdbus-c++ (source build)")
+        else
+            MANUAL_ITEMS+=("sdbus-c++ — source build failed; hyprlock/hypridle 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/sdbus-cpp-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/sdbus-cpp-build.log)")
+            return 1
+        fi
+    fi
+
+    # 3) libspng — randy408/libspng (required by hyprgraphics, absent from EL repos).
+    #    NAMING TRAP: libspng's CMake installs libspng.pc (pkg-config module
+    #    "libspng"), but hyprgraphics pkg_check_modules wants module "spng" — so
+    #    after installing, the pc file is copied under both names or hyprgraphics'
+    #    configure dies on the missing module while the library is actually fine.
+    #    Guard checks BOTH names: otherwise every rerun rebuilds libspng for
+    #    nothing (spng is never seen even though libspng is installed).
+    if ! pkg-config --exists spng 2>/dev/null && ! pkg-config --exists libspng 2>/dev/null; then
+        log "$(_t "[hypr 0c] building libspng (not in this repo set)..." "[hypr 0c] building libspng (not in this repo set)...")"
+        local _spng_ok=0
+        if git_clone_gh "https://github.com/randy408/libspng" "$_work/libspng" \
+           && ( cd "$_work/libspng" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+                && cmake --build build -j"$(nproc)" && cmake --install build ) >>"$LOG_DIR/libspng-build.log" 2>&1; then
+            _spng_ok=1
+            # CMake branch installed libspng.pc — alias it as module "spng"
+            if ! pkg-config --exists spng 2>/dev/null && [ -f /usr/lib64/pkgconfig/libspng.pc ]; then
+                cp /usr/lib64/pkgconfig/libspng.pc /usr/lib64/pkgconfig/spng.pc
+            fi
+        elif [ -f "$_work/libspng/spng/spng.c" ]; then
+            # Hand-rolled fallback: spng.c + spng.h + a minimal spng.pc
+            ( cd "$_work/libspng" \
+                && gcc -O2 -fPIC -shared spng/spng.c -o libspng.so -lz \
+                && install -Dm755 libspng.so /usr/lib64/libspng.so \
+                && install -Dm644 spng/spng.h /usr/include/spng.h \
+                && printf 'prefix=/usr\nexec_prefix=${prefix}\nlibdir=${exec_prefix}/lib64\nincludedir=${prefix}/include\n\nName: libspng\nDescription: Simple PNG (SPNG) decoding library\nVersion: 0.7.4\nLibs: -L${libdir} -lspng\nCflags: -I${includedir}\n' \
+                    > /usr/lib64/pkgconfig/spng.pc ) >>"$LOG_DIR/libspng-build.log" 2>&1 && _spng_ok=1
+        fi
+        if [ "$_spng_ok" -eq 1 ]; then
+            ldconfig 2>/dev/null || true
+            INSTALLED_PKGS+=("libspng (source build)")
+        else
+            MANUAL_ITEMS+=("libspng — source build failed; hyprgraphics 依赖它。日志尾部: $(tail -n 8 "$LOG_DIR/libspng-build.log" 2>/dev/null | tr '\n' ' ') (full: $LOG_DIR/libspng-build.log)")
+            return 1
+        fi
+    fi
+
+    # Strict dependency order (matches deb-install.sh: scanner before utils/lang,
+    # protocols after lang, graphics only for the hyprlock target).
+    _hypr_ok hyprwayland-scanner || _build_hypr_one hyprwayland-scanner || return 1
+    _hypr_ok hyprutils || _build_hypr_one hyprutils || return 1
+    _hypr_ok hyprlang || _build_hypr_one hyprlang || return 1
+    _hypr_ok hyprland-protocols || _build_hypr_one hyprland-protocols || return 1
+    if [ "$_want" = hyprlock ] || [ "$_want" = all ]; then
+        _hypr_ok hyprgraphics || _build_hypr_one hyprgraphics || return 1
+    fi
+    # Final re-check: everything the caller needs must now resolve.
+    if _hypr_ok hyprwayland-scanner && _hypr_ok hyprutils && _hypr_ok hyprlang && _hypr_ok hyprland-protocols; then
+        touch "$LOG_DIR/hypr-stack.ok"
+        return 0
+    fi
+    return 1
+}
+
+# --- hyprlock / hypridle source build (fallback when no apt/dnf package) ---
+# Used for any package listed in SOURCE_PKGS. Clones the upstream repo (CN-mirror
+# aware), installs the hyprwm build deps tolerantly, then builds — auto-detecting
+# the build system: older versions are Rust (cargo build), current ones are
+# C++/CMake (cmake -B build; the repos no longer ship a Cargo.toml). Installs the
+# binary to /usr/local/bin. For hyprlock it also writes /etc/pam.d/hyprlock (the
+# distro package ships one, but a source build does not — without it hyprlock cannot
+# authenticate).
+install_hypr_source() { # $1 = pkg name, $2 = repo URL
+    local pkg="$1" repo="$2"
+    if command -v "$pkg" >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("$pkg (already installed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("$pkg (source build)")
+        return "$DRY_RUN_RC"
+    fi
+
+    # build deps (tolerant: many hypr deps are absent on older releases / Rocky/Alma)
+    local _brc=0
+    dnf_install_tolerant "${HYPR_BUILD_DEPS_RHEL[@]}" || _brc=$?
+    if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+        warn "$(_t "Some $pkg build deps unavailable (continuing):" "Some $pkg build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+    fi
+    # EL names pam-devel (not libpam-devel). Force it so hyprlock's
+    # find_library(PAM) / pkg_check_modules(PAM) succeeds.
+    dnf_install_tolerant pam-devel sdbus-cpp-devel || true
+    if [ ! -f /usr/include/security/pam_appl.h ] && [ ! -f /usr/include/pam/pam_appl.h ]; then
+        MANUAL_ITEMS+=("$pkg — pam-devel missing (libpam not found); install: dnf install pam-devel, then rerun")
+        return 1
+    fi
+    local work
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    log "$(_t "Cloning " "Cloning ") $pkg ($repo)..."
+    local _ref
+    _ref=$(hypr_git_ref "$pkg")
+    if ! git_clone_gh "$repo" "$work/$pkg" "$_ref"; then
+        MANUAL_ITEMS+=("$pkg — git clone failed (direct + CN mirrors), build manually: $repo")
+        return 1
+    fi
+
+    # hyprlock/hypridle migrated from Rust to C++/CMake: the repos no longer contain
+    # a Cargo.toml (only CMakeLists.txt). Detect the build system instead of blindly
+    # running `cargo build` (which used to die with "could not find Cargo.toml").
+    local logf="$LOG_DIR/$pkg-build.log" _bin=""
+    if [ -f "$work/$pkg/Cargo.toml" ]; then
+        if ! ensure_rust; then
+            MANUAL_ITEMS+=("$pkg — Rust toolchain install failed, build manually: $repo")
+            return 1
+        fi
+        log "$(_t "Building " "Building ") $pkg (cargo) from source (~3 min, log: $logf)..."
+        ( cd "$work/$pkg" && cargo build --release ) > "$logf" 2>&1
+        _bin="$work/$pkg/target/release/$pkg"
+    elif [ -f "$work/$pkg/CMakeLists.txt" ]; then
+        # CMake build needs hyprwayland-scanner + hyprlang/hyprgraphics/hyprutils;
+        # build the hypr C++ stack from source iff those aren't already packaged.
+        # Pass the target so hyprgraphics (only hyprlock needs it) is skipped for
+        # hypridle.
+        if ! build_hypr_stack "$pkg"; then
+            MANUAL_ITEMS+=("$pkg — hypr C++ build stack (hyprwayland-scanner/hyprutils/hyprlang/hyprland-protocols) could not be built; see $LOG_DIR/hypr-stack.log. Build manually: $repo")
+            return 1
+        fi
+        log "$(_t "Building " "Building ") $pkg (CMake) from source (~3 min, log: $logf)..."
+        export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+        export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
+        ( cd "$work/$pkg" && cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+            -DCMAKE_CXX_COMPILER="${CXX:-g++}" -DCMAKE_C_COMPILER="${CC:-gcc}" \
+            -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+            && cmake --build build -j"$(nproc)" ) > "$logf" 2>&1
+        _bin="$work/$pkg/build/$pkg"
+    else
+        MANUAL_ITEMS+=("$pkg — cloned source has neither Cargo.toml nor CMakeLists.txt; build manually: $repo")
+        return 1
+    fi
+    if [ ! -x "$_bin" ]; then
+        local tailmsg
+        tailmsg=$(tail -n 6 "$logf" 2>/dev/null | tr '\n' ' ')
+        MANUAL_ITEMS+=("$pkg — build failed; 缺失依赖: ${BDEPS_MISSING[*]:-（常见为 CRB/EPEL 的 -devel 包未装，pkg_check_modules 失败即此因）}; 依赖需 CRB/EPEL 仓库。日志尾部: ${tailmsg:-empty} (full: $logf)")
+        warn "$(_t "Build failed: " "Build failed: ") $pkg (see $logf)"
+        return 1
+    fi
+
+    exe install -Dm755 "$_bin" "/usr/local/bin/$pkg"
+    INSTALLED_PKGS+=("$pkg (source build)")
+    success "$(_t "$pkg built from source" "$pkg built from source")"
+
+    # hyprlock needs a PAM config to authenticate; the distro package ships one, a source build does not.
+    if [ "$pkg" = hyprlock ] && [ ! -f /etc/pam.d/hyprlock ]; then
+        local _pam_src="$work/$pkg/pam/hyprlock"
+        mkdir -p /etc/pam.d
+        if [ -f "$_pam_src" ]; then
+            exe install -Dm644 "$_pam_src" /etc/pam.d/hyprlock
+        else
+            cat > /etc/pam.d/hyprlock <<'PAMEOF'
+# Minimal PAM config for hyprlock (generated by eilNiri source build)
+auth       include      login
+-account   include      login
+password   include      login
+session    include      login
+PAMEOF
+        fi
+        log "$(_t "Wrote /etc/pam.d/hyprlock for source-built hyprlock" "Wrote /etc/pam.d/hyprlock for source-built hyprlock")"
+    fi
+    return 0
+}
+
+install_source_package() { # $1 = package, $2 = upstream repository
+    local pkg="$1" repo="$2" work logf
+    if command -v "$pkg" >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("$pkg (already installed)")
+        return 0
+    fi
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("$pkg (source build)"); return "$DRY_RUN_RC"; }
+    if [[ "$pkg" = hyprlock || "$pkg" = hypridle ]]; then
+        install_hypr_source "$pkg" "$repo"
+        return $?
+    fi
+    dnf_install_tolerant "${RHEL_SOURCE_BUILD_DEPS[@]}" || true
+    # project-specific extras (tolerant: a name missing on older EL only degrades
+    # that feature); remember what is still missing so the failure report below
+    # can name the real cause instead of a bare log path.
+    BDEPS_MISSING=()
+    local _extra=() _meson_args=()
+    CMAKE_EXTRA_ARGS=()
+    case "$pkg" in
+        waybar)    _extra=("${SRC_DEPS_WAYBAR[@]}") ;;
+        copyq)     _extra=("${SRC_DEPS_COPYQ[@]}")
+                   # Disable whichever of CopyQ 16's three optional chains cannot
+                   # be satisfied on this EL release (each is hard-REQUIRED by
+                   # cmake while its option is ON — see SRC_DEPS_COPYQ note).
+                   # NOTE: option names are exact; cmake silently ignores an
+                   # unknown -D and configure still fails.
+                   if ! pkg_installed qca-qt6-devel || ! pkg_installed qtkeychain-qt6-devel; then
+                       CMAKE_EXTRA_ARGS+=(-DWITH_QCA_ENCRYPTION=OFF)
+                   fi
+                   if ! pkg_installed kf6-knotifications-devel; then
+                       # EL has no KF6 stack: WITH_NATIVE_NOTIFICATIONS=OFF also
+                       # drops the ECM requirement. Tray falls back to Qt's own
+                       # implementation; core clipboard features unaffected.
+                       CMAKE_EXTRA_ARGS+=(-DWITH_NATIVE_NOTIFICATIONS=OFF)
+                   fi
+                   if ! pkg_installed miniaudio-devel; then
+                       CMAKE_EXTRA_ARGS+=(-DWITH_AUDIO=OFF)
+                   fi ;;
+        playerctl) _extra=("${SRC_DEPS_PLAYERCTL[@]}")
+                   # playerctl's meson wants gtk-doc to render the API docs; the
+                   # runtime binary does not need them and gtk-doc is absent on EL.
+                   _meson_args=(-Dgtk-doc=false) ;;
+        fuzzel)    # fuzzel's man pages need scdoc; without it, build without docs
+                   pkg_installed scdoc || _meson_args=(-Ddocs=disabled) ;;
+    esac
+    if [ ${#_extra[@]} -gt 0 ]; then
+        dnf_install_tolerant "${_extra[@]}" || true
+    fi
+    local _missing_deps="${BDEPS_MISSING[*]:-}"
+    work=$(mktemp -d)
+    register_temp_path "$work"
+    logf="$LOG_DIR/$pkg-build.log"
+    # SOURCE_TAG pins known-EL-hostile projects (fuzzel) to a release that
+    # builds against the distro's older libraries instead of master.
+    if ! git_clone_gh "$repo" "$work/$pkg" "${SOURCE_TAG[$pkg]:-}"; then
+        MANUAL_ITEMS+=("$pkg — source clone failed (GitHub 与 CN 镜像均不可达); 可设 EILNIRI_GH_PROXY 重试: $repo")
+        return 1
+    fi
+    # Progress note BEFORE the silent build: cmake/ninja output goes to the log
+    # file only, so without this line the terminal looks frozen for minutes
+    # (copyq users reported it as "stuck").
+    log "$(_t "Building $pkg from source — output goes to " "Building $pkg from source — output goes to ") $logf$(_t " (screen stays quiet while it compiles)" " (screen stays quiet while it compiles)")"
+    export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    export CMAKE_PREFIX_PATH="/usr:/usr/local:/usr/lib64:/usr/local/lib64:${CMAKE_PREFIX_PATH:-}"
+    if ! build_source_project "$pkg" "$repo" "$work" "$logf" ${_meson_args[@]+"${_meson_args[@]}"}; then
+        local _why
+        _why=$(tail -n 8 "$logf" 2>/dev/null | tr '\n' ' ')
+        MANUAL_ITEMS+=("$pkg — source build failed; 缺失依赖: ${_missing_deps:-（见日志）}; 依赖包需 CRB/EPEL 仓库（dnf config-manager --set-enabled crb）。日志尾部: ${_why:-empty} (full: $logf)")
+        return 1
+    fi
+    INSTALLED_PKGS+=("$pkg (source build)")
+    success "$(_t "$pkg built from source" "$pkg built from source")"
+}
+
+build_source_project() {
+    local pkg="$1" _repo="$2" work="$3" logf="$4"; shift 4
+    local -a _margs=("$@")
+    local src="$work/$pkg"
+    if [ -f "$src/CMakeLists.txt" ]; then
+        ( cd "$src" && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib64 \
+            ${CMAKE_EXTRA_ARGS[@]+"${CMAKE_EXTRA_ARGS[@]}"} \
+            && cmake --build build -j"$(nproc)" && cmake --install build ) >"$logf" 2>&1
+    elif [ -f "$src/meson.build" ]; then
+        ( cd "$src" && meson setup build --prefix=/usr --libdir=lib64 --buildtype=release \
+            ${_margs[@]+"${_margs[@]}"} \
+            && meson compile -C build -j"$(nproc)" && meson install -C build ) >"$logf" 2>&1
+    elif [ -f "$src/Makefile" ]; then
+        # Plain-Makefile projects (e.g. brightnessctl): run ./configure first when
+        # present — it generates config.mk, and bare make dies with "You need to
+        # run ./configure first". PREFIX=/usr overrides the configure default.
+        ( cd "$src" && { [ ! -x ./configure ] || ./configure; } \
+            && make -j"$(nproc)" && make install PREFIX=/usr ) >"$logf" 2>&1
+    else
+        return 1
+    fi
+}
+
+install_nerd_font() {
+    local _has_nf=0 _p
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        [ "$_p" = "ttf-jetbrains-mono-nerd" ] && _has_nf=1
+    done
+    [ "$_has_nf" -eq 1 ] || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("JetBrainsMono Nerd Font (download)")
+        return "$DRY_RUN_RC"
+    fi
+    local _font_dir="$HOME_DIR/.local/share/fonts"
+    # 幂等：已在系统里装过带有 JetBrainsMono Nerd 字形的字体，或目标目录已有 Nerd Font
+    # 的 .ttf，则直接跳过（绝不在每次 restore 都重新下载几十~上百 MB）。
+    # 正则兼容两种 family 命名：包管理器装的 "JetBrains Mono Nerd" 与 release 下载的
+    # "JetBrainsMono Nerd"（Fedora 的 jetbrains-mono-nerd-fonts 包即据此被识别而跳过下载）。
+    if fc-list 2>/dev/null | grep -qiE 'jetbrains[[:space:]-]?mono.*nerd|nerd.*jetbrains[[:space:]-]?mono'; then
+        log "$(_t "Nerd Font already installed, skipping." "Nerd Font already installed, skipping.")"
+        return 0
+    fi
+    if [ -d "$_font_dir" ] && find "$_font_dir" \( -iname '*.ttf' -o -iname '*.otf' \) 2>/dev/null | head -100 | grep -qiE 'jetbrains[[:space:]-]?mono.*nerd|nerd.*jetbrains[[:space:]-]?mono'; then
+        log "$(_t "Nerd Font present in ~/.local/share/fonts, skipping." "Nerd Font present in ~/.local/share/fonts, skipping.")"
+        return 0
+    fi
+    mkdir -p "$_font_dir"
+    # 可选依赖：这是个 ~50MB 的大文件，且部分地区直连 GitHub 很慢/被墙。
+    # 不能走 download_gh —— 它全局用 --max-time 1800（30 分钟/次）+ 多代理轮询，
+    # 一旦源站慢或不通，整次 install 会被这个可选项拖死（表现为"一直卡住"）。
+    # 这里走统一的 _dl_gh_bounded：直连 + 实测可用的 CN 镜像各试一轮，每次硬性
+    # 90 秒封顶、连接超时 8s、最多 1 次重试；失败立刻降级为"未装上"提示。
+    log "$(_t "Downloading JetBrainsMono Nerd Font (icons, optional)..." "Downloading JetBrainsMono Nerd Font (icons, optional)...")"
+    local _zip _url _ok=0
+    _zip=$(mktemp); register_temp_path "$_zip"
+    _url="https://github.com/ryanoasis/nerd-fonts/releases/latest/download/JetBrainsMono.zip"
+    if _dl_gh_bounded "$_url" "$_zip" 90; then
+        _ok=1
+    fi
+    if [ "$_ok" -eq 1 ]; then
+        if command -v unzip >/dev/null 2>&1; then
+            exe unzip -o "$_zip" -d "$_font_dir" >/dev/null 2>&1 || true
+        else
+            exe python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$_zip" "$_font_dir" 2>/dev/null || true
+        fi
+        exe fc-cache -f "$_font_dir" >/dev/null 2>&1 || true
+        INSTALLED_PKGS+=("JetBrainsMono Nerd Font")
+        success "$(_t "Nerd Font installed (waybar icons)" "Nerd Font installed (waybar icons)")"
+    fi
+    # 下载失败或解压后仍无 nerd 字体 → 记录一条提示但不中止后续安装
+    if [ "$_ok" -eq 0 ] || ! fc-list 2>/dev/null | grep -qi 'jetbrainsmono.*nerd'; then
+        warn "$(_t "Nerd Font 未装上（可选）— waybar 部分图标可能显示为方框; 可稍后手动安装" "Nerd Font not installed (optional) — some waybar icons may render as boxes; install manually later")"
+    fi
+}
+
+# QEMU/KVM 虚拟机：安装并启用 spice-vdagent。
+# 解决两个常见问题：① 宿主机↔虚拟机 剪贴板/复制粘贴不通；② 光标在合成器下无硬件
+# cursor plane 时的拖影/残影（spice 提供客户端光标同步）。
+install_vm_agent() {
+    [ "$DRY_RUN" -eq 1 ] && { DRY_PKGS+=("spice-vdagent"); return "$DRY_RUN_RC"; }
+    command -v spice-vdagent >/dev/null 2>&1 && return 0
+    log "$(_t "Installing spice-vdagent (VM clipboard + cursor sync)..." "Installing spice-vdagent (VM clipboard + cursor sync)...")"
+    pm_install spice-vdagent 2>/dev/null || { warn "$(_t "spice-vdagent install failed (non-VM?)" "spice-vdagent install failed (non-VM?)")"; return 0; }
+    # 系统 daemon（spice-vdagentd）与用户会话 agent（spice-vdagent）
+    systemctl enable --now spice-vdagentd 2>/dev/null || true
+    as_user systemctl --user enable --now spice-vdagent 2>/dev/null || true
+    INSTALLED_PKGS+=("spice-vdagent")
+    success "$(_t "spice-vdagent installed" "spice-vdagent installed")"
+}
+
+stage_apps_install() {
+    if stage_done apps; then
+        log "$(_t "App install stage done, skipping." "App install stage done, skipping.")"
+        return
+    fi
+    section "$(_t "App Install" "App Install")" "$DISTRO_FAMILY family"
+    # warn early about low disk: cargo builds (niri vendored source + target) need several GB
+    local _disk_mb
+    _disk_mb=$(df -m "$BASE_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ "${_disk_mb:-0}" -gt 0 ] && [ "$_disk_mb" -lt 6144 ]; then
+        warn "$(_t "Low disk space: " "Low disk space: ") $((_disk_mb/1024))GB $(_t "free — cargo builds need ~6GB, the build may fail." "free — cargo builds need ~6GB, the build may fail.")"
+    fi
+    # baseline failure counts: the stage is only marked complete when nothing new failed
+    local _bf=${#FAILED_PKGS[@]} _bm=${#MANUAL_ITEMS[@]}
+    apply_cargo_mirror
+    install_rhel
+    install_nerd_font   # waybar 图标字体（Debian/RHEL 的 apt 包不带 Nerd Font 图标）
+    install_vm_agent    # QEMU/虚拟机：spice-vdagent（剪贴板桥 + 光标同步）
+    # Defer the progress mark while background builds (niri/awww) are still running
+    # (stage_wait_builds marks the stage complete once they finish), and when anything
+    # failed in this run — otherwise a rerun would skip retrying the failed installs.
+    if [ ${#BG_JOBS[@]} -gt 0 ]; then
+        log "$(_t "Background builds pending (niri/awww); stage marked complete after they finish." "Background builds pending (niri/awww); stage marked complete after they finish.")"
+    elif [ ${#FAILED_PKGS[@]} -gt "$_bf" ] || [ ${#MANUAL_ITEMS[@]} -gt "$_bm" ]; then
+        warn "$(_t "Some packages failed or need manual install; apps stage not marked complete — rerun (without deleting progress) retries them." "Some packages failed or need manual install; apps stage not marked complete — rerun (without deleting progress) retries them.")"
+    else
+        stage_mark apps
+    fi
+}
+
+# --- 4.3b wait for background cargo builds and install their outputs ---
+
+# Latest meaningful line from a build log (the crate cargo is currently compiling)
+build_progress_line() { # $1 = logfile
+    tail -n 300 "$1" 2>/dev/null \
+        | grep -E 'Compiling|Finished|error\[|error:|warning: unused|^error|Building|Downloading' \
+        | tail -n 1
+}
+
+stage_wait_builds() {
+    [ ${#BG_JOBS[@]} -eq 0 ] && { stage_mark apps; return; }
+    section "$(_t "Background Builds" "Background Builds")" "$(_t "waiting for cargo builds (niri/awww)" "waiting for cargo builds (niri/awww)")"
+    log "$(_t "Run './RHEL-install.sh status' in another terminal to watch progress live." "Run './RHEL-install.sh status' in another terminal to watch progress live.")"
+    local entry name pid logfile srcdir rc tailmsg start now prog any_failed=0
+    for entry in "${BG_JOBS[@]}"; do
+        IFS='|' read -r name pid logfile srcdir <<< "$entry"
+        log "$(_t "Waiting for " "Waiting for ") $name $(_t " build..." " build...")"
+        start=$(date +%s)
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep 15
+            now=$(( $(date +%s) - start ))
+            prog=$(build_progress_line "$logfile")
+            if [ -n "$prog" ]; then
+                log "$(_t "[bg] " "[bg] ") $name ${H_CYAN}$((now/60))m $((now%60))s${NC} $(_t "elapsed — " "elapsed — ") ${DIM}$prog${NC}"
+            else
+                log "$(_t "[bg] " "[bg] ") $name $((now/60))m $((now%60))s $(_t "elapsed" "elapsed")"
+            fi
+        done
+        rc=0
+        wait "$pid" 2>/dev/null || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            case "$name" in
+                niri) install_niri_from_build "$srcdir" "$logfile" ;;
+                awww) install_awww_from_build "$srcdir" "$logfile" ;;
+            esac
+        else
+            any_failed=1
+            tailmsg=$(tail -n 8 "$logfile" 2>/dev/null | tr '\n' ' ')
+            MANUAL_ITEMS+=("$name — build failed ($tailmsg)")
+            warn "$(_t "Background build failed: " "Background build failed: ") $name ($(_t "see log " "see log ") $logfile)"
+        fi
+        # drop this job from the state file so `status` reflects it accurately
+        sed -i "\|^$name|d" "$BUILD_STATE_FILE" 2>/dev/null
+    done
+    rm -f "$BUILD_STATE_FILE"
+    BG_JOBS=()
+    if [ "$any_failed" -eq 0 ]; then
+        stage_mark apps
+    else
+        warn "$(_t "Some background builds failed; apps stage not marked complete — rerun (without deleting progress) retries them." "Some background builds failed; apps stage not marked complete — rerun (without deleting progress) retries them.")"
+    fi
+}
+
+# --- 4.3c build status (./RHEL-install.sh status, run from another terminal while restore is building) ---
+
+do_status() {
+    if [ ! -f "$BUILD_STATE_FILE" ]; then
+        echo ""
+        info_kv "$(_t "Build Status" "Build Status")" "$(_t "no background builds running" "no background builds running")"
+        echo "   $(_t "(restore spawns niri/awww builds in background; the state file is removed when they finish)" "(restore spawns niri/awww builds in background; the state file is removed when they finish)")"
+        return 0
+    fi
+    section "$(_t "Build Status" "Build Status")" "$(_t "live progress (refresh manually or use watch)" "live progress (refresh manually or use watch)")"
+    local line name pid logfile srcdir alive elapsed prog
+    while IFS='|' read -r name pid logfile srcdir; do
+        [ -z "$name" ] && continue
+        if kill -0 "$pid" 2>/dev/null; then
+            elapsed=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+            [ -z "$elapsed" ] && elapsed="?"
+            prog=$(build_progress_line "$logfile")
+            echo -e "   ${H_CYAN}●${NC} ${H_GREEN}${name}${NC} ${H_YELLOW}RUNNING${NC} (${elapsed}s)"
+            [ -n "$prog" ] && echo -e "       ${DIM}→ $prog${NC}"
+        else
+            if grep -qE '^error(\[|:)|error: could not' "$logfile" 2>/dev/null; then
+                echo -e "   ${H_RED}✘${NC} ${H_GREEN}${name}${NC} ${H_RED}FAILED${NC} — see $logfile"
+            else
+                echo -e "   ${TICK} ${H_GREEN}${name}${NC} ${H_GREEN}finished${NC} — see $logfile"
+            fi
+        fi
+    done < "$BUILD_STATE_FILE"
+    echo ""
+    echo -e "   ${DIM}$(_t "Live tail (log streams to):" "Live tail (log streams to):")${NC}"
+    if [ -s "$BUILD_STATE_FILE" ]; then
+        while IFS='|' read -r name pid logfile srcdir; do
+            [ -n "$logfile" ] && [ -f "$logfile" ] && echo -e "       ${H_CYAN}tail -f $logfile${NC}"
+        done < "$BUILD_STATE_FILE"
+    fi
+    echo -e "   ${DIM}$(_t "or: watch -n 5 ./RHEL-install.sh status" "or: watch -n 5 ./RHEL-install.sh status")${NC}"
+}
+
+# --- 4.4 system services (built-in list, fzf selection; snapshot-free mode) ---
+
+stage_services() {
+    if stage_done services; then
+        log "$(_t "Service stage done, skipping." "Service stage done, skipping.")"
+        return
+    fi
+
+    section "$(_t "Services" "Services")" "$(_t "Select services to enable (built-in list)" "Select services to enable (built-in list)")"
+    local selected
+    selected=$(for unit in "${SVC_ORDER[@]}"; do
+        printf '%s\tprovider: %s\n' "$unit" "${SVC_PROVIDER[$unit]}"
+    done | fzf_multi " Select services to enable ") || {
+        warn "$(_t "User cancelled service selection, skipping." "User cancelled service selection, skipping.")"
+        return
+    }
+    if [ -z "$selected" ]; then
+        warn "$(_t "No services selected." "No services selected.")"
+        return
+    fi
+
+    local line unit provider erc
+    local any_failed=0
+    while IFS= read -r line; do
+        unit=$(echo "$line" | cut -f1 -d"$(printf '\t')" | xargs)
+        [ -z "$unit" ] && continue
+        provider="${SVC_PROVIDER[$unit]:-}"
+        # Resolve provider candidates (RHEL_CANDIDATES) BEFORE the install chain:
+        # EL10 has no power-profiles-daemon RPM at all — it ships tuned-ppd (PPD
+        # API translation daemon) instead. Installing tuned-ppd also pulls in
+        # tuned, and its service unit is tuned-ppd.service, not the original one.
+        local _pprovider="$provider"
+        if [ -n "$provider" ] && ! pkg_installed "$provider" && [ -n "${RHEL_CANDIDATES[$provider]:-}" ]; then
+            _pprovider=$(resolve_rhel_package "$provider" 2>/dev/null || echo "$provider")
+            [ "$_pprovider" != "$provider" ] && log "$(_t "Provider resolved: " "Provider resolved: ") $provider $(_t "-> " "-> ") $_pprovider"
+        fi
+        # The replacement provider's service unit has a different name — this must
+        # run OUTSIDE the install block below: on a rerun tuned-ppd is already
+        # installed, the install block is skipped entirely, and without this the
+        # enable step would still target the nonexistent power-profiles-daemon.service.
+        if [ "$_pprovider" != "$provider" ] && [ "$_pprovider" = "tuned-ppd" ]; then
+            unit="tuned-ppd.service"
+            log "$(_t "Service unit switched to: " "Service unit switched to: ") $unit $(_t "(tuned-ppd provides the same PPD D-Bus API)" "(tuned-ppd provides the same PPD D-Bus API)")"
+            # tuned-ppd.service hard-requires tuned.service; if an earlier
+            # stage_disable_system run masked tuned (stale pre-check), lift it.
+            if systemctl is-enabled tuned 2>/dev/null | grep -q masked; then
+                exe systemctl unmask tuned
+            fi
+        fi
+        if [ -n "$provider" ] && ! pkg_installed "$_pprovider"; then
+            log "$(_t "Installing service provider: " "Installing service provider: ")$_pprovider"
+            erc=0
+            # stderr MUST land in dnf-errors.log — the failure report below greps
+            # that file for THIS provider's real error (without it the report
+            # inherits whichever unrelated line sits at the log tail).
+            pm_install "$_pprovider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
+            # RHEL family: some providers (power-profiles-daemon, ...) are only in EPEL,
+            # not the base repos — enable EPEL once and retry before declaring failure.
+            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] \
+                && ! rpm -q epel-release >/dev/null 2>&1 && [ ! -f /etc/yum.repos.d/epel.repo ]; then
+                log "$(_t "Provider not in base RHEL repos — enabling EPEL and retrying..." "Provider not in base RHEL repos — enabling EPEL and retrying...")"
+                pm_install epel-release 2>/dev/null || true
+                erc=0
+                pm_install "$_pprovider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
+            fi
+            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
+                log "$(_t "Retrying service provider with EPEL: " "Retrying service provider with EPEL: ")$_pprovider"
+                erc=0
+                exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' "$_pprovider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
+            fi
+            # The standalone power-profiles-daemon declares `Conflicts: tuned`, and
+            # tuned ships preinstalled on EL8/9 server/cloud images. Masking tuned
+            # (stage_disable_system) does NOT lift a package-level conflict — only
+            # removing it does. Not applicable when we resolved to tuned-ppd (tuned
+            # is its hard dependency). Ask, never remove silently.
+            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ] \
+                && [ "$_pprovider" = "power-profiles-daemon" ] && pkg_installed tuned; then
+                warn "$(_t "power-profiles-daemon conflicts with the installed 'tuned' package (EL server/cloud images ship it preinstalled)." "power-profiles-daemon conflicts with the installed 'tuned' package.")"
+                if confirm "$(_t "Remove 'tuned' to install power-profiles-daemon? [Y/n] (default Y, 20s):" "Remove 'tuned' to install power-profiles-daemon? [Y/n] (default Y, 20s):")" "Y" 20; then
+                    exe dnf remove -y tuned 2>>"$LOG_DIR/dnf-errors.log" || true
+                    erc=0
+                    pm_install "$_pprovider" 2>>"$LOG_DIR/dnf-errors.log" || erc=$?
+                    [ "$erc" -eq 0 ] && ENABLED_SVCS+=("removed:tuned")
+                fi
+            fi
+            if [ "$erc" -ne 0 ] && [ "$erc" -ne "$DRY_RUN_RC" ]; then
+                local _svcerr
+                # Prefer lines about THIS provider, then generic dnf failure lines;
+                # the shared dnf-errors.log tail often belongs to an UNRELATED
+                # earlier failure (e.g. awww's optional dav1d-devel) and must not
+                # be shown as this provider's error.
+                _svcerr=$(grep -F "${_pprovider:-$provider}" "$LOG_DIR/dnf-errors.log" 2>/dev/null | tail -n 2 | tr '\n' ' ')
+                [ -z "$_svcerr" ] && _svcerr=$(grep -hE '没有任何匹配|No match|conflicts with|problem with|无法安装|Failed' "$LOG_DIR/dnf-errors.log" 2>/dev/null | tail -n 2 | tr '\n' ' ')
+                [ -z "$_svcerr" ] && _svcerr="(dnf 日志尾部: $(tail -n 2 "$LOG_DIR/dnf-errors.log" 2>/dev/null | tr '\n' ' '))"
+                FAILED_PKGS+=("svc-provider:$provider (${_svcerr:-见 $LOG_DIR/dnf-errors.log})")
+                any_failed=1
+                continue
+            fi
+            [ "$erc" -eq "$DRY_RUN_RC" ] && DRY_PKGS+=("$provider")
+        fi
+
+        erc=0
+        exe systemctl enable --now "$unit" || erc=$?
+        if [ "$erc" -eq 0 ]; then
+            ENABLED_SVCS+=("$unit")
+        elif [ "$erc" -eq "$DRY_RUN_RC" ]; then
+            DRY_SVCS+=("$unit")
+        else
+            # diagnostics: distinguish a *missing/masked unit* from a *start failure*
+            # so the failure is actionable on the rerun instead of repeating silently.
+            local _desc _srctxt
+            _desc=$(systemctl show "$unit" --property=Description 2>/dev/null | sed 's/^Description=//')
+            if [ -z "$_desc" ]; then
+                warn "$(_t "Service unit not found: " "Service unit not found: ")$unit (package may not ship this unit on this distro)"
+                _srctxt="unit 不存在于本系统（软件包未提供该 unit）"
+            else
+                # masked units are another common cause: name it explicitly
+                if systemctl is-enabled "$unit" 2>/dev/null | grep -q masked; then
+                    _srctxt="unit 处于 masked 状态"
+                else
+                    _srctxt="启动失败（见 service-$unit.log）"
+                fi
+            fi
+            systemctl --no-pager --lines=5 status "$unit" >"$LOG_DIR/service-$unit.log" 2>&1 || true
+            log "$(_t "Enable failed for " "Enable failed for ")$unit — details: $LOG_DIR/service-$unit.log"
+            FAILED_PKGS+=("service:$unit ($_srctxt)")
+            any_failed=1
+        fi
+        # also enable the sockets that ship with libvirtd (if present)
+        if [ "$unit" = libvirtd.service ]; then
+            for sock in libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket virtlogd.socket virtlockd.socket; do
+                exe systemctl enable "$sock" 2>/dev/null || true
+            done
+        fi
+    done <<< "$selected"
+
+    # mark complete only when this stage had no failures; otherwise leave it for the next run to retry
+    if [ "$any_failed" -eq 0 ]; then
+        stage_mark services
+    else
+        warn "$(_t "Service stage has failures, not marked complete. Will retry." "Service stage has failures, not marked complete. Will retry.")"
+    fi
+}
+
+# --- 4.5 display manager (automatic, all families) ---
+# One-script goal: after reboot the machine boots straight into the niri desktop.
+#   Arch  : ly (lightweight, fits niri)
+#   Debian/RHEL: gdm ONLY (gdm3 on old Debian). No lightdm/sddm alternatives.
+# An existing display manager (e.g. gdm3 preinstalled on Ubuntu Desktop) is DISABLED and
+# replaced by the chosen one. Safety: the replacement is installed FIRST and only then is
+# the old DM disabled — if the install fails the current DM stays untouched.
+# Escape hatch: EILNIRI_KEEP_DM=1 keeps the existing DM as-is.
+# gdm is the only supported DM: it is the one that ships in the base repos on every
+# supported release, and niri only needs a Wayland-capable greeter.
+# The GNOME *desktop* is never installed: only the gdm package (plus its hard
+# dependency gnome-shell, which is gdm's own login UI) — see ensure_gdm_only.
+
+stage_dm() {
+    if stage_done dm; then return; fi
+
+    section "$(_t "Display Manager" "Display Manager")" "$(_t "gdm only (replaces any other DM)" "gdm only (replaces any other DM)")"
+
+    # A DM only ever starts under graphical.target. If the system default target is not
+    # graphical (Ubuntu Server / previously switched to multi-user), the machine boots to a
+    # plain tty login and NO display manager runs — fix the default target explicitly.
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$(_t "[DRY-RUN] would ensure default target: graphical.target" "[DRY-RUN] would ensure default target: graphical.target")"
+    elif [ "$(systemctl get-default 2>/dev/null)" != "graphical.target" ]; then
+        log "$(_t "Default target is not graphical.target, switching to graphical.target..." "Default target is not graphical.target, switching to graphical.target...")"
+        if exe systemctl set-default graphical.target; then
+            success "$(_t "Default target set to graphical.target" "Default target set to graphical.target")"
+        else
+            warn "$(_t "Failed to set default target to graphical.target; the machine may still boot to a plain tty." "Failed to set default target to graphical.target; the machine may still boot to a plain tty.")"
+        fi
+    fi
+
+    # Known DM unit names. Used ONLY to disable leftovers from another install —
+    # gdm is the only DM this script installs or configures.
+    local known_dms=(gdm3 gdm sddm lxdm ly greetd plasma-login-manager lemurs)
+    local dm_pkgs dm_unit
+    # gdm only. gdm3 is the old-Debian name and stays as a fallback.
+    dm_pkgs="gdm"; dm_unit="gdm"
+
+    # what is currently configured/installed?
+    local current=""
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        current=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "display-manager.service")
+        current=$(basename "$current" .service)   # strip the .service suffix for unit comparison
+    fi
+    if [ -z "$current" ]; then
+        local dm
+        for dm in "${known_dms[@]}"; do
+            if pkg_installed "$dm"; then current="$dm"; break; fi
+        done
+    fi
+
+    # keep the existing DM on request, or when it already is the chosen one
+    if [ -n "$current" ] && { [ "${EILNIRI_KEEP_DM:-0}" = "1" ] || [ "$current" = "$dm_unit" ]; }; then
+        local reason="already the chosen DM"
+        [ "${EILNIRI_KEEP_DM:-0}" = "1" ] && reason="EILNIRI_KEEP_DM=1, keep"
+        info_kv "$(_t "DM" "DM")" "$current" "$reason"
+        stage_mark dm
+        return
+    fi
+    [ -n "$current" ] && info_kv "$(_t "DM" "DM")" "$current" "will be replaced by $dm_pkgs"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$(_t "[DRY-RUN] would install & enable: " "[DRY-RUN] would install & enable: ") $dm_pkgs${current:+ ($(_t "disabling " "disabling ") $current)}"
+        DRY_PKGS+=("$dm_pkgs")
+        DRY_SVCS+=("$dm_unit")
+        stage_mark dm
+        return
+    fi
+
+    # --- install the chosen DM first; never disable the current one before the replacement is in place ---
+    local ok=0
+    # gdm only, and gdm as a PACKAGE (never a desktop group): ensure_gdm_only()
+    # installs it with weak deps off and audits for stray GNOME desktop packages.
+    if ensure_gdm_only; then
+        dm_pkgs="gdm"; dm_unit="gdm"; ok=1
+    elif pm_install gdm3; then
+        dm_pkgs="gdm3"; dm_unit="gdm3"; ok=1
+    fi
+    if [ "$ok" -eq 0 ]; then
+        FAILED_PKGS+=("dm:$dm_unit")
+        warn "$(_t "No display manager could be installed; keeping the existing one (") $current$(_t ") unchanged — run niri-session from tty after reboot." ") unchanged — run niri-session from tty after reboot.")"
+        return   # not marked: rerun retries
+    fi
+
+    # --- disable every known DM and the display-manager.service entry ---
+    local dm
+    for dm in "${known_dms[@]}"; do
+        exe systemctl disable "$dm" 2>/dev/null || true
+    done
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        exe systemctl disable display-manager.service 2>/dev/null || rm -f /etc/systemd/system/display-manager.service
+    fi
+
+    # --- enable the chosen DM ---
+    if exe systemctl enable "$dm_unit"; then
+        # verify: the unit must be enabled, and (except ly, which runs on tty1 directly)
+        # display-manager.service must point at the new DM
+        local _verify_ok=1
+        if ! systemctl is-enabled --quiet "$dm_unit" 2>/dev/null; then
+            _verify_ok=0
+            warn "$(_t "Verification failed: " "Verification failed: ") $dm_unit $(_t "is not enabled." "is not enabled.")"
+        fi
+        if [ "$dm_unit" != "ly@tty1" ] && [ -e /etc/systemd/system/display-manager.service ]; then
+            local _dm_link
+            _dm_link=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
+            if [ "$(basename "$_dm_link" .service)" != "$dm_unit" ]; then
+                _verify_ok=0
+                warn "$(_t "Verification failed: display-manager.service points to " "Verification failed: display-manager.service points to ") ${_dm_link:-unknown}$(_t ", expected " ", expected ") $dm_unit"
+            fi
+        fi
+        if [ "$_verify_ok" -eq 1 ]; then
+            ENABLED_SVCS+=("$dm_unit")
+            success "$(_t "Display manager switched to: " "Display manager switched to: ") $dm_pkgs"
+            stage_mark dm
+        else
+            FAILED_PKGS+=("dm:$dm_unit")
+            warn "$(_t "Display manager enable verification failed; run niri-session from tty after reboot." "Display manager enable verification failed; run niri-session from tty after reboot.")"
+            # not marked: rerun retries
+        fi
+    else
+        FAILED_PKGS+=("dm:$dm_unit")
+        warn "$(_t "Display manager enable failed; run niri-session from tty after reboot." "Display manager enable failed; run niri-session from tty after reboot.")"
+        # not marked: rerun retries
+    fi
+}
+
+# --- 4.7 config deploy ---
+
+# Install the zsh runtime that configs/.zshrc depends on (oh-my-zsh + its custom
+# plugins + starship + eza + bat).  The distro packages for zsh-autosuggestions /
+# zsh-syntax-highlighting cannot satisfy oh-my-zsh's plugins=() list, and
+# oh-my-zsh itself is not packaged in Debian/RHEL at all — this is why the
+# collected .zshrc only ever worked on the Arch reference machine.  Runs only
+# when zsh was selected; every step is best-effort with a MANUAL_ITEMS note on
+# failure (the .zshrc itself is tolerant of missing pieces).
+install_zsh_extras() {
+    local _has_zsh=0 _p
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        [ "$_p" = "zsh" ] && _has_zsh=1
+    done
+    [ "$_has_zsh" -eq 1 ] || return 0
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("oh-my-zsh (git clone) starship eza bat zoxide")
+        return "$DRY_RUN_RC"
+    fi
+
+    # git is needed for the clones; not guaranteed present on a minimal install.
+    command -v git >/dev/null 2>&1 || pm_install git 2>/dev/null || true
+
+    # 1) oh-my-zsh itself (official repo -> gitee mirror -> CN proxy clones).
+    #    A bare GitHub clone dies on CN networks, so never rely on it alone.
+    if [ ! -d "$HOME_DIR/.oh-my-zsh" ]; then
+        log "$(_t "Installing oh-my-zsh..." "Installing oh-my-zsh...")"
+        if as_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null \
+            || as_user git clone --depth=1 https://gitee.com/mirrors/oh-my-zsh.git "$HOME_DIR/.oh-my-zsh" 2>/dev/null \
+            || git_clone_gh https://github.com/ohmyzsh/ohmyzsh.git "$HOME_DIR/.oh-my-zsh"; then
+            INSTALLED_PKGS+=("oh-my-zsh")
+        else
+            MANUAL_ITEMS+=("oh-my-zsh — clone failed (GitHub 与 gitee 镜像均不可达); 手动: git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git $HOME_DIR/.oh-my-zsh")
+        fi
+    else
+        log "$(_t "oh-my-zsh already present, skipping." "oh-my-zsh already present, skipping.")"
+    fi
+
+    # 2) the two plugins listed in configs/.zshrc — must live in $ZSH_CUSTOM/plugins
+    #    for oh-my-zsh's plugins=() to find them (distro packages don't).
+    if [ -d "$HOME_DIR/.oh-my-zsh" ]; then
+        mkdir -p "$HOME_DIR/.oh-my-zsh/custom/plugins"
+        local _plugin _plug_url
+        for _plugin in zsh-autosuggestions zsh-syntax-highlighting; do
+            if [ ! -d "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" ]; then
+                case "$_plugin" in
+                    zsh-autosuggestions)   _plug_url="https://github.com/zsh-users/zsh-autosuggestions" ;;
+                    zsh-syntax-highlighting) _plug_url="https://github.com/zsh-users/zsh-syntax-highlighting" ;;
+                esac
+                log "$(_t "Installing oh-my-zsh plugin: " "Installing oh-my-zsh plugin: ") $_plugin"
+                # git_clone_gh adds the CN mirror-proxy fallback — a direct
+                # GitHub clone from CN usually dies. It clones as root; the
+                # chown -R below hands the tree back to the target user.
+                git_clone_gh "$_plug_url" "$HOME_DIR/.oh-my-zsh/custom/plugins/$_plugin" \
+                    || MANUAL_ITEMS+=("oh-my-zsh plugin $_plugin — clone failed (GitHub 与镜像均不可达)")
+            fi
+        done
+        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+            "$HOME_DIR/.oh-my-zsh" 2>/dev/null || true
+    fi
+
+    # 3) starship (configs/.zshrc evals `starship init zsh` under a command -v guard).
+    #    Fedora ships starship in the official repos; EL has no package, so use the
+    #    official install script there.
+    if ! command -v starship >/dev/null 2>&1; then
+        log "$(_t "Installing starship..." "Installing starship...")"
+        local _starship_done=0
+        if dnf -q list available starship >/dev/null 2>&1 && pm_install starship; then
+            _starship_done=1
+        fi
+        if [ "$_starship_done" -eq 0 ]; then
+            if exe bash -c 'curl -sSfL https://starship.rs/install.sh | sh -s -- -y -b /usr/local/bin' 2>/dev/null; then
+                _starship_done=1
+            else
+                MANUAL_ITEMS+=("starship — install failed; run: curl -sSfL https://starship.rs/install.sh | sh -s -- -y")
+            fi
+        fi
+        [ "$_starship_done" -eq 1 ] && INSTALLED_PKGS+=("starship")
+    fi
+    # starship 没装上时才退回 oh-my-zsh 内置主题（agnoster，nerd font 提供 powerline
+    # 符号），保证 prompt 可用；starship 可用时保持 ZSH_THEME=""（本机同款，prompt
+    # 完全交给 starship + configs/.config/starship.toml）。
+    if ! command -v starship >/dev/null 2>&1 && [ -f "$HOME_DIR/.zshrc" ] && grep -q '^ZSH_THEME=""' "$HOME_DIR/.zshrc" 2>/dev/null; then
+        sed -i 's/^ZSH_THEME=""/ZSH_THEME="agnoster"/' "$HOME_DIR/.zshrc" 2>/dev/null || true
+        log "$(_t "starship unavailable — set ZSH_THEME=agnoster as fallback" "starship unavailable — set ZSH_THEME=agnoster as fallback")"
+    fi
+
+    # 4) eza (aliased in .zshrc): Fedora has it in the official repos; on EL it
+    #    lives in EPEL. cargo build is the last resort.
+    if ! command -v eza >/dev/null 2>&1; then
+        log "$(_t "Installing eza..." "Installing eza...")"
+        pm_install eza 2>/dev/null || true
+        if ! command -v eza >/dev/null 2>&1; then
+            if ! rpm -q epel-release >/dev/null 2>&1; then
+                log "$(_t "eza not in base repos — enabling EPEL and retrying..." "eza not in base repos — enabling EPEL and retrying...")"
+                pm_install epel-release 2>/dev/null || true
+                pm_install eza 2>/dev/null || true
+            fi
+            if ! command -v eza >/dev/null 2>&1; then
+                if command -v cargo >/dev/null 2>&1 && exe cargo install --locked --root /usr/local eza 2>/dev/null; then
+                    INSTALLED_PKGS+=("eza (cargo build)")
+                else
+                    MANUAL_ITEMS+=("eza — no repo package and cargo build failed; install manually (dnf --enablerepo=epel install eza / cargo install eza)")
+                fi
+            fi
+        fi
+    fi
+
+    # 5) bat (aliased in .zshrc): Fedora/EPEL name the binary `bat`; keep the
+    #    batcat symlink guard anyway in case a differently-named build shows up.
+    if ! command -v bat >/dev/null 2>&1; then
+        pm_install bat 2>/dev/null || true
+        if ! command -v bat >/dev/null 2>&1 && command -v batcat >/dev/null 2>&1; then
+            ln -sf /usr/bin/batcat /usr/local/bin/bat
+        fi
+    fi
+
+    # 6) zoxide (configs/.zshrc evals `zoxide init zsh` under a command -v guard).
+    #    Fedora ships it; EL often doesn't — fall back to cargo (rustup mirror
+    #    already configured for CN timezones via apply_cargo_mirror/ensure_rust).
+    if ! command -v zoxide >/dev/null 2>&1; then
+        pm_install zoxide 2>/dev/null || true
+        if ! command -v zoxide >/dev/null 2>&1; then
+            if command -v cargo >/dev/null 2>&1 || ensure_rust; then
+                if exe cargo install --locked --root /usr/local zoxide 2>/dev/null; then
+                    INSTALLED_PKGS+=("zoxide (cargo build)")
+                else
+                    MANUAL_ITEMS+=("zoxide — 无仓库包且 cargo 构建失败; 手动: dnf install zoxide (Fedora) 或 cargo install zoxide")
+                fi
+            else
+                MANUAL_ITEMS+=("zoxide — EL 仓库无包且 Rust 工具链不可用; 手动: dnf install zoxide (Fedora) 或 cargo install zoxide")
+            fi
+        fi
+    fi
+}
+
+# The shipped niri config spawns the polkit agent path from the reference machine
+# (/usr/lib/polkit-gnome-authentication-agent-1 — retired upstream, packaged by
+# neither Fedora nor EPEL). If that binary is absent but another agent is
+# installed (mate-polkit / polkit-kde / ...), repoint the spawn-at-startup line.
+# Fedora keeps 64-bit agents under /usr/lib64, so those globs are mandatory here.
+fix_polkit_agent() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _cfg="$HOME_DIR/.config/niri/config.kdl"
+    [ -f "$_cfg" ] || return 0
+    local _cur
+    _cur=$(grep -oP 'spawn-at-startup\s+"\K[^"]*polkit[^"]*' "$_cfg" 2>/dev/null | head -n 1)
+    [ -n "$_cur" ] || return 0
+    [ -x "$_cur" ] && return 0   # shipped path is valid, nothing to do
+    local _cand _found=""
+    for _cand in \
+        /usr/lib/*polkit*authentication-agent* \
+        /usr/lib64/*polkit*authentication-agent* \
+        /usr/libexec/*polkit*authentication-agent* \
+        /usr/lib/xfce-polkit /usr/lib64/xfce-polkit /usr/libexec/xfce-polkit \
+        /usr/lib/mate-polkit* /usr/lib64/mate-polkit* /usr/libexec/mate-polkit* \
+        /usr/lib/lxpolkit /usr/lib64/lxpolkit /usr/libexec/lxpolkit; do
+        [ -x "$_cand" ] || continue
+        _found="$_cand"
+        break
+    done
+    if [ -z "$_found" ]; then
+        warn "$(_t "No polkit agent found — GUI privilege prompts (disks, users...) will not appear." "No polkit agent found — GUI privilege prompts (disks, users...) will not appear.")"
+        return 0
+    fi
+    log "$(_t "polkit agent " "polkit agent ") $_cur $(_t "missing -> repointing to " "missing -> repointing to ") $_found"
+    sed -i "s#\"$_cur\"#\"$_found\"#" "$_cfg"
+    exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg"
+}
+
+# configs/.config/niri/config.kdl is SHARED by all three installers and still
+# starts fcitx5, which is exactly the component this script replaced. Debian and
+# Arch keep the fcitx5 line untouched (only this script calls this function); on
+# RHEL the line is repointed to the IBus launcher below.
+#
+# Why a launcher script instead of a plain "ibus-daemon -drx" line:
+#   * niri implements zwp_input_method_manager_v2, and upstream's documented
+#     niri setup is `ibus start --type wayland` (it spawns ibus-ui-gtk3 with
+#     --enable-wayland-im, giving native Wayland apps IME support through the
+#     protocol). Upstream notes plain spawn lines are unreliable there.
+#   * `ibus start` exits with an error if the Wayland IM protocol is missing, so
+#     the launcher falls back to `ibus-daemon -drx` (-d daemonize, -r replace a
+#     stale daemon, -x XIM server for XWayland/X11 apps), which always works.
+IBUS_SESSION_LAUNCHER=".config/ibus/eilniri-ime-session"
+
+_ibus_write_session_launcher() {
+    [ -n "${HOME_DIR:-}" ] || return 0
+    local _f="$HOME_DIR/$IBUS_SESSION_LAUNCHER"
+    mkdir -p "$(dirname "$_f")" 2>/dev/null || return 0
+    cat > "$_f" <<'LAUNCHEREOF'
+#!/bin/sh
+# eilNiri — start the IBus input method daemon for the niri session (RHEL family).
+# Written by RHEL-install.sh; safe to edit, and regenerated only if missing.
+#
+# PATH: the niri session env may not carry /usr/local/bin; the RPM binaries are
+# in /usr/bin, so make sure it is reachable.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export PATH
+
+log() { printf 'eilNiri-ime: %s\n' "$*" >&2; }
+
+# Already running (e.g. a second restore run / compositor reload)? Nothing to do.
+if pgrep -x ibus-daemon >/dev/null 2>&1; then
+    log "ibus-daemon already running"
+    exit 0
+fi
+
+# Make sure the engine the installer picked is the ACTIVE one. dconf's
+# preload-engines is honoured by the panel on startup (first entry wins), but
+# being explicit here also covers upgrades and manual dconf edits.
+select_engine() {
+    command -v ibus >/dev/null 2>&1 || return 0
+    # give the daemon/panel a moment to come up
+    i=0
+    while [ "$i" -lt 40 ]; do
+        cur=$(ibus engine 2>/dev/null || true)
+        [ -n "$cur" ] && break
+        i=$((i + 1)); sleep 0.5
+    done
+    want=""
+    if ibus list-engine 2>/dev/null | grep -qE '(^|[^a-z])rime$'; then
+        want=rime
+    elif ibus list-engine 2>/dev/null | grep -qE '(^|[^a-z])libpinyin$'; then
+        want=libpinyin
+    fi
+    [ -n "$want" ] || { log "no Chinese engine registered; leaving IBus as-is"; return 0; }
+    if [ "${cur:-}" != "$want" ]; then
+        ibus engine "$want" >/dev/null 2>&1 \
+            && log "activated engine: $want" \
+            || log "could not activate engine '$want' (current: ${cur:-none})"
+    else
+        log "engine already active: $want"
+    fi
+}
+
+# Preferred: Wayland input-method bridge (niri supports input-method v2).
+if command -v ibus >/dev/null 2>&1; then
+    if ibus start --type wayland >/dev/null 2>&1; then
+        log "started via 'ibus start --type wayland'"
+        select_engine
+        exit 0
+    fi
+    log "'ibus start --type wayland' failed (no input-method protocol?); falling back to ibus-daemon -drx"
+fi
+
+if command -v ibus-daemon >/dev/null 2>&1; then
+    # -d daemonize, -r replace any stale instance, -x XIM server for X11 apps.
+    # -R restarts the panel/config process if it dies (a dead panel means no
+    # candidate window, since the panel owns the lookup table UI).
+    ibus-daemon -drxR
+    select_engine
+    exit $?
+fi
+
+log "neither ibus nor ibus-daemon is installed — no Chinese input available"
+exit 1
+LAUNCHEREOF
+    chmod 0755 "$_f" 2>/dev/null || true
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_f" 2>/dev/null || true
+    return 0
+}
+
+_repoint_ime_spawn() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ -n "${HOME_DIR:-}" ] || return 0
+    local _cfg="$HOME_DIR/.config/niri/config.kdl"
+    [ -f "$_cfg" ] || return 0
+    _ibus_write_session_launcher
+    local _spawn='spawn-sh-at-startup "$HOME/'"$IBUS_SESSION_LAUNCHER"'"'
+    # already repointed?
+    grep -qF "$IBUS_SESSION_LAUNCHER" "$_cfg" 2>/dev/null && return 0
+    local _cur
+    _cur=$(grep -oE 'spawn-at-startup[[:space:]]+"[^"]*(fcitx|ibus)[^"]*"' "$_cfg" 2>/dev/null | head -n 1)
+    if [ -z "$_cur" ]; then
+        # Custom config without any IME spawn line — append one (unless the file
+        # has no spawn-at-startup section at all, in which case just warn).
+        if ! grep -qE '^[[:space:]]*spawn-at-startup' "$_cfg" 2>/dev/null; then
+            warn "$(_t "niri config has no spawn-at-startup section — add '$IBUS_SESSION_LAUNCHER' to it manually." "niri config has no spawn-at-startup section — add the IBus launcher manually.")"
+            return 0
+        fi
+        log "$(_t "No fcitx5 spawn line in niri config — appending the IBus launcher line" "No fcitx5 spawn line in niri config — appending the IBus launcher line")"
+    else
+        cp -f "$_cfg" "$_cfg.bak-ime-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+        log "$(_t "Repointing niri IME startup: fcitx5 -> $IBUS_SESSION_LAUNCHER" "Repointing niri IME startup: fcitx5 -> $IBUS_SESSION_LAUNCHER")"
+        sed -i -E "s#^[[:space:]]*spawn-at-startup[[:space:]]+\"[^\"]*(fcitx|ibus)[^\"]*\".*\$#${_spawn}#" "$_cfg"
+    fi
+    # Sanity net: never end up without an IME autostart (e.g. the sed pattern did
+    # not match because the user indented or reworded the line).
+    if ! grep -qF "$IBUS_SESSION_LAUNCHER" "$_cfg" 2>/dev/null; then
+        printf '\n// eilNiri: IBus input method (RHEL family — fcitx5 has no EL package)\n%s\n' "$_spawn" >> "$_cfg"
+    fi
+    exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg" 2>/dev/null || true
+    return 0
+}
+
+# The shared config.kdl also exports fcitx-specific IM module values in its
+# `environment { ... }` block. Those are exported INTO the niri session and rank
+# above environment.d, so they must be flipped to ibus here or every application
+# started by niri would keep looking for a fcitx daemon that no longer exists.
+# The block is byte-identical across the three scripts' snapshot; only the VALUE
+# is touched, which makes this safe for hand-edited configs.
+_repoint_ime_env_config() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ -n "${HOME_DIR:-}" ] || return 0
+    local _cfg="$HOME_DIR/.config/niri/config.kdl"
+    [ -f "$_cfg" ] || return 0
+    local _changed=0 _k _want _cur
+    for _k in XMODIFIERS GTK_IM_MODULE QT_IM_MODULE SDL_IM_MODULE; do
+        # NOTE on the two patterns below: `[[:space:]]+` right before `"` is
+        # unreliable (the quantifier can swallow the quote and the match fails),
+        # so the value is matched by its inner text and the "\"" is a separate,
+        # non-quantified anchor. The keys live inside niri's environment{} block,
+        # hence the leading whitespace class.
+        [ "$_k" = XMODIFIERS ] && _want="@im=ibus" || _want="ibus"
+        if [ "$_k" = XMODIFIERS ]; then
+            grep -qE "^[[:space:]]*${_k}[[:space:]]*\"@im=fcitx\"" "$_cfg" 2>/dev/null || continue
+            sed -i -E "s#^([[:space:]]*${_k}[[:space:]]*)\"@im=fcitx\"#\1\"${_want}\"#" "$_cfg"
+        else
+            grep -qE "^[[:space:]]*${_k}[[:space:]]*\"fcitx\"" "$_cfg" 2>/dev/null || continue
+            sed -i -E "s#^([[:space:]]*${_k}[[:space:]]*)\"fcitx\"#\1\"${_want}\"#" "$_cfg"
+        fi
+        _changed=1
+        log "$(_t "niri config environment: " "niri config environment: ")$_k -> $_want"
+    done
+    # Extra keys IBus/toolkits look at: INPUT_METHOD is read by several toolkits,
+    # XDG_SESSION_DESKTOP tells IBus which session it runs in (it reads that
+    # variable directly), GLFW_IM_MODULE matters for kitty. Added once, when the
+    # fcitx -> ibus switch happens.
+    if [ "$_changed" -eq 1 ]; then
+        local _want_kv _wk _wv
+        for _want_kv in "GLFW_IM_MODULE=ibus" "INPUT_METHOD=ibus" "XDG_SESSION_DESKTOP=niri"; do
+            _wk="${_want_kv%%=*}"; _wv="${_want_kv#*=}"
+            grep -qE "^[[:space:]]*${_wk}[[:space:]]" "$_cfg" 2>/dev/null && continue
+            sed -i "/^[[:space:]]*SDL_IM_MODULE/a\\	${_wk} \"${_wv}\"" "$_cfg" 2>/dev/null || true
+        done
+        exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# --- in-place text surgery that also works on a read-only parent directory ---
+# `sed -i` creates its temp file in the SAME directory as the target, so it fails
+# on a read-only /etc (containers, immutable root, some VM images) even when the
+# file itself is writable. awk can rewrite the file in place without extra files.
+
+# Delete the eilNiri IME marker block (all occurrences) from $1. 0 = success.
+# Strategy: filter with awk into a temp file OUTSIDE the target dir (works even
+# when the target dir is read-only), then copy the result back (needs only the
+# file itself to be writable); `sed -i` is the last resort.
+_env_strip_ime_block() { # $1 = file
+    local f="$1" tmp rc=1
+    [ -f "$f" ] || return 1
+    tmp=$(mktemp 2>/dev/null) || tmp=""
+    if [ -n "$tmp" ]; then
+        if awk '
+            /^# >>> eilNiri IME >>>$/ { inblk = 1; next }
+            /^# <<< eilNiri IME <<<$/ { inblk = 0; next }
+            !inblk
+        ' "$f" > "$tmp" 2>/dev/null && cat "$tmp" > "$f" 2>/dev/null; then
+            rc=0
+        fi
+        rm -f "$tmp"
+    fi
+    if [ "$rc" -ne 0 ]; then
+        sed -i '/^# >>> eilNiri IME >>>$/,/^# <<< eilNiri IME <<<$/d' "$f" 2>/dev/null && rc=0
+    fi
+    return "$rc"
+}
+
+# Delete every line of $1 matching the ERE in $2 (all occurrences). 0 = success.
+_env_drop_lines() { # $1 = file, $2 = ERE
+    local f="$1" re="$2" tmp rc=1
+    [ -f "$f" ] || return 1
+    tmp=$(mktemp 2>/dev/null) || tmp=""
+    if [ -n "$tmp" ]; then
+        if awk -v re="$re" '!($0 ~ re)' "$f" > "$tmp" 2>/dev/null && cat "$tmp" > "$f" 2>/dev/null; then
+            rc=0
+        fi
+        rm -f "$tmp"
+    fi
+    if [ "$rc" -ne 0 ]; then
+        sed -i -E "/${re}/d" "$f" 2>/dev/null && rc=0
+    fi
+    return "$rc"
+}
+
+prune_config_backups() { # $1 = directory, $2 = basename glob
+    local dir="$1" pattern="$2" backup
+    [ -d "$dir" ] || return 0
+    mapfile -t backups < <(
+        find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
+            | sort -rn | awk 'NR > 1 { sub(/^[^ ]+ /, ""); print }'
+    )
+    for backup in "${backups[@]}"; do
+        [ -n "$backup" ] && rm -f -- "$backup"
+    done
+}
+
+deploy_one() { # $1 = source path, $2 = destination path
+    local src="$1" dst="$2" ts="$3"
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+        log "$(_t "Backup existing: " "Backup existing: ")$dst -> $dst.bak-$ts"
+        exe mv "$dst" "$dst.bak-$ts"
+        prune_config_backups "$(dirname "$dst")" "$(basename "$dst").bak-*"
+    fi
+    exe cp -r "$src" "$dst"
+    exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dst"
+}
+
+is_privacy_risk() { # $1 = path inside configs/
+    local p="$1" b
+    b=$(basename "$p")
+    case "$p" in
+        *copyq*|*QtProject.conf*|*__pycache__*|*cached_layouts*|*/rime/*) return 0 ;;
+    esac
+    case "$b" in
+        copyq.lock|*.dat|*.log|*.sqlite|*.db) return 0 ;;
+    esac
+    return 1
+}
+
+# --- ~/.local/state 属主自愈 ---
+# 旧版本脚本以 root 在用户家目录下创建 ~/.local/state/eilNiri 后未归还属主，导致
+# ~/.local/state 整棵树归 root；waypaper 等程序登录后无法在其中创建自己的状态目录
+# （waypaper 启动即 PermissionError → GUI 打不开、壁纸失效）。
+fix_home_state_ownership() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _st="$HOME_DIR/.local/state" _ug
+    _ug=$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")
+
+    # The session wrapper logs to ~/.local/state/eilNiri/session.log. This script
+    # runs as root and used to leave that directory (and the log inside it) owned
+    # by root, so a normal user could not append to it and the redirect in
+    # niri-session aborted the whole login ("line 58: Permission denied").
+    # Create it here, owned by the target user, every run.
+    local _logs="$HOME_DIR/.local/state/eilNiri"
+    if [ -n "${HOME_DIR:-}" ] && [ -n "${TARGET_USER:-}" ]; then
+        mkdir -p "$HOME_DIR/.local/state" "$_logs" 2>/dev/null || true
+        chown "$TARGET_USER:$_ug" "$HOME_DIR/.local" "$HOME_DIR/.local/state" "$_logs" 2>/dev/null || true
+        chmod 0755 "$HOME_DIR/.local" "$HOME_DIR/.local/state" "$_logs" 2>/dev/null || true
+        if [ -e "$_logs/session.log" ]; then
+            chown "$TARGET_USER:$_ug" "$_logs/session.log" 2>/dev/null || true
+            chmod 0644 "$_logs/session.log" 2>/dev/null || true
+        fi
+    fi
+
+    # Pre-existing root-owned state trees (older runs, container images).
+    [ -d "$_st" ] || return 0
+    local _owner
+    _owner=$(stat -c '%U' "$_st" 2>/dev/null)
+    if [ -n "$_owner" ] && [ "$_owner" != "$TARGET_USER" ]; then
+        chown "$TARGET_USER:$_ug" "$HOME_DIR/.local" "$_st" 2>/dev/null || true
+        chown -R "$TARGET_USER:$_ug" "$_st" 2>/dev/null || true
+        log "$(_t "~/.local/state was root-owned — ownership restored to $TARGET_USER" "~/.local/state was root-owned — ownership restored to $TARGET_USER")"
+    fi
+}
+
+stage_configs() {
+    if stage_done configs; then
+        log "$(_t "Config deploy stage done, skipping." "Config deploy stage done, skipping.")"
+        return
+    fi
+    local snap="$BASE_DIR/configs"
+    if [ ! -d "$snap" ]; then
+        log "$(_t "configs/ not present — skipping config deploy." "configs/ not present — skipping config deploy.")"
+        return
+    fi
+
+    section "$(_t "Config Deploy" "Config Deploy")" "Target: $HOME_DIR"
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+
+    # 隐私防线：configs/ 里若混入剪贴板历史等个人数据，拒绝部署而非静默发出。
+    local _prv
+    _prv=$(find "$snap" -type f \( -path '*copyq*' -o -name 'QtProject.conf' -o -name '*.dat' \
+        -o -name '*.log' -o -name '*.sqlite' -o -name '*.db' -o -path '*__pycache__*' \
+        -o -path '*cached_layouts*' \) 2>/dev/null)
+    if [ -n "$_prv" ]; then
+        warn "$(_t "Privacy-sensitive files found in configs/ — they will NOT be deployed:" "Privacy-sensitive files found in configs/ — they will NOT be deployed:")"
+        echo "$_prv" | sed 's/^/       /'
+    fi
+
+    # root 属主的 ~/.local/state 会让 waypaper 等 GUI 启动即 PermissionError
+    fix_home_state_ownership
+    # 截图输出目录：satty 的 --output-filename 不会自动创建父目录
+    mkdir -p "$HOME_DIR/Pictures/Screenshots"
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+        "$HOME_DIR/Pictures" "$HOME_DIR/Pictures/Screenshots" 2>/dev/null || true
+
+    shopt -s nullglob dotglob
+    local item name
+    # ~/.config/<name>
+    for item in "$snap/.config"/*; do
+        name=$(basename "$item")
+        # configs/.config/fcitx5 belongs to the Debian/Arch builders — this script
+        # replaced Fcitx5 with IBus, so deploying it would leave a stale, wrong
+        # configuration behind. Any pre-existing user configuration is preserved.
+        if [ "$name" = "fcitx5" ]; then
+            log "$(_t "skip (IBus build): " "skip (IBus build): ") .config/fcitx5"
+            continue
+        fi
+        # ~/.config/ibus must NOT be replaced wholesale: besides the config
+        # snapshot it holds the daemon's live state (~/.config/ibus/bus/<address>).
+        # install_ibus_ime() copies the individual files instead.
+        if [ "$name" = "ibus" ]; then
+            log "$(_t "skip (handled file-by-file by install_ibus_ime): " "skip (handled by install_ibus_ime): ") .config/ibus"
+            continue
+        fi
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .config/$name"
+            continue
+        fi
+        deploy_one "$item" "$HOME_DIR/.config/$name" "$ts"
+    done
+    # ~/.local/share/<name> (fixed niri-session etc.)
+    for item in "$snap/.local/share"/*; do
+        name=$(basename "$item")
+        [ -d "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .local/share/$name"
+            continue
+        fi
+        mkdir -p "$HOME_DIR/.local/share"
+        deploy_one "$item" "$HOME_DIR/.local/share/$name" "$ts"
+    done 2>/dev/null
+    # ~/.local/share/applications (custom desktop files)
+    for item in "$snap/.local/share/applications"/*; do
+        [ -f "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") applications/$(basename "$item")"
+            continue
+        fi
+        mkdir -p "$HOME_DIR/.local/share/applications"
+        deploy_one "$item" "$HOME_DIR/.local/share/applications/$(basename "$item")" "$ts"
+    done 2>/dev/null
+    # ~/.local/bin (fixed niri-session etc.)
+    for item in "$snap/.local/bin"/*; do
+        [ -f "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") .local/bin/$(basename "$item")"
+            continue
+        fi
+        mkdir -p "$HOME_DIR/.local/bin"
+        deploy_one "$item" "$HOME_DIR/.local/bin/$(basename "$item")" "$ts"
+    done 2>/dev/null
+    # home dotfiles (e.g. .pam_environment)
+    for item in "$snap"/.*; do
+        name=$(basename "$item")
+        [[ "$name" = "." || "$name" = ".." || "$name" = ".config" ]] && continue
+        [ -f "$item" ] || continue
+        if is_privacy_risk "$item"; then
+            warn "$(_t "skip (privacy): " "skip (privacy): ") $name"
+            continue
+        fi
+        deploy_one "$item" "$HOME_DIR/$name" "$ts"
+    done
+    shopt -u nullglob dotglob
+
+    # enable PipeWire user services (if the audio group was installed)
+    local _pw=0
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        [ "$_p" = "pipewire-pulse" ] || [ "$_p" = "wireplumber" ] && _pw=1
+    done
+    if [ "$_pw" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+        log "$(_t "Enabling PipeWire user services..." "Enabling PipeWire user services...")"
+        as_user systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service 2>/dev/null || true
+    fi
+
+    # enable waypaper user services (wallpaper restore on login + random-change timer),
+    # deployed from configs/.config/systemd/user/. Only when waypaper was selected.
+    if [ "$DRY_RUN" -eq 0 ]; then
+        # 修正 user unit 里 ExecStart 的二进制绝对路径：参考机是 Arch，二进制多在
+        # /usr/bin；Debian/RHEL 系 pip(--user)、源码构建装到的可能是 /usr/local/bin
+        # 或 ~/.local/bin。路径对不上会 "Failed at step EXEC spawning ... No such file"
+        # （waypaper/hypridle 都中过招）。按 basename 在三个常见位置找真实二进制并改写。
+        local _sf _exe _base _new _cand
+        for _sf in "$HOME_DIR"/.config/systemd/user/*.service; do
+            [ -f "$_sf" ] || continue
+            while IFS= read -r _exe; do
+                _exe=${_exe%% *}                    # 去掉尾部参数
+                case "$_exe" in /*) ;; *) continue ;; esac
+                [ -x "$_exe" ] && continue          # 路径存在就不用改
+                _base=$(basename "$_exe")
+                _new=""
+                for _cand in /usr/bin/$_base /usr/local/bin/$_base "$HOME_DIR/.local/bin/$_base"; do
+                    [ -x "$_cand" ] && { _new="$_cand"; break; }
+                done
+                if [ -n "$_new" ]; then
+                    log "$(_t "fix ExecStart in " "fix ExecStart in ") $(basename "$_sf")$(_t ": " ": ") $_exe -> $_new"
+                    sed -i "s#^ExecStart=$_exe#ExecStart=$_new#" "$_sf" 2>/dev/null || true
+                fi
+            done < <(sed -n 's/^ExecStart=//p' "$_sf" 2>/dev/null)
+        done
+
+        # waybar 由 niri 的 spawn-at-startup 启动（configs/ 里没有任何 waybar
+        # systemd unit，GDM 也不会拉起它）——注释掉会导致状态栏彻底消失，
+        # 因此这里不做任何改动（与 arch-install.sh 保持一致）。
+
+        # 光标拖影：QEMU/KVM 虚拟机常因虚拟硬件 cursor plane 与 Niri 不兼容。
+        # Keep the environment file for user services, and export the same
+        # variables from the niri-session wrapper so GDM definitely inherits them.
+        if command -v systemd-detect-virt >/dev/null 2>&1; then
+            local _virt
+            _virt=$(systemd-detect-virt 2>/dev/null || true)
+            case "$_virt" in
+                qemu|kvm)
+                    local _cursor_env="$HOME_DIR/.config/environment.d/90-eilniri-cursor.conf"
+                    mkdir -p "$(dirname "$_cursor_env")"
+                    if [ ! -f "$_cursor_env" ] || ! grep -q '^WLR_NO_HARDWARE_CURSORS=1$' "$_cursor_env" 2>/dev/null; then
+                        printf '%s\n' 'WLR_NO_HARDWARE_CURSORS=1' 'WLR_RENDERER_ALLOW_SOFTWARE=1' > "$_cursor_env"
+                        chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cursor_env" 2>/dev/null || true
+                        log "$(_t "Enabled software cursor fallback for QEMU/KVM to prevent ghosting" "Enabled software cursor fallback for QEMU/KVM to prevent ghosting")"
+                    fi
+                    warn "$(_t "检测到 QEMU/KVM：已启用软件光标回退。若仍有拖影，请将虚拟显卡设为 virtio-gpu 并开启 3D 加速（gl=on），或改用 SPICE 显示协议。" "QEMU/KVM detected: software cursor fallback is enabled. If ghosting remains, use virtio-gpu with 3D acceleration (gl=on), or use the SPICE display protocol.")"
+                    ;;
+            esac
+        fi
+
+        # niri 配置自检：部署后若 niri 可用，validate 一次；失败说明配置被破坏，
+        # 给出明确提示（下次重跑 stage_configs 会用仓库干净配置重新部署）。
+        if command -v niri >/dev/null 2>&1 && [ -f "$HOME_DIR/.config/niri/config.kdl" ] && [ "$DRY_RUN" -eq 0 ]; then
+            if ! as_user niri validate -c "$HOME_DIR/.config/niri/config.kdl" >/dev/null 2>&1; then
+                warn "$(_t "niri config validation FAILED — 配置可能被破坏，快捷键/壁纸会失效。重跑 restore 会自动用仓库干净配置恢复。" "niri config validation FAILED — the config may be broken (hotkeys/wallpaper will fail). Rerun restore to redeploy the clean config.")"
+            else
+                log "$(_t "niri config validated OK" "niri config validated OK")"
+            fi
+        fi
+
+        local _has_wp=0
+        for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+            [ "$_p" = "waypaper" ] && _has_wp=1
+        done
+        if [ "$_has_wp" -eq 1 ] && [ -f "$HOME_DIR/.config/systemd/user/waypaper.service" ]; then
+            log "$(_t "Enabling waypaper user services..." "Enabling waypaper user services...")"
+            as_user systemctl --user daemon-reload 2>/dev/null || true
+            as_user systemctl --user enable --now waypaper.service waypaper-random.timer 2>/dev/null || true
+        fi
+
+        # 壁纸自愈：awww 已装则确保有壁纸状态文件（生成默认渐变壁纸 / 修正 waypaper 路径）
+        _ensure_wallpaper
+        _ensure_waypaper_desktop   # pip 装的 waypaper 无 .desktop → fuzzel 无图标
+        fix_polkit_agent           # niri 配置里的 agent 路径按本机实际安装改写
+        _repoint_ime_env_config    # niri environment{} 里的 fcitx 变量值改成 ibus
+        _repoint_ime_spawn         # niri 启动的 fcitx5 -> ibus-daemon -drx
+    fi
+
+    # IBus IME environment variables: ~/.pam_environment is disabled by default on
+    # modern distros, so write environment.d (imported by systemd --user).
+    # GTK/QT/SDL/GLFW/X11 all use the module name "ibus" (no per-toolkit alias like
+    # fcitx5's "fcitx"), so every client toolkit finds the same daemon.
+    # NOTE: this block REWRITES 00-ime.conf when it still carries the old fcitx
+    # values — a leftover "GTK_IM_MODULE=fcitx" makes IBus silently unusable.
+    if [ "$DRY_RUN" -eq 0 ]; then
+        local _has_ime=0
+        for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+            case "$_p" in ibus|ibus-*|rime-ice-pinyin-git) _has_ime=1; break ;; esac
+        done
+        if [ "$_has_ime" -eq 1 ] && [ -n "$TARGET_USER" ]; then
+            local _imed="$HOME_DIR/.config/environment.d"
+            mkdir -p "$_imed"
+            # 旧版（fcitx5 时代）文件名 ime.conf 按字母序在 00-ime.conf 之后，且值也
+            # 是 fcitx 的 —— 只要还带 fcitx 就删除，避免把 IBus 覆盖回不可用状态。
+            if [ -f "$_imed/ime.conf" ] && grep -qi "fcitx" "$_imed/ime.conf" 2>/dev/null; then
+                rm -f "$_imed/ime.conf"
+                log "$(_t "Removed stale environment.d/ime.conf (fcitx values)" "Removed stale environment.d/ime.conf (fcitx values)")"
+            fi
+            if [ ! -f "$_imed/00-ime.conf" ] || grep -qi "fcitx" "$_imed/00-ime.conf" 2>/dev/null; then
+                [ -f "$_imed/00-ime.conf" ] && cp -f "$_imed/00-ime.conf" "$_imed/00-ime.conf.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+                cat > "$_imed/00-ime.conf" <<'IMEEOF'
+# eilNiri: IBus 输入法环境变量（覆盖 systemd 用户服务与 XDG autostart 启动的应用）
+GTK_IM_MODULE=ibus
+QT_IM_MODULE=ibus
+XMODIFIERS=@im=ibus
+SDL_IM_MODULE=ibus
+GLFW_IM_MODULE=ibus
+INPUT_METHOD=ibus
+IMEEOF
+                chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_imed/00-ime.conf" 2>/dev/null || true
+                log "$(_t "Wrote ~/.config/environment.d/00-ime.conf (ibus IME vars)" "Wrote ~/.config/environment.d/00-ime.conf (ibus IME vars)")"
+            fi
+            # /etc/environment：PAM 会话级兜底（DM 直接拉起的会话也拿得到这些变量）。
+            # 旧版 fcitx 的块/散行必须先删除，否则同名变量后出现的值反而不会生效
+            # ——因此这里是"整块替换"而不是"存在就跳过"。
+            # NOTE: `sed -i` writes a temp file NEXT TO the target, so it fails on
+            # a read-only /etc even when the file itself is writable (seen in
+            # containers / immutable-root setups). awk can rewrite the same file
+            # without a temp file, so it is used as the fallback below.
+            if grep -q "^# >>> eilNiri IME >>>" /etc/environment 2>/dev/null; then
+                if _env_strip_ime_block /etc/environment; then
+                    log "$(_t "Removed the previous eilNiri IME block from /etc/environment" "Removed the previous eilNiri IME block from /etc/environment")"
+                else
+                    warn "$(_t "Could not clean the old IME block in /etc/environment — check it manually." "Could not clean the old IME block in /etc/environment.")"
+                fi
+            fi
+            # 散落在外面的 fcitx 行（更早期的脚本版本没有标记块）——留着会让 IBus 失效。
+            if grep -qE '^(GTK_IM_MODULE|QT_IM_MODULE|SDL_IM_MODULE|GLFW_IM_MODULE|INPUT_METHOD|XMODIFIERS)=.*fcitx' /etc/environment 2>/dev/null; then
+                if _env_drop_lines /etc/environment '^(# *)?(GTK_IM_MODULE|QT_IM_MODULE|SDL_IM_MODULE|GLFW_IM_MODULE|INPUT_METHOD|XMODIFIERS)=.*fcitx'; then
+                    log "$(_t "Removed leftover fcitx IM variables from /etc/environment" "Removed leftover fcitx IM variables from /etc/environment")"
+                fi
+            fi
+            if ! grep -q "^GTK_IM_MODULE=ibus$" /etc/environment 2>/dev/null; then
+                [ -f /etc/environment ] || touch /etc/environment
+                {
+                    echo ""
+                    echo "# >>> eilNiri IME >>>"
+                    echo "GTK_IM_MODULE=ibus"
+                    echo "QT_IM_MODULE=ibus"
+                    echo "XMODIFIERS=@im=ibus"
+                    echo "SDL_IM_MODULE=ibus"
+                    echo "GLFW_IM_MODULE=ibus"
+                    echo "INPUT_METHOD=ibus"
+                    echo "# <<< eilNiri IME <<<"
+                } >> /etc/environment
+                log "$(_t "Wrote ibus IME vars to /etc/environment (replacing any fcitx block)" "Wrote ibus IME vars to /etc/environment (replacing any fcitx block)")"
+            fi
+        fi
+    fi
+    # zsh 美化：把登录 shell 换成 zsh 并安装 configs/.zshrc 依赖的运行时
+    # （oh-my-zsh + 插件 + starship + eza/bat/zoxide）。仅在用户选择了 zsh 时生效。
+    for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
+        if [ "$_p" = "zsh" ] && [ "$DRY_RUN" -eq 0 ] && [ -n "$TARGET_USER" ] \
+            && [ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != "$(command -v zsh)" ]; then
+            exe chsh -s "$(command -v zsh)" "$TARGET_USER" 2>/dev/null \
+                || warn "$(_t "Failed to set zsh as default shell" "Failed to set zsh as default shell")"
+            break
+        fi
+    done
+    install_zsh_extras
+
+    success "$(_t "Config deploy complete." "Config deploy complete.")"
+    stage_mark configs
+}
+
+# --- 4.7b disable system components from other desktop environments ---
+# No DE other than niri is needed on this machine; disable the conflicting components
+# (notifications, settings daemons, etc.) so the niri session runs cleanly.  Every action
+# is recorded in $BASE_DIR/.system_disabled and is reversible via `restore-system`.
+DISABLE_MANIFEST="$BASE_DIR/.system_disabled"
+
+# Older eilNiri versions masked these GDM helpers, which makes a valid niri
+# Wayland session handoff appear as an immediate black screen. Always remove
+# those stale masks on RHEL-family restores; they are never valid cleanup targets.
+unmask_gdm_wayland() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local unit
+    for unit in gdm-wayland-session.service gdm-x11-session.service gdm-launch-environment.service; do
+        systemctl unmask "$unit" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$unit" 2>/dev/null || true
+    done
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+stage_disable_system() {
+    if stage_done sysdisable; then return; fi
+    if [ "${EILNIRI_KEEP_SYS:-0}" = "1" ]; then
+        log "$(_t "EILNIRI_KEEP_SYS=1: skipping system component disable." "EILNIRI_KEEP_SYS=1: skipping system component disable.")"
+        stage_mark sysdisable
+        return
+    fi
+
+    section "$(_t "System Cleanup" "System Cleanup")" "$(_t "disabling other-DE components (mask/stop/hidden)" "disabling other-DE components (mask/stop/hidden)")"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$(_t "[DRY-RUN] Would disable system components of other desktop environments." "[DRY-RUN] Would disable system components of other desktop environments.")"
+        stage_mark sysdisable
+        return
+    fi
+
+    > "$DISABLE_MANIFEST"  # Clear manifest before rebuild
+
+    local line type name reason _rc _adir _afile valid
+    local disabled_count=0 skipped_count=0 failed_items=()
+
+    # EL10 whitelist pre-check (runs BEFORE stage_services installs anything):
+    # when the power-profiles-daemon provider resolves to tuned-ppd (RHEL 10
+    # family ships tuned-ppd instead of the standalone daemon), masking
+    # tuned.service would break tuned-ppd, which hard-requires tuned. Resolve
+    # once up front — this stage runs before the service stage installs the
+    # provider, so checking installed packages alone is too late.
+    local _TUNED_PPD_MODE=0
+    if pkg_installed tuned-ppd 2>/dev/null \
+        || [ "$(resolve_rhel_package power-profiles-daemon 2>/dev/null || true)" = "tuned-ppd" ]; then
+        _TUNED_PPD_MODE=1
+        log "$(_t "EL10 detected: power-profiles API is provided by tuned-ppd — tuned.service will NOT be masked." "EL10 detected: power-profiles API is provided by tuned-ppd — tuned.service will NOT be masked.")"
+    fi
+
+    for line in "${DISABLE_SYS[@]}"; do
+        IFS='|' read -r type name reason <<< "$line"
+        valid=0
+
+        if [ "$name" = "tuned.service" ] && [ "$_TUNED_PPD_MODE" -eq 1 ]; then
+            log "$(_t "  [SKIP] tuned.service — tuned-ppd (power-profiles provider) requires it" "  [SKIP] tuned.service — tuned-ppd (power-profiles provider) requires it")"
+            skipped_count=$((skipped_count + 1))
+            continue
+        fi
+
+        case "$type" in
+            autostart)
+                # Check if autostart file exists in system
+                if [ -f "/etc/xdg/autostart/$name" ]; then
+                    _adir="$HOME_DIR/.config/autostart"
+                    mkdir -p "$_adir"
+                    _afile="$_adir/$name"
+                    
+                    # Write Hidden=true override
+                    cat > "$_afile" <<ASEOF
+[Desktop Entry]
+Hidden=true
+ASEOF
+                    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_afile" 2>/dev/null || true
+                    
+                    # Verify file was created and contains Hidden=true
+                    if [ -f "$_afile" ] && grep -q "Hidden=true" "$_afile"; then
+                        log "$(_t "  [✓ DISABLED] autostart: " "  [✓ DISABLED] autostart: ")$name"
+                        echo "   $(_t "   └─ Reason: " "   └─ Reason: ")$reason"
+                        valid=1
+                        disabled_count=$((disabled_count + 1))
+                        
+                        # Try to kill running process (extract binary name from .desktop name)
+                        local _proc_base="${name%.desktop}"
+                        if pkill -u "$TARGET_USER" -f "$_proc_base" 2>/dev/null; then
+                            log "$(_t "   └─ Killed running process: " "   └─ Killed running process: ")$_proc_base"
+                        fi
+                    else
+                        failed_items+=("autostart|$name")
+                    fi
+                else
+                    skipped_count=$((skipped_count + 1))
+                fi
+                ;;
+                
+            userunit)
+                # Check if unit exists for this user
+                local _unit_exists=0
+                if as_user systemctl --user list-unit-files 2>/dev/null | grep -q "^$name"; then
+                    _unit_exists=1
+                fi
+                
+                if [ "$_unit_exists" -eq 1 ]; then
+                    # Stop the unit first (if running)
+                    as_user systemctl --user stop "$name" 2>/dev/null || true
+                    
+                    # Mask the unit
+                    _rc=0
+                    as_user systemctl --user mask "$name" 2>/dev/null || _rc=$?
+                    
+                    if [ "$_rc" -eq 0 ]; then
+                        # Verify mask was successful
+                        if as_user systemctl --user is-enabled "$name" 2>/dev/null | grep -q "masked"; then
+                            log "$(_t "  [✓ DISABLED] user unit: " "  [✓ DISABLED] user unit: ")$name"
+                            echo "   $(_t "   └─ Reason: " "   └─ Reason: ")$reason"
+                            valid=1
+                            disabled_count=$((disabled_count + 1))
+                        else
+                            failed_items+=("userunit|$name")
+                        fi
+                    else
+                        failed_items+=("userunit|$name")
+                    fi
+                else
+                    skipped_count=$((skipped_count + 1))
+                fi
+                ;;
+                
+            systemunit)
+                # Check if unit exists on system
+                local _unit_exists=0
+                if systemctl list-unit-files 2>/dev/null | grep -q "^$name"; then
+                    _unit_exists=1
+                fi
+                
+                if [ "$_unit_exists" -eq 1 ]; then
+                    # Stop the unit first (if running)
+                    systemctl stop "$name" 2>/dev/null || true
+                    
+                    # Mask the unit
+                    _rc=0
+                    systemctl mask "$name" 2>/dev/null || _rc=$?
+                    
+                    if [ "$_rc" -eq 0 ]; then
+                        # Verify mask was successful
+                        if systemctl is-enabled "$name" 2>/dev/null | grep -q "masked"; then
+                            log "$(_t "  [✓ DISABLED] system unit: " "  [✓ DISABLED] system unit: ")$name"
+                            echo "   $(_t "   └─ Reason: " "   └─ Reason: ")$reason"
+                            valid=1
+                            disabled_count=$((disabled_count + 1))
+                        else
+                            failed_items+=("systemunit|$name")
+                        fi
+                    else
+                        failed_items+=("systemunit|$name")
+                    fi
+                else
+                    skipped_count=$((skipped_count + 1))
+                fi
+                ;;
+        esac
+        
+        # Record successful disables in manifest (for future restore-system)
+        if [ "$valid" -eq 1 ]; then
+            echo "$type|$name" >> "$DISABLE_MANIFEST"
+        fi
+    done
+    
+    # Summary
+    echo ""
+    info_kv "$(_t "System Components Disabled" "System Components Disabled")" "$disabled_count successfully disabled"
+    if [ "$skipped_count" -gt 0 ]; then
+        info_kv "$(_t "Not Found (Skipped)" "Not Found (Skipped)")" "$skipped_count components (not installed on this system)"
+    fi
+    
+    if [ ${#failed_items[@]} -gt 0 ]; then
+        warn "$(_t "Failed to disable ${#failed_items[@]} components:" "Failed to disable ${#failed_items[@]} components:")"
+        for item in "${failed_items[@]}"; do
+            echo -e "       ${H_YELLOW}-${NC} $item"
+        done
+        warn "$(_t "Stage not marked complete — rerun retries." "Stage not marked complete — rerun retries.")"
+    else
+        stage_mark sysdisable
+        success "$(_t "All replaceable system components disabled successfully." "All replaceable system components disabled successfully.")"
+    fi
+}
+
+# --- 4.8 hardware adapt (auto-detect output/resolution) ---
+
+stage_hardware_adapt() {
+    if stage_done hwadapt; then return; fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$(_t "[DRY-RUN] Skipping hardware adapt." "[DRY-RUN] Skipping hardware adapt.")"
+        stage_mark hwadapt
+        return
+    fi
+    if [ ! -d /sys/class/drm ] || [ -z "$(ls /sys/class/drm/card*-*/status 2>/dev/null)" ]; then
+        log "$(_t "No DRM device, skipping hardware adapt." "No DRM device, skipping hardware adapt.")"
+        stage_mark hwadapt
+        return
+    fi
+
+    section "$(_t "Hardware Adapt" "Hardware Adapt")" "$(_t "Auto-detect display" "Auto-detect display")"
+    local niri_cfg="$HOME_DIR/.config/niri/config.kdl"
+    local waybar_cfg="$HOME_DIR/.config/waybar/config"
+
+    # --- 1) detect the actual output name + resolution ---
+    local detected_out="" detected_mode="" p
+    for p in /sys/class/drm/card*-*/status; do
+        [ "$(cat "$p" 2>/dev/null)" = "connected" ] || continue
+        local dir
+        dir=$(dirname "$p")
+        detected_out=$(basename "$dir" | sed 's/^card[0-9]-//')
+        detected_mode=$(head -1 "$dir/modes" 2>/dev/null)
+        [ -n "$detected_out" ] && break
+    done
+
+    if [ -z "$detected_out" ]; then
+        warn "$(_t "No connected display found, skipping adapt." "No connected display found, skipping adapt.")"
+        # On QEMU/KVM this usually means the virtual GPU/render backend isn't
+        # producing an active output — the classic cause of niri's
+        # "display output is not active" / black screen at the greeter.
+        local _virt=""
+        command -v systemd-detect-virt >/dev/null 2>&1 && _virt=$(systemd-detect-virt 2>/dev/null || true)
+        case "$_virt" in
+            qemu|kvm)
+                warn "$(_t "检测到 QEMU/KVM 且无可用显示输出 — niri 进桌面可能黑屏 / 提示 display output is not active。请在虚拟机上：① 显卡设为 virtio-gpu 并开 3D（gl=on）；② 显示协议用 SPICE；③ 确保安装了对应的图形驱动（mesa/virtio_gpu）；④ libvirt 里 <video> 的 model 为 virtio 并开启渲染。改完重启即可。" "QEMU/KVM detected with no active display output — niri may black-screen / show 'display output is not active'. On the VM: 1) set the video card to virtio-gpu with 3D (gl=on); 2) use the SPICE display protocol; 3) ensure the graphics driver (mesa/virtio_gpu) is installed; 4) set libvirt <video> model=virtio with rendering enabled. Reboot after changing.")"
+                ;;
+        esac
+        # Do not rewrite output settings when the installer cannot observe a
+        # connected DRM output. The GDM session may expose it later.
+        stage_mark hwadapt
+        return
+    fi
+
+    # resolution format: 1920x1080 -> mode "1920x1080@60"
+    local mode_line=""
+    if [ -n "$detected_mode" ]; then
+        local w h refresh
+        w=$(echo "$detected_mode" | cut -dx -f1)
+        h=$(echo "$detected_mode" | cut -dx -f2)
+        # EDID offset 12 is NOT the refresh rate; proper refresh requires parsing
+        # the detailed timing descriptor. Default to 60Hz to avoid bogus values.
+        refresh=60
+        mode_line="mode \"${w}x${h}@${refresh}\""
+    fi
+
+    info_kv "$(_t "Detected output" "Detected output")" "$detected_out" "${detected_mode:-?}"
+
+    # --- 2) fix niri config ---
+    if [ -f "$niri_cfg" ]; then
+        log "$(_t "Adapting niri output config..." "Adapting niri output config...")"
+        # backup
+        cp "$niri_cfg" "$niri_cfg.bak-hw-$(date +%Y%m%d-%H%M%S)"
+        prune_config_backups "$(dirname "$niri_cfg")" "$(basename "$niri_cfg").bak-hw-*"
+
+        # find the first active output block and replace its name and mode
+        local tmp
+        tmp=$(mktemp)
+        register_temp_path "$tmp"
+        local in_first_output=0 found_output=0
+        while IFS= read -r line; do
+            if [ "$found_output" -eq 0 ] && echo "$line" | grep -qP '^\s*output\s+"'; then
+                found_output=1
+                in_first_output=1
+                echo "output \"$detected_out\" {" >> "$tmp"
+                [ -n "$mode_line" ] && echo "    $mode_line" >> "$tmp"
+                continue
+            fi
+            if [ "$in_first_output" -eq 1 ]; then
+                # skip mode lines inside the original output block
+                if echo "$line" | grep -qP '^\s*mode\s+"'; then
+                    [ -z "$mode_line" ] && echo "$line" >> "$tmp"
+                    continue
+                fi
+                if echo "$line" | grep -qP '^\s*\}'; then
+                    in_first_output=0
+                    [ -n "$mode_line" ] && echo "}" >> "$tmp" || echo "}" >> "$tmp"
+                    continue
+                fi
+                # skip other content inside the output block (left for the new empty block)
+                continue
+            fi
+            # comment out the 2nd and later output blocks
+            if [ "$found_output" -eq 1 ] && echo "$line" | grep -qP '^\s*output\s+"'; then
+                echo "/-output $(echo "$line" | sed 's/^\s*output\s*//')" >> "$tmp"
+                continue
+            fi
+            echo "$line" >> "$tmp"
+        done < "$niri_cfg"
+        mv "$tmp" "$niri_cfg"
+        exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$niri_cfg"
+        success "$(_t "niri output adapted" "niri output adapted")"
+    fi
+
+    # --- 3) fix the hardware sink in waybar config ---
+    if [ -f "$waybar_cfg" ]; then
+        if grep -q 'ignored-sinks' "$waybar_cfg" 2>/dev/null; then
+            sed -i 's/^\(\s*"ignored-sinks":[^]]*\]\)/\/* \1 *\//' "$waybar_cfg"
+            log "$(_t "waybar ignored-sinks commented" "waybar ignored-sinks commented")"
+        fi
+    fi
+
+    # --- 4) polkit agent path ---
+    # stage_configs 里的 fix_polkit_agent() 已按"实际安装的 agent"改写 spawn 路径
+    # （polkit-gnome 上游已废弃，Fedora/EPEL 均无此包，不能再盲目改写到
+    # /usr/libexec/polkit-gnome-*——那个路径永远不存在）。此处仅兜底：若前面没有
+    # 任何 agent 可指（警告已发），保持原样留给用户处理，不再做无效改写。
+
+    # GPU driver hint
+    if command -v lspci &>/dev/null; then
+        local gpu_info
+        gpu_info=$(lspci | grep -E -i 'vga|3d|display' 2>/dev/null | head -2)
+        [ -n "$gpu_info" ] && info_kv "$(_t "GPU detected" "GPU detected")" "$(echo "$gpu_info" | head -1 | cut -d: -f3- | xargs)" ""
+    fi
+
+    stage_mark hwadapt
+}
+
+# --- 4.9 post-install verification (package audit + config audit) ---
+
+stage_verify() {
+    if stage_done verify; then return; fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$(_t "[DRY-RUN] Skipping verification." "[DRY-RUN] Skipping verification.")"
+        return
+    fi
+
+    section "$(_t "Verification" "Verification")" "$(_t "Install Audit & Config Audit" "Install Audit & Config Audit")"
+    local missing=()
+
+    # package audit
+    local all_sel=(${REPO_SEL[@]+"${REPO_SEL[@]}"})
+    if [ ${#all_sel[@]} -gt 0 ]; then
+        local p name
+        for p in "${all_sel[@]}"; do
+            [ -n "${PIP_PKGS[$p]:-}" ] && continue
+            # niri/awww/satty/xwayland-satellite may be installed via dnf/prebuilt/source/cargo; check by PATH
+            case "$p" in
+                niri|awww|satty|xwayland-satellite)
+                    command -v "$p" >/dev/null 2>&1 || missing+=("$p")
+                    continue
+                    ;;
+                rime-ice-pinyin-git)
+                    # IBus engine layout (~/.config/ibus/rime). The old fcitx5 path is
+                    # accepted as well so a machine migrated by hand is not reported
+                    # as broken.
+                    if [ -f "$HOME_DIR/$RIME_IBUS_USER_DIR_SUFFIX/rime_ice.schema.yaml" ] \
+                        || [ -f "$HOME_DIR/$RIME_FCITX_USER_DIR_SUFFIX/rime_ice.schema.yaml" ]; then
+                        :
+                    else
+                        missing+=("rime-ice")
+                    fi
+                    continue
+                    ;;
+            esac
+            [ -n "${RHEL_MANUAL[$p]:-}" ] && continue
+            # ttf-jetbrains-mono-nerd falls back to a GitHub zip install (no RPM
+            # exists on EL) — audit the font itself, not a package name.
+            if [ "$p" = "ttf-jetbrains-mono-nerd" ]; then
+                fc-list 2>/dev/null | grep -qi 'jetbrainsmono.*nerd' || missing+=("JetBrainsMono Nerd Font")
+                continue
+            fi
+            # Packages with a source-build fallback may legitimately end up as
+            # plain binaries with no RPM (waybar/mako/fuzzel/copyq/grim/slurp/
+            # playerctl/brightnessctl/hyprlock/hypridle) — audit by command.
+            if [ -n "${SOURCE_PKGS[$p]:-}" ]; then
+                command -v "$p" >/dev/null 2>&1 || missing+=("$p")
+                continue
+            fi
+            # polkit-agent is a logical alias resolved to a real package at
+            # install time (RESOLVED_PKG_NAME) — auditing the alias name with
+            # rpm -q would always fail even when the agent is installed.
+            if [ "$p" = "polkit-agent" ]; then
+                name="${RESOLVED_PKG_NAME[$p]:-}"
+                [ -z "$name" ] && name=$(resolve_rhel_package "$p" 2>/dev/null || true)
+                if [ -z "$name" ] || ! pkg_installed "$name"; then
+                    missing+=("$p")
+                fi
+                continue
+            fi
+            name="${RHEL_MAP[$p]:-$p}"
+            pkg_installed "$name" || missing+=("$name")
+        done
+    fi
+    if [ ${#missing[@]} -gt 0 ]; then
+        warn "$(_t "Selected packages failed to install:" "Selected packages failed to install:")"
+        for p in "${missing[@]}"; do echo -e "     ${H_RED}->${NC} ${H_YELLOW}$p${NC}"; done
+    else
+        success "$(_t "Package audit passed." "Package audit passed.")"
+    fi
+
+    # config audit
+    local cfg_errors=0 d
+    for d in niri waybar kitty mako hypr ibus; do
+        if [ -e "$HOME_DIR/.config/$d" ]; then
+            log "  [OK] $HOME_DIR/.config/$d"
+        else
+            echo -e "     ${H_RED}->${NC} ${H_YELLOW}$HOME_DIR/.config/$d missing${NC}"
+            cfg_errors=$((cfg_errors+1))
+        fi
+    done
+    [ "$cfg_errors" -eq 0 ] && success "$(_t "Config audit passed." "Config audit passed.")" || warn "$cfg_errors critical config directories missing."
+    stage_mark verify
+}
+
+# --- 4.10 summary report ---
+
+print_summary() {
+    section "$(_t "Summary" "Summary")" "$(_t "eilNiri restore" "eilNiri restore")"
+    info_kv "$(_t "Installed" "Installed")" "${#INSTALLED_PKGS[@]} packages"
+    info_kv "$(_t "Skipped" "Skipped")" "${#SKIPPED_PKGS[@]} packages"
+    info_kv "$(_t "Enabled Services" "Enabled Services")" "${#ENABLED_SVCS[@]} services"
+    if [ ${#ENABLED_SVCS[@]} -gt 0 ]; then
+        printf "     ${DIM}%s${NC}\n" "${ENABLED_SVCS[@]}"
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info_kv "$(_t "[DRY-RUN] Will install" "[DRY-RUN] Will install")" "${#DRY_PKGS[@]} packages"
+        if [ ${#DRY_PKGS[@]} -gt 0 ]; then
+            printf "     ${DIM}%s${NC}\n" "${DRY_PKGS[@]}"
+        fi
+        info_kv "$(_t "[DRY-RUN] Will enable services" "[DRY-RUN] Will enable services")" "${#DRY_SVCS[@]} services"
+        if [ ${#DRY_SVCS[@]} -gt 0 ]; then
+            printf "     ${DIM}%s${NC}\n" "${DRY_SVCS[@]}"
+        fi
+    fi
+    if [ ${#FAILED_PKGS[@]} -gt 0 ]; then
+        warn "Failed ${#FAILED_PKGS[@]} items:"
+        printf "     ${H_RED}->${NC} %s\n" "${FAILED_PKGS[@]}"
+    fi
+    if [ ${#MANUAL_ITEMS[@]} -gt 0 ]; then
+        warn "Manual install needed (${#MANUAL_ITEMS[@]}):"
+        printf "     ${H_YELLOW}->${NC} %s\n" "${MANUAL_ITEMS[@]}"
+    fi
+    echo ""
+    info_kv "$(_t "Log" "Log")" "$TEMP_LOG_FILE"
+    info_kv "$(_t "Progress File" "Progress File")" "$STATE_FILE" "(delete after everything completes)"
+    echo -e "   ${H_YELLOW}>>> It is recommended to reboot and enter the niri desktop. ${NC}"
+}
+
+do_restore() {
+    init_logger
+    check_root
+    detect_distro
+
+    section "$(_t "Restore" "Restore")" "v$SCRIPT_VERSION — $(_t "Restore Niri Desktop" "Restore Niri Desktop")"
+    [ "$DRY_RUN" -eq 1 ] && warn "$(_t "DRY-RUN mode: printing plan only, no changes." "DRY-RUN mode: printing plan only, no changes.")"
+    show_logo
+
+    # configs/ is optional: if present it's deployed as the desktop config; if absent
+    # the script still installs and configures everything else and niri runs with
+    # default config. Never block or prompt the user about it — a plain `./RHEL-install.sh
+    # restore` must just work with no prep.
+    if [ ! -d "$BASE_DIR/configs" ]; then
+        log "$(_t "configs/ not present — desktop config deploy skipped (niri will run with default config). To ship your own dotfiles, put them under configs/.config/" "configs/ not present — desktop config deploy skipped (niri will run with default config). To ship your own dotfiles, put them under configs/.config/")"
+    fi
+
+    # update the system first (a fresh machine has a stale package db, so installing fzf directly may fail)
+    stage_preflight
+    unmask_gdm_wayland
+    ensure_fzf
+    detect_target_user
+
+    if stage_apps_select; then
+        stage_apps_install
+    fi
+    # Disable other-DE components (mask tuned / GNOME / PulseAudio / ...) BEFORE
+    # enabling our services — e.g. power-profiles-daemon.service fails to start if
+    # tuned is still running (RHEL default), a conflict resolved by masking tuned here.
+    stage_disable_system
+    stage_services
+    stage_dm
+    stage_configs
+    stage_wait_builds
+    stage_hardware_adapt
+    stage_verify
+    ensure_dm_session   # idempotent: re-checks every run (niri build may have finished late)
+    boot_env_check
+    print_niri_status
+    print_summary
+    save_diag_bundle
+}
+
+# --- 4.10c one-line niri status (printed right before the summary) ---
+print_niri_status() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _bin="MISSING" _desk="MISSING" _sess="unset"
+    if command -v niri >/dev/null 2>&1 || [ -x /usr/local/bin/niri ]; then _bin="installed"; fi
+    if [ -f /usr/local/share/wayland-sessions/niri.desktop ] || [ -f /usr/share/wayland-sessions/niri.desktop ]; then _desk="registered"; fi
+    if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
+        _sess=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//' )
+        [ -z "$_sess" ] && _sess="unset"
+    fi
+    echo ""
+    info_kv "$(_t "NIRI STATUS" "NIRI STATUS")" "binary=$_bin | desktop=$_desk | gdm Session=$_sess"
+}
+
+# --- 4.10d diagnostic bundle (so a failed run can be shared for offline analysis) ---
+save_diag_bundle() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _ts _bundle _tmpdir
+    _ts=$(date +%Y%m%d-%H%M%S)
+    _tmpdir=$(mktemp -d)
+    register_temp_path "$_tmpdir"
+    # gather plain-text snapshots (best effort; never fail the whole restore here)
+    {
+        echo "=== eilNiri diagnostic bundle ==="
+        echo "Date: $(date)"
+        echo "Script: v$SCRIPT_VERSION  Progress: $PROGRESS_VERSION"
+        echo "Distro: $DISTRO_FAMILY ($DISTRO_ID)"
+        echo "Target user: $TARGET_USER  Home: $HOME_DIR"
+        echo
+        echo "=== systemctl get-default ==="
+        systemctl get-default 2>/dev/null
+        echo
+        echo "=== display-manager.service ==="
+        readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "(missing)"
+        echo
+        echo "=== enabled DMs ==="
+        for _d in gdm gdm3; do systemctl is-enabled --quiet "$_d" 2>/dev/null && echo "$_d enabled"; done
+        echo
+        echo "=== AccountsService users/$TARGET_USER ==="
+        cat "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null || echo "(missing)"
+        echo
+        echo "=== gdm custom.conf ==="
+        cat /etc/gdm/custom.conf /etc/gdm3/custom.conf 2>/dev/null || echo "(none)"
+        echo
+        echo "=== niri.desktop locations ==="
+        ls -l /usr/local/share/wayland-sessions/niri.desktop /usr/share/wayland-sessions/niri.desktop 2>/dev/null || echo "(none)"
+        echo
+        echo "=== niri binary ==="
+        command -v niri 2>/dev/null && niri --version 2>&1 | head -1 || echo "(not found)"
+        echo
+        echo "=== installed pkgs (gdm/niri/rust/accountsservice/hypr) ==="
+        rpm -qa 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr'
+        echo
+        echo "=== build logs tail ==="
+        for _f in "$LOG_DIR/niri-build.log" "$LOG_DIR/awww-build.log" "$LOG_DIR/xwayland-satellite-build.log" "$LOG_DIR/hyprlock-build.log" "$LOG_DIR/hypridle-build.log"; do
+            [ -f "$_f" ] && { echo "--- $_f (tail 30) ---"; tail -n 30 "$_f" 2>/dev/null; }
+        done
+    } > "$_tmpdir/diag.txt" 2>/dev/null
+    # attach the full replicate log too
+    [ -f "$TEMP_LOG_FILE" ] && cp "$TEMP_LOG_FILE" "$_tmpdir/replicate.log" 2>/dev/null
+    # The session entry point and its log: "login from GDM shows nothing" is almost
+    # always diagnosed from these two, so ship them with the bundle.
+    [ -x /usr/local/bin/niri-session ] && cp /usr/local/bin/niri-session "$_tmpdir/niri-session" 2>/dev/null
+    if [ -n "${TARGET_USER:-}" ]; then
+        local _uhome
+        _uhome=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
+        if [ -n "$_uhome" ] && [ -f "$_uhome/.local/state/eilNiri/session.log" ]; then
+            cp "$_uhome/.local/state/eilNiri/session.log" "$_tmpdir/session.log" 2>/dev/null
+        fi
+    fi
+    # The PATH a fresh session sees decides whether the DM finds "niri-session";
+    # record it so a missing-/usr/local/bin regression is visible at a glance.
+    { printf 'runtime PATH=%s\n' "$PATH"
+      grep -nE '^PATH=' /etc/environment 2>/dev/null || true; } > "$_tmpdir/session-path.txt" 2>/dev/null || true
+    _bundle="$LOG_DIR/diag-$_ts.tar.gz"
+    if tar czf "$_bundle" -C "$_tmpdir" . 2>/dev/null; then
+        echo ""
+        info_kv "$(_t "Diagnostic Bundle" "Diagnostic Bundle")" "$_bundle" "$(_t "(share this if niri fails to start)" "(share this if niri fails to start)")"
+        write_log "DIAG" "bundle saved: $_bundle"
+    fi
+}
+
+# --- 4.10b ensure display manager default session = niri (idempotent, runs on EVERY restore) ---
+# The stage_dm write only happens while that stage runs, but the niri.desktop session file
+# arrives later (background build). This step re-checks on every run so a late niri build
+# still gets picked up as the DM default session.
+# Mechanism is DM-specific: gdm uses AccountsService (Session=niri).
+
+# gdm / gdm3: write /var/lib/AccountsService/users/<TARGET_USER> with Session=niri
+ensure_gdm_session() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ -z "$TARGET_USER" ] && return 0
+    local _niri_desktop=""
+    [ -f /usr/local/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
+    [ -z "$_niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/share/wayland-sessions/niri.desktop
+    if [ -z "$_niri_desktop" ]; then
+        warn "$(_t "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop." "niri.desktop session not registered (niri not installed / build unfinished) — login will go to the default desktop.")"
+        return 0
+    fi
+
+    # gdm custom.conf can override the session with DefaultSession / AutomaticLoginSession,
+    # or bypass session selection entirely via AutomaticLogin (auto-login uses the default
+    # session, i.e. GNOME on Ubuntu). Clear all of these so AccountsService Session=niri wins.
+    local _gconf
+    for _gconf in /etc/gdm/custom.conf /etc/gdm3/custom.conf; do
+        if [ -f "$_gconf" ]; then
+            local _changed=0
+            if grep -q '^DefaultSession=' "$_gconf" 2>/dev/null; then
+                sed -i 's/^DefaultSession=.*$/DefaultSession=/' "$_gconf"; _changed=1
+            fi
+            if grep -q '^AutomaticLoginSession=' "$_gconf" 2>/dev/null; then
+                sed -i 's/^AutomaticLoginSession=.*$/AutomaticLoginSession=/' "$_gconf"; _changed=1
+            fi
+            # AutomaticLoginEnable=true + AutomaticLogin=<user> bypasses session selection
+            # entirely (auto-login drops into the default desktop = GNOME). Disable it so the
+            # user picks the session at the greeter (and AccountsService Session=niri applies).
+            if grep -qi '^AutomaticLoginEnable=true' "$_gconf" 2>/dev/null; then
+                sed -i 's/^AutomaticLoginEnable=.*/AutomaticLoginEnable=false/I' "$_gconf"; _changed=1
+                warn "$(_t "Disabled AutomaticLoginEnable in " "Disabled AutomaticLoginEnable in ") $_gconf $(_t " (auto-login bypasses session selection)" " (auto-login bypasses session selection)")"
+            fi
+            [ "$_changed" -eq 1 ] && log "$(_t "Cleared session override(s) in " "Cleared session override(s) in ") $_gconf"
+        fi
+    done
+
+    # gdm reads the default session via AccountsService (accounts-daemon). If the daemon is
+    # missing, the Session=niri file we write below is silently ignored and login goes to GNOME.
+    if ! pkg_installed accountsservice 2>/dev/null && ! pkg_installed accounts-daemon 2>/dev/null; then
+        log "$(_t "Installing accountsservice (gdm reads the default session from it)..." "Installing accountsservice (gdm reads the default session from it)...")"
+        pm_install accountsservice 2>/dev/null || warn "$(_t "accountsservice install failed; gdm may ignore Session=niri." "accountsservice install failed; gdm may ignore Session=niri.")"
+    fi
+    systemctl enable --now accounts-daemon 2>/dev/null || systemctl enable --now accountsservice 2>/dev/null || true
+
+    local afile="/var/lib/AccountsService/users/$TARGET_USER"
+    mkdir -p "$(dirname "$afile")"
+    if [ -f "$afile" ] && grep -q '^Session=niri$' "$afile"; then
+        log "$(_t "gdm default session already set to niri (AccountsService)" "gdm default session already set to niri (AccountsService)")"
+    else
+        if [ -f "$afile" ]; then
+            if grep -q '^Session=' "$afile"; then
+                sed -i 's/^Session=.*$/Session=niri/' "$afile"
+            elif grep -q '^\[User\]' "$afile"; then
+                sed -i '/^\[User\]/a Session=niri' "$afile"
+            else
+                # file exists but has no [User] section; append one
+                echo -e '\n[User]\nSession=niri' >> "$afile"
+            fi
+        else
+            cat > "$afile" <<'EOF'
+[User]
+Session=niri
+EOF
+            chown root:root "$afile" 2>/dev/null || true
+            chmod 644 "$afile" 2>/dev/null || true
+        fi
+        log "$(_t "gdm default session set to niri (AccountsService Session=niri)" "gdm default session set to niri (AccountsService Session=niri)")"
+    fi
+
+    # accounts-daemon reads the file on startup; restart so it picks up the change NOW
+    # (matters if the user logs in without rebooting first — the daemon may cache the old value)
+    if systemctl is-active --quiet accounts-daemon 2>/dev/null; then
+        exe systemctl try-restart accounts-daemon 2>/dev/null || true
+    fi
+}
+
+# Make the bare command name "niri-session" resolvable for the display manager.
+# niri.desktop uses Exec=niri-session and niri.service uses ExecStart=niri; both are
+# resolved through PATH. Distro packages provide the name under /usr/bin, but a
+# source-built niri only has whatever this script installed — historically
+# "niri-session.real" plus a wrapper under a non-standard name, leaving the DM with
+# nothing to exec (the classic "login from GDM fails instantly, TTY works" symptom).
+_ensure_niri_session_cmd() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _need=0
+    [ -x /usr/local/bin/niri-session ] || _need=1
+    # Refresh an outdated wrapper that still delegates to the wrong path.
+    if [ "$_need" -eq 0 ] && grep -q '^exec /usr/local/bin/niri-session.real' /usr/local/bin/niri-session 2>/dev/null; then
+        _need=1
+    fi
+    if [ "$_need" -eq 1 ]; then
+        install_niri_output_wrapper
+        log "$(_t "Installed /usr/local/bin/niri-session (niri.desktop's Exec target)" "Installed /usr/local/bin/niri-session")"
+    fi
+    # Whatever the wrapper delegates to must exist: prefer the source-built
+    # niri-session.real, otherwise point the wrapper at the system one.
+    if [ ! -x /usr/local/bin/niri-session.real ] && [ -x /usr/bin/niri-session ]; then
+        ln -sf /usr/bin/niri-session /usr/local/bin/niri-session.real 2>/dev/null || true
+        install_niri_output_wrapper
+    fi
+    # niri.service runs "niri --session"; a source build lands in /usr/local/bin,
+    # which is not on the default RHEL/Debian PATH, so give it a /usr/bin entry too.
+    if [ -x /usr/local/bin/niri ] && [ ! -e /usr/bin/niri ]; then
+        ln -sf /usr/local/bin/niri /usr/bin/niri 2>/dev/null || true
+        log "$(_t "Linked /usr/local/bin/niri -> /usr/bin/niri (niri.service ExecStart)" "Linked /usr/local/bin/niri -> /usr/bin/niri")"
+    fi
+    # The wrapper writes ~/.local/state/eilNiri/session.log as the USER; a root-owned
+    # directory there made the redirect fail and killed the whole login, so make sure
+    # the path is writable before the user ever tries to log in.
+    [ -n "${HOME_DIR:-}" ] && [ -n "${TARGET_USER:-}" ] && fix_home_state_ownership 2>/dev/null || true
+    return 0
+}
+
+# dispatch: pick the right mechanism for the DM that actually owns display-manager.service
+ensure_dm_session() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _dm
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        _dm=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "")
+        _dm=$(basename "$_dm" .service)
+    else
+        return 0
+    fi
+    case "$_dm" in
+        gdm|gdm3) ensure_gdm_session ;;
+        *)        warn "$(_t "Display manager '$_dm' is not gdm — this script only configures gdm; set niri as the session manually." "Display manager '$_dm' is not gdm — set niri as the session manually.")" ;;
+    esac
+}
+
+# Guard: the user asked for the gdm display manager WITHOUT the GNOME desktop.
+# `dnf install gdm` alone is correct (its only desktop-ish requirement is
+# gnome-shell, which gdm itself uses as the login UI). What must never happen is a
+# packag-*group* or meta package pulling in the full desktop (nautilus,
+# gnome-terminal, gnome-control-center, gnome-tour, ...). This function installs
+# gdm explicitly with weak deps off and then reports anything suspicious that is
+# nevertheless present, so a regression is visible instead of silent.
+GNOME_DESKTOP_MARKERS=(nautilus gnome-terminal gnome-control-center gnome-tour
+    gnome-text-editor gnome-maps gnome-music gnome-calendar gnome-software
+    gnome-classic-session gnome-session-xsession)
+
+ensure_gdm_only() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    if ! pkg_installed gdm && ! pkg_installed gdm3; then
+        log "$(_t "Installing gdm (display manager only — no GNOME desktop)..." "Installing gdm (display manager only, no GNOME desktop)...")"
+        # --setopt=install_weak_deps=False keeps "Recommends"-style extras out (e.g.
+        # gnome-tour). Explicit package name only: never "group install gnome-desktop".
+        exe dnf install -y --setopt=install_weak_deps=False gdm 2>>"$LOG_DIR/dnf-errors.log" \
+            || pm_install gdm || return 1
+    fi
+
+    # Audit EVERY run (also when gdm was already present), so leftovers from an
+    # earlier manual install stay visible instead of only being checked once.
+    local _p _found=()
+    for _p in "${GNOME_DESKTOP_MARKERS[@]}"; do
+        pkg_installed "$_p" && _found+=("$_p")
+    done
+    if [ ${#_found[@]} -gt 0 ]; then
+        warn "$(_t "GNOME desktop components are installed: " "GNOME desktop components are installed: ")${_found[*]}"
+        MANUAL_ITEMS+=("GNOME 桌面组件已存在（${_found[*]}）——脚本只装了 gdm，这些是镜像自带或依赖带入；如不需要可 'sudo dnf remove ${_found[*]}'")
+    else
+        log "$(_t "gdm installed without GNOME desktop components" "gdm installed without GNOME desktop components")"
+    fi
+    return 0
+}
+
+# --- 4.11 boot environment self-check ---
+# Printed right before the summary so a "still stuck at a tty login" problem is diagnosable
+# in one glance: default target, display-manager.service target, DM enabled state.
+boot_env_check() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    section "$(_t "Boot Environment Check" "Boot Environment Check")" "$(_t "default target & display manager" "default target & display manager")"
+    # Self-heal the session entry point before auditing it: a missing/outdated
+    # /usr/local/bin/niri-session is why a GDM login can die with no output.
+    _ensure_niri_session_cmd 2>/dev/null || true
+    info_kv "$(_t "Default Target" "Default Target")" "$(systemctl get-default 2>/dev/null || echo unknown)" "$(_t "(must be graphical.target)" "(must be graphical.target)")"
+    if [ -e /etc/systemd/system/display-manager.service ]; then
+        local _dl
+        _dl=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo unknown)
+        info_kv "$(_t "Display Manager" "Display Manager")" "$(basename "$_dl")" "display-manager.service → $_dl"
+    else
+        info_kv "$(_t "Display Manager" "Display Manager")" "$(_t "none configured" "none configured")" "$(_t "display-manager.service missing — boot will stay at a tty" "display-manager.service missing — boot will stay at a tty")"
+    fi
+    local _dm
+    for _dm in gdm3 gdm; do
+        if systemctl is-enabled --quiet "$_dm" 2>/dev/null; then
+            info_kv "$(_t "Enabled DM" "Enabled DM")" "$_dm" ""
+            break
+        fi
+    done
+    # niri session registration + DM default session
+    local _niri_desktop=""
+    [ -f /usr/local/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/local/share/wayland-sessions/niri.desktop
+    [ -z "$_niri_desktop" ] && [ -f /usr/share/wayland-sessions/niri.desktop ] && _niri_desktop=/usr/share/wayland-sessions/niri.desktop
+    if [ -n "$_niri_desktop" ]; then
+        info_kv "$(_t "Niri Session" "Niri Session")" "$(_t "registered" "registered")" "$_niri_desktop"
+    else
+        info_kv "$(_t "Niri Session" "Niri Session")" "$(_t "NOT registered" "NOT registered")" "$(_t "(niri build incomplete — login goes to the default desktop)" "(niri build incomplete — login goes to the default desktop)")"
+    fi
+    # The command niri.desktop exec's must be resolvable by the display manager.
+    # Missing "niri-session" in PATH = login fails instantly with no output.
+    local _session_cmd=""
+    _session_cmd=$(command -v niri-session 2>/dev/null || true)
+    if [ -n "$_session_cmd" ]; then
+        info_kv "$(_t "niri-session" "niri-session")" "$_session_cmd" "$(_t "(niri.desktop Exec target)" "(niri.desktop Exec target)")"
+    else
+        info_kv "$(_t "niri-session" "niri-session")" "NOT FOUND" "$(_t "(DM login will fail with no output)" "(DM login will fail with no output)")"
+    fi
+    # gdm / gdm3: AccountsService
+    if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
+        local _as
+        _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
+        if [ -n "$_as" ]; then
+            info_kv "$(_t "gdm Session" "gdm Session")" "AccountsService=$_as" "$(_t "(must be niri)" "(must be niri)")"
+            [ "$_as" != "niri" ] && warn "$(_t "gdm AccountsService Session=$_as — login will not go to niri." "gdm AccountsService Session=$_as — login will not go to niri.")"
+        fi
+    fi
+    # session files visible to the DM
+    local _sessions
+    _sessions=$(ls /usr/share/xsessions /usr/local/share/xsessions /usr/share/wayland-sessions /usr/local/share/wayland-sessions 2>/dev/null | sort -u | tr '\n' ' ')
+    info_kv "$(_t "Sessions (all)" "Sessions (all)")" "${_sessions:-none}" "$(_t "(niri present if niri.desktop listed)" "(niri present if niri.desktop listed)")"
+
+    # final assertion: will gdm actually boot into niri?
+    local _boot_ok=1 _reason=""
+    [ -z "$_niri_desktop" ] && { _boot_ok=0; _reason="niri.desktop not registered (build incomplete)"; }
+    if [ -z "$_session_cmd" ]; then
+        _boot_ok=0
+        _reason="${_reason:+$_reason; }niri-session not in PATH (niri.desktop Exec cannot run)"
+    fi
+    if [ -n "$TARGET_USER" ] && [ -f "/var/lib/AccountsService/users/$TARGET_USER" ]; then
+        local _as
+        _as=$(grep '^Session=' "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null | sed 's/^Session=//')
+        if [ "$_as" != "niri" ]; then
+            _boot_ok=0
+            # NOTE: append, never overwrite — this used to clobber an earlier reason.
+            _reason="${_reason:+$_reason; }gdm AccountsService Session='${_as:-unset}' (expected niri)"
+        fi
+    fi
+    if [ "$_boot_ok" -eq 1 ]; then
+        success "$(_t "Boot check: gdm will start niri after reboot." "Boot check: gdm will start niri after reboot.")"
+    else
+        echo -e "   ${H_RED}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
+        echo -e "   ${H_RED}┃  BOOT CHECK FAILED: gdm will NOT start niri.                       ┃${NC}"
+        echo -e "   ${H_RED}┃  Reason: $_reason${NC}"
+        echo -e "   ${H_RED}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
+        write_log "FAIL" "boot check failed: $_reason"
+    fi
+}
+
+# --- 4.12 restore-system: re-enable system components that were disabled during restore ---
+do_restore_system() {
+    init_logger
+    check_root
+    detect_distro
+    detect_target_user
+
+    section "$(_t "Restore System" "Restore System")" "$(_t "Re-enable disabled DE components" "Re-enable disabled DE components")"
+    local mf="$BASE_DIR/.system_disabled"
+    if [ ! -f "$mf" ] || [ ! -s "$mf" ]; then
+        log "$(_t "No disabled system components found (manifest missing or empty)." "No disabled system components found (manifest missing or empty).")"
+        return 0
+    fi
+
+    local count=0 line type name _rc
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        IFS='|' read -r type name <<< "$line"
+        case "$type" in
+            autostart)
+                local _af="$HOME_DIR/.config/autostart/$name"
+                if [ -f "$_af" ]; then
+                    rm -f "$_af" && log "$(_t "Re-enabled autostart: " "Re-enabled autostart: ")$name"
+                fi
+                ;;
+            userunit)
+                _rc=0; as_user systemctl --user unmask "$name" 2>/dev/null || _rc=$?
+                [ "$_rc" -eq 0 ] && log "$(_t "Unmasked user unit: " "Unmasked user unit: ")$name"
+                ;;
+            systemunit)
+                _rc=0; systemctl unmask "$name" 2>/dev/null || _rc=$?
+                [ "$_rc" -eq 0 ] && log "$(_t "Unmasked system unit: " "Unmasked system unit: ")$name"
+                ;;
+        esac
+        count=$((count + 1))
+    done < "$mf"
+    as_user systemctl --user daemon-reload 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    rm -f "$mf"
+    success "$(_t "$count system component(s) re-enabled; manifest cleared." "$count system component(s) re-enabled; manifest cleared.")"
+}
+
+# ==============================================================================
+# 5. main
+# ==============================================================================
+
+usage() {
+    cat <<EOF
+eilNiri RHEL-install.sh v$SCRIPT_VERSION — niri desktop environment replication tool
+
+Usage:
+  ./RHEL-install.sh restore [--dry-run]      restore desktop on new system (root)
+  ./RHEL-install.sh status                   show background build progress (run from another terminal)
+  ./RHEL-install.sh restore-system           re-enable system components disabled by restore (root)
+  ./RHEL-install.sh --help                   show this help
+
+Options:
+  --dry-run      print plan only, no actual install/enable/deploy
+
+Environment:
+  EILNIRI_KEEP_DM=1    keep existing display manager unchanged
+  (display manager)    always gdm; the GNOME *desktop* is never installed
+  EILNIRI_KEEP_SYS=1   skip disabling other-DE components during restore
+  EILNIRI_GH_PROXY     space-separated GitHub proxy URLs (default: ghfast.top gh-proxy.com ghproxy.net gh.llkk.cc)
+
+Workflow:
+  1. Copy this eilNiri directory to the target machine (USB / network)
+  2. On the machine (Fedora / Rocky / Alma / CentOS Stream / RHEL): sudo ./RHEL-install.sh restore   — no prep required;
+     optionally drop your own dotfiles into configs/.config/ and they get deployed
+     - niri/awww compile in background:  ./RHEL-install.sh status   (live progress)
+     - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
+     - IME: IBus + ibus-rime + rime-ice (no compilation). The engine lives in
+       EPEL on EL; if it is missing, rerun after 'dnf install epel-release'.
+       Verify with: ibus engine  (should print "rime" inside the desktop session)
+  3. Re-enable other-DE comps:   sudo ./RHEL-install.sh restore-system
+EOF
+}
+
+main() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            restore|status|restore-system) MODE="$arg" ;;
+            --dry-run)      DRY_RUN=1 ;;
+            -h|--help)      usage; exit 0 ;;
+            *) error "$(_t "Unknown argument: " "Unknown argument: ") $arg"; usage; exit 1 ;;
+        esac
+    done
+
+    case "$MODE" in
+        restore)         do_restore ;;
+        status)          do_status ;;
+        restore-system)  do_restore_system ;;
+        *)               usage; exit 1 ;;
+    esac
+}
+
+main "$@"

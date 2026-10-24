@@ -1,0 +1,9 @@
+show_calendar = true
+show_week_numbers = true
+mark_today = true
+mainwindow_position = mouse
+mainwindow_decorated = false
+mainwindow_keep_above = true
+mainwindow_skip_taskbar = true
+close_on_mouseleave = true
+close_on_unfocus = true

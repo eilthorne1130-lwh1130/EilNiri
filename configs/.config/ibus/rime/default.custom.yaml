@@ -1,0 +1,30 @@
+# ==============================================================================
+# eilNiri — Rime 用户配置（IBus 前端）
+# ==============================================================================
+#
+# 部署位置：~/.config/ibus/rime/default.custom.yaml
+#   （ibus-rime 的用户数据目录，来自上游 rime_main.c：
+#    get_ibus_rime_user_data_dir() -> $HOME/.config/ibus/rime；
+#    对应 fcitx5 时代的 ~/.local/share/fcitx5/rime）
+#
+# 本文件是对上游方案 default.yaml 的"补丁"，**不会**覆盖 rime-ice 自身，
+# 只会合并/覆盖 patch: 下面列出的键。删掉它即回到 rime-ice 原厂行为。
+#
+# 由 RHEL-install.sh 的 install_rime_ice() 部署：仅在文件不存在时写入，
+# 因此你手工改过的版本在重跑 restore 时不会被覆盖。
+# 修改后需要在候选窗里选"重新部署"（或删除 ~/.config/ibus/rime/build/ 后重新登录）。
+# ==============================================================================
+
+patch:
+  # 每页候选数 5（对应 fcitx5 [Behavior] DefaultPageSize=5；rime-ice 原厂也是 5，这里显式钉死）
+  menu/page_size: 5
+
+  # 方案列表：只保留雾凇拼音，与 dconf 的 preload-engines=['rime'] 对应
+  schema_list:
+    - schema: rime_ice
+
+  # 说明：fcitx5 的 hotkey 配置（单击左 Shift 中英切换、方向键翻页、
+  # Tab/Shift+Tab 选候选）在 IBus 上由 Rime 引擎自身提供：
+  #   - 左 Shift 中英切换 = rime_ice.schema.yaml 的 switches: ascii_mode
+  #   - 翻页/选词       = Rime 默认 default.yaml（方向键、逗号句号、Tab）
+  # 因此这里不需要重复配置；如需调整请在你的 rime_ice.custom.yaml 里覆盖。

@@ -1,0 +1,13 @@
+[general]
+copy-command = "wl-copy"
+focus-toggles-toolbars= true
+actions-on-right-click = ["save-to-clipboard"]
+[font]
+family = "Noto Sans"
+style = "Regular"
+fallback = [
+    "Noto Sans CJK SC",
+    "Noto Sans CJK JP",
+    "Noto Sans CJK TC",
+    "Noto Sans CJK KR"
+]

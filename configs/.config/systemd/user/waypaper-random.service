@@ -1,0 +1,6 @@
+[Unit]
+Description=Waypaper Random Wallpaper Changer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/waypaper --random
