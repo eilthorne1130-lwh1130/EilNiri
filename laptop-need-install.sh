@@ -2,23 +2,35 @@
 # ==============================================================================
 # eilNiri — laptop-need-install.sh
 #
-# 笔记本补装脚本，搭配 arch-install.sh / deb-install.sh / RHEL-install.sh 使用：
-# 在主安装脚本完成 eilNiri 安装后，在笔记本/带电池设备上运行本脚本，
+# 补装脚本，搭配 arch-install.sh / deb-install.sh / RHEL-install.sh 使用：
+# 任一主安装脚本完成 eilNiri 安装后，在笔记本或台式机上运行本脚本，
 # 为已配置好的 waybar 添加电量模块（外观与其余模块一致，每 10 秒刷新一次）。
+#
+# 兼容三种主脚本的全部产物形态：
+#   - arch / RHEL：configs 快照参考版（含整行 /* */ JSONC 注释亦可，注入前剥离）
+#   - deb（waybar >= 0.10）：内嵌参考版
+#   - deb（waybar 0.9.x）：快照平铺版
+#   - deb 安装时已加过 battery（interval 30）：重跑本脚本刷新为 10
+# 台式机同样写入模块；waybar 对无电池机器会自动隐藏该模块（无害）。
 #
 # Usage:
 #   sudo ./laptop-need-install.sh [--dry-run]   # 与主脚本一致，root 下自动定位目标用户
 #   ./laptop-need-install.sh  [--dry-run]       # 普通用户直接运行，操作自己的配置
 #
 # 本脚本只修改（写前自动做时间戳备份 *.bak-bat-YYYYmmdd-HHMMSS）：
-#   ~/.config/waybar/config      — modules-right 注入 "battery" + 模块定义
-#   ~/.config/waybar/style.css   — 幂等追加 #battery 基础 pill 样式
-# 状态变色规则（charging/warning/critical）部署的 style.css 已自带，不重复添加。
+#   ~/.config/waybar/config      — modules-right 注入 "battery" + 模块定义（原子写）
+#   ~/.config/waybar/style.css   — 幂等追加 #battery 基础样式；状态色 / blink
+#                                  keyframes 缺失时自动补齐，已存在则跳过
+#
+# 生效方式：优先经 niri IPC（niri msg action spawn）拉起新 waybar —— 与
+# spawn-at-startup 同源、继承 niri 完整会话环境（不会丢 NIRI_SOCKET 等变量）；
+# niri IPC 不可用时以原进程完整环境+原命令行重启；两者皆不可用则不杀现有
+# waybar，仅提示手动操作。
 # ==============================================================================
 
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 DRY_RUN=0
 _ERROR_REPORTED=0
 BAT_DETECTED="N"
@@ -248,8 +260,9 @@ backup_files() {
 
 # JSON 注入：modules-right 在 "tray" 前插 "battery"（无 tray 则放最前）+ battery
 # 模块定义。参考版/平铺版 JSON 通用；幂等（battery 已在 modules-right 则不重复插入，
-# 定义整体刷新——可借此把旧 interval 30 更新为 10）。原子写入：先写 .tmp 再 replace，
-# 解析失败时原文件不动。
+# 定义整体刷新——可借此把旧 interval 30 更新为 10）。整行 /* */ JSONC 注释
+# （arch/RHEL 硬件适配对 ignored-sinks 的产物）先剥离再解析。原子写入：先写
+# .tmp 再 replace，解析失败时原文件不动。
 inject_battery_json() {
     if [ "$DRY_RUN" -eq 1 ]; then
         dry_run_note "python3 — inject battery module into $WAYBAR_CFG"
@@ -258,11 +271,17 @@ inject_battery_json() {
     local tmp="$WAYBAR_CFG.tmp-bat.$$"
     register_temp_path "$tmp"
     python3 - "$WAYBAR_CFG" "$tmp" <<'PYBATEOF'
-import json, os, sys
+import json, os, re, sys
 
 path, tmp = sys.argv[1], sys.argv[2]
 with open(path, encoding="utf-8") as f:
-    cfg = json.load(f)
+    raw = f.read()
+
+# arch/RHEL 硬件适配会把 "ignored-sinks" 行注释成整行 /* ... */（JSONC）；
+# 严格 json 解析前剥离整行块注释（写回后即为纯 JSON）。
+raw = re.sub(r"^[ \t]*/\*.*\*/[ \t]*\r?$", "", raw, flags=re.M)
+
+cfg = json.loads(raw)
 
 mods = cfg.get("modules-right", [])
 if "battery" not in mods:
@@ -294,22 +313,28 @@ PYBATEOF
     return 0
 }
 
-# CSS：追加 #battery 基础 pill 样式（状态色规则部署的 style.css 已自带，缺的只是
-# 基础样式；幂等：已有 ^#battery { 则跳过——deb 安装时加过的机器直接跳过）。
+# CSS：追加 #battery 基础 pill 样式。三个独立幂等守卫——基础样式、状态变色
+# （charging/warning/critical）、blink keyframes，缺哪个补哪个（两版 style.css
+# 通常已带状态色与 keyframes，则自动跳过；防的是更老的历史版本）。
 append_battery_css() {
     if [ ! -f "$WAYBAR_CSS" ]; then
         warn "$(_t "style.css not found — base #battery style not added." "style.css not found — base #battery style not added.")"
         return 0
     fi
-    if grep -q '^#battery {' "$WAYBAR_CSS"; then
-        log "$(_t "#battery base style already present in style.css — skipped." "#battery base style already present in style.css — skipped.")"
+    local _need_base=0 _need_states=0 _need_blink=0
+    grep -q '^#battery {' "$WAYBAR_CSS" || _need_base=1
+    grep -q '^#battery\.charging' "$WAYBAR_CSS" || _need_states=1
+    grep -q '@keyframes blink' "$WAYBAR_CSS" || _need_blink=1
+    if [ "$_need_base" -eq 0 ] && [ "$_need_states" -eq 0 ] && [ "$_need_blink" -eq 0 ]; then
+        log "$(_t "style.css already has all #battery rules — skipped." "style.css already has all #battery rules — skipped.")"
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        dry_run_note "append #battery base style to $WAYBAR_CSS"
+        dry_run_note "append #battery css blocks to $WAYBAR_CSS"
         return 0
     fi
-    cat >> "$WAYBAR_CSS" <<'BATCSSEOF'
+    if [ "$_need_base" -eq 1 ]; then
+        cat >> "$WAYBAR_CSS" <<'BATCSSEOF'
 
 /* ═══════════════════════════════════════════════════════════════
    13. Battery（eilNiri 按需添加）
@@ -329,59 +354,171 @@ append_battery_css() {
     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
 }
 BATCSSEOF
+    fi
+    if [ "$_need_states" -eq 1 ]; then
+        cat >> "$WAYBAR_CSS" <<'BATSTSEOF'
+
+/* Battery 状态色（与参考版 style.css 第 6 节一致） */
+#battery.charging {
+    color: #a6e3a1;
+}
+
+#battery.warning:not(.charging) {
+    color: #f9e2af;
+}
+
+#battery.critical:not(.charging) {
+    color: #f38ba8;
+    animation: blink 800ms infinite;
+}
+BATSTSEOF
+    fi
+    if [ "$_need_blink" -eq 1 ]; then
+        cat >> "$WAYBAR_CSS" <<'BATBLKEOF'
+
+@keyframes blink {
+    0% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.35;
+    }
+    100% {
+        opacity: 1;
+    }
+}
+BATBLKEOF
+    fi
     _own_back "$WAYBAR_CSS"
     return 0
 }
 
 # ==============================================================================
-# 4. waybar restart — only when a live waybar and a usable session env exist;
-#    otherwise fall back to a manual hint (never kill without a way to relaunch)
+# 4. waybar restart — 让新模块立即生效，且不破坏会话环境
+#    v1.0 的「白名单环境变量重建」会丢 NIRI_SOCKET 等会话变量，导致
+#    niri/workspaces、niri/window 模块失联甚至整条栏消失。正确做法：让 niri
+#    自己拉起 waybar（niri msg action spawn，与 spawn-at-startup 同源、继承
+#    niri 完整会话环境）；niri IPC 不可用时，以原进程的完整 environ+cmdline
+#    原样重启；两者都不可用则不动运行中的 waybar，仅给手动提示。
 # ==============================================================================
 
 restart_waybar() {
-    local wpid="" wenv="" launch_cmd=""
+    local wpid="" launch_cmd="" _envdump="" _cmddump="" _niri_env="" _cap="" _pyrelaunch=""
+    local _niri_ok=0 _ok=0
     wpid=$(pgrep -x waybar 2>/dev/null | head -n 1 || true)
     if [ -z "$wpid" ]; then
         log "$(_t "waybar is not running; the battery module appears on next login (niri spawn-at-startup)." "waybar is not running; the battery module appears on next login (niri spawn-at-startup).")"
         return 0
     fi
-    # Prefer the installed single-instance guard — same launch source as niri
+    # 优先复用仓库的单实例启动守卫，与 niri 的启动来源保持一致
     if [ -x /usr/local/bin/eilniri-waybar-start ]; then
         launch_cmd="/usr/local/bin/eilniri-waybar-start"
     else
         launch_cmd="waybar"
     fi
 
-    if [ "$RUN_AS_ROOT" -eq 1 ]; then
-        # root: borrow the session env from the live waybar process, relaunch as target user
-        wenv=$(tr '\0' '\n' < "/proc/$wpid/environ" 2>/dev/null \
-            | grep -E '^(WAYLAND_DISPLAY|XDG_RUNTIME_DIR|DISPLAY|DBUS_SESSION_BUS_ADDRESS)=' \
-            | tr '\n' ' ' || true)
-        if [ -z "$wenv" ]; then
-            warn "$(_t "Could not read the running waybar session env — restart it manually (pkill waybar, then re-login)." "Could not read the running waybar session env — restart it manually (pkill waybar, then re-login).")"
-            return 0
-        fi
-        if [ "$DRY_RUN" -eq 1 ]; then
-            dry_run_note "pkill -x waybar; runuser -u $TARGET_USER -- setsid env $wenv$launch_cmd"
-            return 0
-        fi
-        pkill -x waybar 2>/dev/null || true
-        sleep 0.5
-        as_user sh -c "setsid env $wenv $launch_cmd >/dev/null 2>&1 </dev/null &"
-    else
-        if [ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
-            log "$(_t "No graphical session detected; the battery module appears on next login." "No graphical session detected; the battery module appears on next login.")"
-            return 0
-        fi
-        if [ "$DRY_RUN" -eq 1 ]; then
-            dry_run_note "pkill -x waybar; setsid $launch_cmd"
-            return 0
-        fi
-        pkill -x waybar 2>/dev/null || true
-        sleep 0.5
-        setsid "$launch_cmd" >/dev/null 2>&1 </dev/null &
+    if [ "$DRY_RUN" -eq 1 ]; then
+        dry_run_note "pkill -x waybar; niri msg action spawn -- $launch_cmd"
+        return 0
     fi
-    success "$(_t "waybar restarted — the battery module is live now." "waybar restarted — the battery module is live now.")"
+
+    # 先取运行中 waybar 的会话环境（进程死后 /proc/<pid> 即消失）：
+    #   - NIRI_SOCKET/XDG_RUNTIME_DIR：root / SSH 下借给这一次 niri IPC 调用
+    #     （真正拉起的 waybar 用的是 niri 自己的完整环境，与白名单重建不同）
+    #   - 完整 environ + cmdline：留给次选的全环境重启
+    _envdump=$(mktemp 2>/dev/null) && _cmddump=$(mktemp 2>/dev/null)
+    [ -n "$_envdump" ] && register_temp_path "$_envdump"
+    [ -n "$_cmddump" ] && register_temp_path "$_cmddump"
+    cat "/proc/$wpid/environ" > "$_envdump" 2>/dev/null || true
+    cat "/proc/$wpid/cmdline" > "$_cmddump" 2>/dev/null || true
+    _niri_env=""
+    [ -n "${NIRI_SOCKET:-}" ] && _niri_env="NIRI_SOCKET=${NIRI_SOCKET} "
+    [ -n "${XDG_RUNTIME_DIR:-}" ] && _niri_env="${_niri_env}XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} "
+    if [ -s "$_envdump" ]; then
+        _cap=$(tr '\0' '\n' < "$_envdump" 2>/dev/null | grep -E '^(NIRI_SOCKET|XDG_RUNTIME_DIR)=' | tr '\n' ' ' || true)
+        [ -n "$_cap" ] && _niri_env="${_niri_env}${_cap}"
+    fi
+
+    # 预检 niri IPC 可达（无害读命令）；确认能拉起才动进程
+    if command -v niri >/dev/null 2>&1 && [ -n "${_niri_env// /}" ]; then
+        if [ "$RUN_AS_ROOT" -eq 1 ]; then
+            runuser -u "$TARGET_USER" -- env $_niri_env niri msg version >/dev/null 2>&1 && _niri_ok=1
+        else
+            env $_niri_env niri msg version >/dev/null 2>&1 && _niri_ok=1
+        fi
+    fi
+    if [ "$_niri_ok" -ne 1 ] && [ ! -s "$_envdump" ]; then
+        warn "$(_t "cannot restart waybar safely (no niri IPC and no captured env) — config written, running waybar left untouched. Apply manually: re-login, or 'pkill -x waybar' then run: $launch_cmd" "cannot restart waybar safely (no niri IPC and no captured env) — config written, running waybar left untouched. Apply manually: re-login, or 'pkill -x waybar' then run: $launch_cmd")"
+        return 0
+    fi
+
+    pkill -x waybar 2>/dev/null || true
+    sleep 0.5
+
+    # 首选：niri 拉起（继承 niri 完整会话环境，与 spawn-at-startup 同源）
+    if [ "$_niri_ok" -eq 1 ]; then
+        if [ "$RUN_AS_ROOT" -eq 1 ]; then
+            runuser -u "$TARGET_USER" -- env $_niri_env niri msg action spawn -- "$launch_cmd" >/dev/null 2>&1 && _ok=1
+        else
+            env $_niri_env niri msg action spawn -- "$launch_cmd" >/dev/null 2>&1 && _ok=1
+        fi
+    fi
+
+    # 次选：以原进程完整环境 + 原命令行重启（双 fork 脱离本脚本会话）
+    if [ "$_ok" -ne 1 ] && [ -s "$_envdump" ]; then
+        _pyrelaunch=$(mktemp 2>/dev/null)
+        if [ -n "$_pyrelaunch" ]; then
+            register_temp_path "$_pyrelaunch"
+            cat > "$_pyrelaunch" <<'PYWREOF'
+import os, sys
+
+envdump, cmddump, fallback_cmd = sys.argv[1], sys.argv[2], sys.argv[3]
+env = {}
+with open(envdump, "rb") as f:
+    for kv in f.read().split(b"\0"):
+        if b"=" in kv:
+            k, v = kv.split(b"=", 1)
+            env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+argv = []
+with open(cmddump, "rb") as f:
+    for a in f.read().split(b"\0"):
+        if a:
+            argv.append(a.decode("utf-8", "replace"))
+if not argv:
+    argv = [fallback_cmd]
+cmd = argv[0]
+if "/" not in cmd:
+    for d in env.get("PATH", "/usr/bin:/bin").split(":"):
+        cand = (d.rstrip("/") or "/") + "/" + cmd
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            cmd = cand
+            break
+argv[0] = cmd
+pid = os.fork()
+if pid > 0:
+    sys.exit(0)
+os.setsid()
+devnull = os.open(os.devnull, os.O_RDWR)
+for fd in (0, 1, 2):
+    os.dup2(devnull, fd)
+os.execve(cmd, argv, env)
+PYWREOF
+            _own_back "$_envdump" "$_cmddump" "$_pyrelaunch"
+            if [ "$RUN_AS_ROOT" -eq 1 ]; then
+                runuser -u "$TARGET_USER" -- python3 "$_pyrelaunch" "$_envdump" "$_cmddump" "$launch_cmd" >/dev/null 2>&1 && _ok=1 || true
+            else
+                python3 "$_pyrelaunch" "$_envdump" "$_cmddump" "$launch_cmd" >/dev/null 2>&1 && _ok=1 || true
+            fi
+        fi
+    fi
+
+    # 验证：2 秒后 waybar 必须在跑，否则给出明确的手动恢复路径
+    sleep 2
+    if pgrep -x waybar >/dev/null 2>&1; then
+        success "$(_t "waybar restarted — the battery module is live now." "waybar restarted — the battery module is live now.")"
+    else
+        warn "$(_t "waybar did not come back automatically (config is already written). Recover manually: re-login, or run: $launch_cmd" "waybar did not come back automatically (config is already written). Recover manually: re-login, or run: $launch_cmd")"
+    fi
 }
 
 # ==============================================================================
@@ -392,9 +529,10 @@ usage() {
     cat <<USAGEEOF
 eilNiri laptop-need-install.sh v$SCRIPT_VERSION
 
-笔记本补装脚本（搭配 arch-install.sh / deb-install.sh / RHEL-install.sh 使用）。
-在主安装脚本完成 eilNiri 安装后运行，为已配置好的 waybar 添加电量模块
-（外观与现有模块一致，每 10 秒刷新一次）。
+补装脚本（搭配 arch-install.sh / deb-install.sh / RHEL-install.sh 使用）。
+任一主安装脚本完成 eilNiri 安装后运行，为已配置好的 waybar 添加电量模块
+（外观与现有模块一致，每 10 秒刷新一次）。三种主脚本的全部产物形态均兼容；
+笔记本与台式机通用（无电池机器 waybar 自动隐藏该模块，无害）。
 
 Usage:
   sudo ./laptop-need-install.sh [--dry-run]
@@ -425,7 +563,7 @@ main() {
     echo ""
     echo -e "${H_PURPLE}╭────────────────────────────────────────────────────────────────────────╮${NC}"
     echo -e "${H_PURPLE}│${NC} ${BOLD}${H_WHITE}eilNiri Laptop Supplement — waybar battery module${NC}  ${DIM}v$SCRIPT_VERSION${NC}"
-    echo -e "${H_PURPLE}│${NC} ${H_CYAN}after arch/deb/RHEL-install.sh · laptop only · idempotent${NC}"
+    echo -e "${H_PURPLE}│${NC} ${H_CYAN}after arch/deb/RHEL-install.sh · laptop & desktop · idempotent${NC}"
     echo -e "${H_PURPLE}╰────────────────────────────────────────────────────────────────────────╯${NC}"
     echo ""
     write_log "SECTION" "laptop-need-install v$SCRIPT_VERSION started (dry-run=$DRY_RUN)"
@@ -434,8 +572,11 @@ main() {
     preflight
     detect_battery
     info_kv "$(_t "Battery" "Battery")" "$([ "$BAT_DETECTED" = "Y" ] && echo "detected" || echo "not found")"
+    if [ "$BAT_DETECTED" != "Y" ]; then
+        log "$(_t "No battery detected — the module is written anyway; waybar auto-hides it on battery-less machines (desktops), which is harmless." "No battery detected — the module is written anyway; waybar auto-hides it on battery-less machines (desktops), which is harmless.")"
+    fi
 
-    if ! confirm "$(_t "Add the waybar battery module (laptop/battery-powered device)? [Y/n] (default ${BAT_DETECTED}, 15s):" "Add the waybar battery module (laptop/battery-powered device)? [Y/n] (default ${BAT_DETECTED}, 15s):")" "$BAT_DETECTED" 15; then
+    if ! confirm "$(_t "Add the waybar battery module? [Y/n] (default Y, 15s):" "Add the waybar battery module? [Y/n] (default Y, 15s):")" "Y" 15; then
         log "$(_t "Battery module not added — nothing was changed." "Battery module not added — nothing was changed.")"
         exit 0
     fi
