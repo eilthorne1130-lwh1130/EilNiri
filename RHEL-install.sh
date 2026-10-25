@@ -606,7 +606,9 @@ as_user() {
 # Resume support (dry-run does not read/write the progress file).
 # The progress file carries a script-version marker; progress files written by older
 # script versions are ignored (stages are re-run instead of being silently skipped).
-PROGRESS_VERSION="v49"
+# v50: the IME/wallpaper/EPEL fixes live in the apps + configs stages; machines that
+# already ran v49 must re-run BOTH or the fixes are skipped as "already done".
+PROGRESS_VERSION="v50"
 stage_done() {
     [ "$DRY_RUN" -eq 1 ] && return 1
     grep -q "^# eilniri-progress $PROGRESS_VERSION" "$STATE_FILE" 2>/dev/null || return 1
@@ -4205,7 +4207,15 @@ _ibus_write_session_launcher() {
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export PATH
 
-log() { printf 'eilNiri-ime: %s\n' "$*" >&2; }
+# Log to stderr AND ~/.cache/eilniri-ime.log — niri discards spawn-sh output on
+# most setups, so the file is the only way to see which start path was taken and
+# whether engine activation worked (check it when the tray icon is missing).
+_IME_LOG="${XDG_CACHE_HOME:-$HOME/.cache}/eilniri-ime.log"
+mkdir -p "$(dirname "$_IME_LOG")" 2>/dev/null
+log() {
+    printf '[%s] eilNiri-ime: %s\n' "$(date '+%F %T')" "$*" >>"$_IME_LOG" 2>/dev/null
+    printf 'eilNiri-ime: %s\n' "$*" >&2
+}
 
 # Already running (e.g. a second restore run / compositor reload)? Nothing to do.
 if pgrep -x ibus-daemon >/dev/null 2>&1; then
