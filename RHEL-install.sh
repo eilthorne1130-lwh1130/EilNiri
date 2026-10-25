@@ -961,6 +961,38 @@ resolve_rhel_package() { # $1 = logical package name; prints an installable cand
 # in the official repos — extra enables are best-effort and ignored if absent.
 ensure_rhel_repos() {
     [ "$DRY_RUN" -eq 1 ] && { log "$(_t "[DRY-RUN] would enable EPEL + CRB/PowerTools repos." "[DRY-RUN] would enable EPEL + CRB/PowerTools repos.")"; return 0; }
+    # Fedora: EVERYTHING this script installs is in the official repos
+    # (niri, ibus-rime/librime/librime-lua/brise, hyprlock, copyq, ...). EPEL and
+    # CRB are EL-only. An older script version still ran the EPEL block below on
+    # Fedora: 'dnf install epel-release' fails (Fedora does not ship it) and the
+    # fallback installs the EL10 epel-release RPM straight from a CN mirror —
+    # that RPM DOES install on Fedora, but its repo uses $releasever (=4x), which
+    # has no EPEL mirror, so every later dnf transaction died on the 404 metadata
+    # and the run cascaded into bogus "ibus-rime needs EPEL/COPR" messages.
+    # Heal that residue first, then skip the EPEL/CRB setup entirely.
+    if [ "${DISTRO_ID:-}" = fedora ]; then
+        if rpm -q epel-release >/dev/null 2>&1 || ls /etc/yum.repos.d/epel*.repo >/dev/null 2>&1; then
+            warn "$(_t "Fedora's official repos already carry everything, but a leftover EPEL repo was found (an EL epel-release an older script version installed by mistake — its \$releasever has no mirror and the 404 metadata wedges dnf). Removing it..." "Fedora: leftover EPEL repo found (installed by mistake; its 404 metadata wedges dnf). Removing...")"
+            rpm -e epel-release 2>>"$LOG_DIR/dnf-errors.log" || true
+            rm -f /etc/yum.repos.d/epel*.repo 2>/dev/null || true
+            dnf clean all >/dev/null 2>&1 || true
+            dnf makecache --refresh >/dev/null 2>&1 || true
+            log "$(_t "Removed the broken EPEL repo from Fedora and refreshed the dnf cache" "Removed the broken EPEL repo and refreshed the dnf cache")"
+        fi
+        log "$(_t "Fedora: the official repos cover every dependency (incl. ibus-rime) — skipping EPEL/CRB/COPR setup" "Fedora: official repos cover every dependency — skipping EPEL/CRB/COPR setup")"
+        # Keep the -testing repo self-heal: incomplete *-testing metadata on fresh
+        # Fedora minors wedges dnf the same way it does on EL.
+        local _trepo _tdisabled=0
+        for _trepo in $(dnf repolist --all 2>/dev/null | awk 'BEGIN{IGNORECASE=1} $1 ~ /-testing(\/|$)/ {print $1}'); do
+            dnf config-manager setopt "${_trepo}.enabled=0" >/dev/null 2>&1 || true
+            dnf config-manager --set-disabled "$_trepo" >/dev/null 2>&1 || true
+            _tdisabled=1
+            log "$(_t "Disabled -testing repo (avoids dnf metadata failures): " "Disabled -testing repo (avoids dnf metadata failures): ") $_trepo"
+        done
+        [ "$_tdisabled" -eq 1 ] && dnf clean all >/dev/null 2>/dev/null || true
+        dnf makecache --refresh >/dev/null 2>&1 || true
+        return 0
+    fi
     if [ ! -f /etc/yum.repos.d/epel.repo ] && ! rpm -q epel-release >/dev/null 2>&1; then
         log "$(_t "Enabling EPEL..." "Enabling EPEL...")"
         # NOTE: stderr goes to the error log instead of /dev/null. On EL10 the most
@@ -2250,7 +2282,10 @@ install_awww_from_build() { # $1 = srcdir, $2 = logfile
 # 修正 waypaper config.ini 与 hyprlock.conf（锁屏壁纸）里指向参考机的绝对路径。
 _ensure_wallpaper() {
     [ "$DRY_RUN" -eq 1 ] && return 0
-    command -v awww >/dev/null 2>&1 || return 0   # awww 缺失由 install_awww 处理
+    # NOTE: 不再以 awww 是否已安装为前提——awww 在 RHEL 系是后台 cargo 构建，二进制
+    # 要到 stage_wait_builds（stage_configs 之后）才安装，若在此早退，首次安装时壁纸
+    # 不会部署、hyprlock/waypaper 的路径也不会修正（锁屏背景空白）。壁纸部署与路径
+    # 修正均不依赖 awww 二进制；awww 就绪后 stage_wait_builds 会再跑一次本函数（幂等）。
 
     local _img="" _cand _ext=""
     # 1) 固定使用仓库根目录的壁纸图（用户放在 script 旁的那张 QQ图片.../wallpaper 图）。
@@ -2957,6 +2992,12 @@ install_rime_ice() {
 # when absent so a user's own tuning survives a rerun.
 #   default.custom.yaml — schema list + menu/page_size:5 (the fcitx5 config used
 #                         DefaultPageSize=5; rime-ice already ships 5, this pins it)
+#                         + ascii_composer/switch_key — 左 Shift 切换中英文, the
+#                         toggle this dotfiles shipped since the fcitx5 days
+#                         (TriggerKeys=Shift+Shift_L). Pinned explicitly instead
+#                         of relying on rime-ice's upstream defaults. A file from
+#                         an older script version (no switch_key line) is
+#                         regenerated with a timestamped backup.
 #   ibus_rime.yaml      — ibus-rime stops overwriting this file once it carries a
 #                         version (rime_main.c: deploy_config_file only when the
 #                         installed copy has no version field), so our values win.
@@ -2971,7 +3012,15 @@ _rime_ibus_write_custom() { # $1 = rime user dir
     _own="$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
     mkdir -p "$d" 2>/dev/null || return 0
 
-    if [ ! -f "$d/default.custom.yaml" ]; then
+    if [ ! -f "$d/default.custom.yaml" ] || ! grep -q 'ascii_composer/switch_key' "$d/default.custom.yaml" 2>/dev/null; then
+        # An older script version wrote this file WITHOUT the Shift toggle patch
+        # (it relied on rime-ice's upstream defaults) — regenerate those with a
+        # backup. A file that already carries switch_key is the user's own tuning
+        # and is left alone.
+        if [ -f "$d/default.custom.yaml" ]; then
+            cp -f "$d/default.custom.yaml" "$d/default.custom.yaml.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+            log "$(_t "Regenerated default.custom.yaml to pin the Shift_L CJK/ASCII toggle (old copy backed up)" "Regenerated default.custom.yaml to pin the Shift_L toggle (old copy backed up)")"
+        fi
         cat > "$d/default.custom.yaml" <<'RIMEEOF'
 # eilNiri: IBus + Rime defaults (managed file — delete to fall back to upstream)
 # Mirrors the fcitx5 settings this script shipped before the IBus migration.
@@ -2981,9 +3030,12 @@ patch:
   # Keep rime-ice as the only schema; ibus preload-engines=['rime'] selects it.
   schema_list:
     - schema: rime_ice
-  # Do NOT reset the switch state when the focus changes — the fcitx5 build ran
-  # with resetStateWhenFocusIn=Program and rime-ice ships reset commented out.
-  # (rime-ice may re-add its own copy on update; harmless either way.)
+  # 左 Shift 切换中英文（fcitx5: TriggerKeys=Shift+Shift_L）。不依赖 rime-ice 上游
+  # 默认值：Shift_L 上屏已输入的编码并切英文，Shift_R 上屏整句切换。引擎级切换
+  # （Ctrl+Space）在 IBus 层 dconf trigger 里，带修饰键，与此互不冲突。
+  ascii_composer/good_old_caps_lock: true
+  ascii_composer/switch_key/Shift_L: commit_code
+  ascii_composer/switch_key/Shift_R: commit_text
 RIMEEOF
         chown "$_own" "$d/default.custom.yaml" 2>/dev/null || true
     fi
@@ -3620,7 +3672,12 @@ stage_wait_builds() {
         if [ "$rc" -eq 0 ]; then
             case "$name" in
                 niri) install_niri_from_build "$srcdir" "$logfile" ;;
-                awww) install_awww_from_build "$srcdir" "$logfile" ;;
+                awww)
+                    install_awww_from_build "$srcdir" "$logfile"
+                    # awww 二进制此刻才就绪（stage_configs 运行时它还在后台编译），
+                    # 补一次壁纸收尾：写状态文件 + 主动 set-wallpaper。函数幂等。
+                    _ensure_wallpaper
+                    ;;
             esac
         else
             any_failed=1
@@ -4169,9 +4226,12 @@ select_engine() {
         i=$((i + 1)); sleep 0.5
     done
     want=""
-    if ibus list-engine 2>/dev/null | grep -qE '(^|[^a-z])rime$'; then
+    # `ibus list-engine` prints "name : longname" per line (e.g. "rime : Rime"),
+    # so match the engine NAME as a whole word anywhere in the line — anchoring
+    # to end-of-line never matches the longname that follows it.
+    if ibus list-engine 2>/dev/null | grep -qw rime; then
         want=rime
-    elif ibus list-engine 2>/dev/null | grep -qE '(^|[^a-z])libpinyin$'; then
+    elif ibus list-engine 2>/dev/null | grep -qw libpinyin; then
         want=libpinyin
     fi
     [ -n "$want" ] || { log "no Chinese engine registered; leaving IBus as-is"; return 0; }
@@ -4196,9 +4256,9 @@ fi
 
 if command -v ibus-daemon >/dev/null 2>&1; then
     # -d daemonize, -r replace any stale instance, -x XIM server for X11 apps.
-    # -R restarts the panel/config process if it dies (a dead panel means no
-    # candidate window, since the panel owns the lookup table UI).
-    ibus-daemon -drxR
+    # NOTE: ibus-daemon has NO -R option (only -r/--replace) — an unknown short
+    # option makes GOption abort the daemon before it ever starts.
+    ibus-daemon -drx
     select_engine
     exit $?
 fi
@@ -4273,6 +4333,19 @@ _repoint_ime_env_config() {
         _changed=1
         log "$(_t "niri config environment: " "niri config environment: ")$_k -> $_want"
     done
+    # spawn-sh lines carry INLINE IM variables (the Mod+W kitty bind: "GLFW_IM_
+    # MODULE=ibus QT_IM_MODULE=fcitx ... kitty -e zsh"). The loop above only
+    # rewrites the environment{} block, so without this the terminal — and every
+    # app launched from it — would keep looking for the fcitx daemon that does
+    # not exist on the RHEL family (IBus is the IME there). Same VALUE-only
+    # substitution, anchored on the VAR=fcitx inline form, so the environment{}
+    # entries (KEY "value") are never touched twice.
+    if grep -qE '(IM_MODULE|XMODIFIERS)=@?(im=)?fcitx' "$_cfg" 2>/dev/null; then
+        cp -f "$_cfg" "$_cfg.bak-ime-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+        sed -i -E 's/(IM_MODULE=)fcitx/\1ibus/g; s/(XMODIFIERS=@im=)fcitx/\1ibus/g' "$_cfg" 2>/dev/null || true
+        _changed=1
+        log "$(_t "niri config spawn-sh inline IM vars: fcitx -> ibus" "niri config spawn-sh inline IM vars: fcitx -> ibus")"
+    fi
     # Extra keys IBus/toolkits look at: INPUT_METHOD is read by several toolkits,
     # XDG_SESSION_DESKTOP tells IBus which session it runs in (it reads that
     # variable directly), GLFW_IM_MODULE matters for kitty. Added once, when the
