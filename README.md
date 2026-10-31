@@ -41,14 +41,13 @@
 
 ## 🌟 项目简介
 
-**EilNiri** 是一套开箱即用的 Wayland 桌面环境配置与自动化构建部署套件，核心基于滚动式无限平铺合成器 [Niri](https://github.com/YaLTeR/niri)。
+**EilNiri** 是一套面向多主流 Linux 发行版的开箱即用 [Niri](https://github.com/YaLTeR/niri) (Wayland) 桌面环境配置与自动化部署套件。
 
-本项目打破了传统平铺窗口管理器（如 i3、bspwm、Hyprland）在屏幕横向空间拥挤、多窗口叠放割裂的局限，充分利用 Niri 革命性的**无限水平带状平铺（Scrollable Tiling）**特性，结合 **Catppuccin Mocha** 现代化设计语言与深度打磨的动效体系，为 Linux 用户打造既赏心悦目又健步如飞的极客生产力桌面。
+项目基于 Niri 独特的**无限水平带状平铺（Scrollable Tiling）**窗口管理机制，整合了模块化状态栏、轻量快捷启动器、现代终端、健全统一的中文输入法方案以及完善的会话与锁屏守护，为 Linux 用户提供清晰直观、轻量流畅且开箱即用的平铺桌面生产力体验。
 
 ### ✨ 核心特性
 
 - 🎯 **跨三大发行版家族全自动化**：提供 `arch-install.sh`、`deb-install.sh`、`RHEL-install.sh`，覆盖 Arch Linux / Manjaro、Debian / Ubuntu / Pop!_OS、Fedora / RHEL / Rocky 等主流平台。
-- 🧊 **极致视觉美学**：全局统一的 Catppuccin Mocha 主题色系、24px 优雅圆角、85% 亚克力毛玻璃微透，配合 `awww-daemon` 实现多显示器无缝动态壁纸流转。
 - ⌨️ **Vim 风格人体工程学快捷键**：全面支持 `H/J/K/L` 导航与移动，分工明确的修饰键分级体系，双手不离键盘即可完成所有视窗编排。
 - 🌏 **统一且开箱即用的中文输入体验**：三大家族全平台统一 Fcitx5 + Rime（雾凇拼音 rime-ice），原生解决 Wayland 与 Kitty 终端中文输入环境。
 - 🔋 **智能模块热注入**：自带 `laptop-need-install.sh`，采用 AST 级幂等语法注入，自动补齐 Waybar 电量监视模块与低电量告警。
@@ -85,7 +84,7 @@ vlc "/home/eilthorne/2-disk/演示/EilNiri演示.mp4"
 | 场景 | 截图展示 | 关键功能特性 |
 | :--- | :--- | :--- |
 | **01. 纯净桌面与状态栏** | <img src="assets/screenshots/01_desktop.png" width="420" /> | • 4K 唯美动态壁纸渲染<br>• Waybar 顶置极简状态栏<br>• 模块化系统托盘与电量/网络指标 |
-| **02. Fuzzel 应用启动器** | <img src="assets/screenshots/02_fuzzel.png" width="420" /> | • `Mod+Z` 瞬时唤起<br>• 高斯模糊深紫灰背景 (`1e1e2edd`)<br>• Papirus-Dark 高清图标与拼音首字母过滤 |
+| **02. Fuzzel 应用启动器** | <img src="assets/screenshots/02_fuzzel.png" width="420" /> | • `Mod+Z` 瞬时唤起<br>• Wayland 原生极速轻量启动器<br>• 半透明深紫灰配色 (`1e1e2edd`) 与 Papirus-Dark 图标支持<br>• 应用名称、通用描述与命令模糊匹配过滤 |
 | **03. Kitty 终端微透质感** | <img src="assets/screenshots/03_kitty.png" width="420" /> | • `Mod+W` 极速打开终端<br>• 85% 亚克力半透明与 12px 圆角<br>• Starship 现代化三段式状态提示符 |
 | **04. 监控与 Waybar 折叠抽屉** | <img src="assets/screenshots/04_btop.png" width="420" /> | • 点击状态栏触发 `group/sys` 平滑展开<br>• 实时硬件占用（CPU/内存/磁盘）<br>• 一键联动进入全功能 `btop` 面板 |
 | **05. 无限水平滚动与比例预设** | <img src="assets/screenshots/05_tiling.png" width="420" /> | • `Mod+R` 在 1/3、1/2、2/3 宽度间循环<br>• `Mod+F` 独占当前列最大化<br>• 视窗平滑阻尼物理弹性滚动动画 |
@@ -197,6 +196,55 @@ sudo ./laptop-need-install.sh -y
 3. **中文输入法切换**：
    - 默认采用 `Fcitx5 + Rime (雾凇拼音)`，快捷键为 **左 Shift** 切换中英文。
    - 配置文件位于 `~/.config/fcitx5/` 与 `~/.config/ibus/rime/`。
+
+4. **锁屏配置（默认背景与锁屏时间）**：
+   - **默认锁屏背景**：
+     - 各安装脚本部署时，会自动将仓库自带的精美壁纸（`QQ图片20260713144149.jpeg`）同步部署至用户目录：`~/.local/share/backgrounds/wallpaper.jpg`。
+     - 锁屏程序 `hyprlock` 默认自动加载该路径作为背景（`~/.config/hypr/hyprlock.conf` 中的 `background { path = $HOME/.local/share/backgrounds/wallpaper.jpg }`），并通过 GPU 着色器应用双通道高斯模糊（`blur_passes = 2`、`blur_size = 4`）与暗化处理，兼顾视觉美感与解锁可读性。
+     - **更换锁屏背景**：直接将你喜欢的图片覆盖至 `~/.local/share/backgrounds/wallpaper.jpg`，或者修改 `~/.config/hypr/hyprlock.conf` 中的 `path` 路径。
+   - **默认锁屏时间与应用抑制**：
+     - 闲置状态由 `hypridle` 后台守护进程统一管理（配置文件为 `~/.config/hypr/hypridle.conf`）。
+     - **默认锁屏时间为闲置 20 分钟（1200 秒）**，超时自动调起 `hyprlock`。
+     - **智能防打扰**：配置已开启 `ignore_dbus_inhibit = false` 与 `ignore_systemd_inhibit = false`。当您在浏览器/MPV 全屏观看视频、或者系统正在进行包管理更新时，播放器与系统更新会发送抑制信号，系统**不会**误触发锁屏。
+     - **手动即时锁屏**：按下快捷键 <kbd>Super</kbd> + <kbd>Alt</kbd> + <kbd>L</kbd> 可立即锁屏。
+
+5. **修改锁屏时间、睡眠/休眠与关闭显示器（DPMS）**：
+   编辑 `~/.config/hypr/hypridle.conf`，根据个人使用习惯按需调整：
+
+   ```ini
+   # ------------------------------
+   # 通用设置
+   # ------------------------------
+   general {
+       lock_cmd = "hyprlock"         # 锁屏执行命令
+       ignore_dbus_inhibit = false   # 尊重播放器/浏览器全屏看视频的防锁屏请求
+       ignore_systemd_inhibit = false
+   }
+
+   # 1. 调整自动锁屏时间（例如将 20 分钟改为 10 分钟或 5 分钟）
+   listener {
+       timeout = 600                 # 600 秒 = 10 分钟（原默认为 1200 秒）
+       on-timeout = "hyprlock"       # 闲置超时仅执行锁屏
+   }
+
+   # 2. 自动关闭显示器 / 息屏（可选：闲置 15 分钟后息屏节能）
+   listener {
+       timeout = 900                 # 900 秒 = 15 分钟
+       on-timeout = niri msg action power-off-monitors  # 关闭显示器
+       on-resume = niri msg action power-on-monitors   # 键盘鼠标活动时重新点亮
+   }
+
+   # 3. 自动挂起 / 睡眠（可选：笔记本电脑闲置 30 分钟后系统休眠挂起）
+   listener {
+       timeout = 1800                # 1800 秒 = 30 分钟
+       on-timeout = systemctl suspend # 触发系统挂起休眠 (Suspend to RAM)
+   }
+   ```
+
+   修改完成后，保存文件并在终端运行以下命令重启 `hypridle` 即可立即生效：
+   ```bash
+   killall hypridle && hypridle &
+   ```
 
 ---
 

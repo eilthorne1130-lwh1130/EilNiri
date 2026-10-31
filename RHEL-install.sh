@@ -4003,7 +4003,7 @@ configure_copyq_hidden_window() {
         fi
         log "$(_t "Set hide_main_window=true in ~/.config/copyq/copyq.conf (no CopyQ window at startup)" "Set hide_main_window=true in ~/.config/copyq/copyq.conf (no CopyQ window at startup)")"
     fi
-    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cqconf" 2>/dev/null || true
+    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$HOME_DIR/.config/copyq" 2>/dev/null || true
 }
 
 
