@@ -83,7 +83,7 @@ vlc "/home/eilthorne/2-disk/演示/EilNiri演示.mp4"
 
 | 场景 | 截图展示 | 关键功能特性 |
 | :--- | :--- | :--- |
-| **01. 纯净桌面与状态栏** | <img src="assets/screenshots/01_desktop.png" width="420" /> | • 4K 唯美动态壁纸渲染<br>• Waybar 顶置极简状态栏<br>• 模块化系统托盘与电量/网络指标 |
+| **01. 纯净桌面与状态栏** | <img src="assets/screenshots/01_desktop.png" width="420" /> | • 高清壁纸渲染与居中展示<br>• Waybar 顶置极简状态栏<br>• 模块化系统托盘与电量/网络指标 |
 | **02. Kitty 终端微透质感** | <img src="assets/screenshots/03_kitty.png" width="420" /> | • `Mod+W` 极速打开终端<br>• 85% 亚克力半透明与 12px 圆角<br>• Starship 现代化三段式状态提示符 |
 | **03. 监控与 Waybar 折叠抽屉** | <img src="assets/screenshots/04_btop.png" width="420" /> | • 点击状态栏触发 `group/sys` 平滑展开<br>• 实时硬件占用（CPU/内存/磁盘）<br>• 一键联动进入全功能 `btop` 面板 |
 | **04. 无限水平滚动与比例预设** | <img src="assets/screenshots/05_tiling.png" width="420" /> | • `Mod+R` 在 1/3、1/2、2/3 宽度间循环<br>• `Mod+F` 独占当前列最大化<br>• 视窗平滑阻尼物理弹性滚动动画 |
@@ -361,7 +361,7 @@ flowchart TD
     end
 
     subgraph VisualSession ["视觉底座与会话防护 (Visuals & Security)"]
-        Awww["Awww-daemon<br>• GPU 纹理动态壁纸服务<br>• backdrop 透明通道穿透"]
+        Awww["Awww-daemon<br>• GPU 纹理壁纸服务<br>• backdrop 透明通道穿透"]
         Hyprlock["Hyprlock<br>• 双通道高斯模糊锁屏"]
         Hypridle["Hypridle<br>• 闲置感知与 DBus 抑制"]
         Polkit["polkit-gnome-agent<br>• 权限提升弹窗代理"]
@@ -397,7 +397,7 @@ flowchart TD
 ### 关键工程突破与设计细节
 
 #### 1. 壁纸穿透防黑屏机制 (Backdrop Rendering)
-在传统平铺窗口管理器中，多显示器动态切换壁纸或开启透明终端时，极易发生“黑底遮盖”或“壁纸闪烁”问题。
+在传统平铺窗口管理器中，多显示器切换壁纸或开启透明终端时，极易发生“黑底遮盖”或“壁纸闪烁”问题。
 EilNiri 通过对 Niri 实施底层图层规则（`layer-rule`）配合透明视口背景解决：
 ```kdl
 layer-rule {
@@ -464,6 +464,6 @@ environment {
 - [Niri](https://github.com/YaLTeR/niri) - 极具创新精神的 Wayland 滚动平铺合成器
 - [Catppuccin](https://github.com/catppuccin/catppuccin) - 温暖舒适的开源配色方案
 - [Waybar](https://github.com/Alexays/Waybar) - 高度灵活的 Wayland 桌面状态栏
-- [Awww](https://github.com/cynicsun/awww) - 流畅高效的 Wayland 动态壁纸守护进程
+- [Awww](https://github.com/cynicsun/awww) - 流畅高效的 Wayland 壁纸守护进程
 - [Rime 雾凇拼音](https://github.com/iDvel/rime-ice) - 精雕细琢的简体中文输入法词库方案
 - [shorin-arch-setup](https://github.com/SHORiN-KiWATA/shorin-arch-setup) - 优秀的安装向导交互设计灵感
