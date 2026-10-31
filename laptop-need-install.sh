@@ -14,11 +14,11 @@
 # 台式机同样写入模块；waybar 对无电池机器会自动隐藏该模块（无害）。
 #
 # Usage:
-#   sudo ./laptop-need-install.sh [--dry-run]   # 与主脚本一致，root 下自动定位目标用户
-#   ./laptop-need-install.sh  [--dry-run]       # 普通用户直接运行，操作自己的配置
+#   sudo ./laptop-need-install.sh [-y|--yes] [--dry-run]   # 与主脚本一致，root 下自动定位目标用户
+#   ./laptop-need-install.sh [-y|--yes] [--dry-run]       # 普通用户直接运行，操作自己的配置
 #
 # 本脚本只修改（写前自动做时间戳备份 *.bak-bat-YYYYmmdd-HHMMSS）：
-#   ~/.config/waybar/config      — modules-right 注入 "battery" + 模块定义（原子写）
+#   ~/.config/waybar/config (或 config.jsonc) — modules-right 注入 "battery" + 模块定义（原子写）
 #   ~/.config/waybar/style.css   — 幂等追加 #battery 基础样式；状态色 / blink
 #                                  keyframes 缺失时自动补齐，已存在则跳过
 #
@@ -30,8 +30,9 @@
 
 set -uo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 DRY_RUN=0
+ASSUME_YES=0
 _ERROR_REPORTED=0
 BAT_DETECTED="N"
 
@@ -116,8 +117,13 @@ info_kv() {
 # Returns 0 = yes, 1 = no
 confirm() {
     local prompt="$1" default="${2:-Y}" timeout="${3:-30}" ans
-    echo -ne "   ${H_CYAN}${prompt} ${NC}"
-    if ! read -t "$timeout" -r ans; then echo ""; fi
+    if [ "${ASSUME_YES:-0}" -eq 1 ]; then
+        ans="Y"
+        echo -e "   ${H_CYAN}${prompt} ${BOLD}Y (unattended)${NC}"
+    else
+        echo -ne "   ${H_CYAN}${prompt} ${NC}"
+        if ! read -t "$timeout" -r ans; then echo ""; fi
+    fi
     ans=${ans:-$default}
     [[ "$ans" =~ ^[Yy] ]]
 }
@@ -211,12 +217,15 @@ WAYBAR_CFG=""
 WAYBAR_CSS=""
 
 preflight() {
-    WAYBAR_CFG="$HOME_DIR/.config/waybar/config"
-    WAYBAR_CSS="$HOME_DIR/.config/waybar/style.css"
-    if [ ! -f "$WAYBAR_CFG" ]; then
-        error "$(_t "waybar config not found at $WAYBAR_CFG — run one of the main installers (arch/deb/RHEL-install.sh) first." "waybar config not found at $WAYBAR_CFG — run one of the main installers (arch/deb/RHEL-install.sh) first.")"
+    if [ -f "$HOME_DIR/.config/waybar/config" ]; then
+        WAYBAR_CFG="$HOME_DIR/.config/waybar/config"
+    elif [ -f "$HOME_DIR/.config/waybar/config.jsonc" ]; then
+        WAYBAR_CFG="$HOME_DIR/.config/waybar/config.jsonc"
+    else
+        error "$(_t "waybar config not found in $HOME_DIR/.config/waybar/ (checked config and config.jsonc) — run one of the main installers (arch/deb/RHEL-install.sh) first." "waybar config not found in $HOME_DIR/.config/waybar/ (checked config and config.jsonc) — run one of the main installers (arch/deb/RHEL-install.sh) first.")"
         exit 1
     fi
+    WAYBAR_CSS="$HOME_DIR/.config/waybar/style.css"
     if ! command -v python3 >/dev/null 2>&1; then
         error "$(_t "python3 not found — cannot patch the waybar config." "python3 not found — cannot patch the waybar config.")"
         exit 1
@@ -259,10 +268,10 @@ backup_files() {
 }
 
 # JSON 注入：modules-right 在 "tray" 前插 "battery"（无 tray 则放最前）+ battery
-# 模块定义。参考版/平铺版 JSON 通用；幂等（battery 已在 modules-right 则不重复插入，
-# 定义整体刷新——可借此把旧 interval 30 更新为 10）。整行 /* */ JSONC 注释
-# （arch/RHEL 硬件适配对 ignored-sinks 的产物）先剥离再解析。原子写入：先写
-# .tmp 再 replace，解析失败时原文件不动。
+# 模块定义。单 bar dict 与多 bar list 配置均兼容；幂等（battery 已在 modules-right
+# 则不重复插入，定义整体刷新——可借此把旧 interval 30 更新为 10）。剥离全部 JSONC 注释
+# （// 与 /* */）及末尾逗号，严格保护字符串不被破坏。原子写入：先写 .tmp 再 replace，
+# 解析失败时原文件不动。
 inject_battery_json() {
     if [ "$DRY_RUN" -eq 1 ]; then
         dry_run_note "python3 — inject battery module into $WAYBAR_CFG"
@@ -277,19 +286,35 @@ path, tmp = sys.argv[1], sys.argv[2]
 with open(path, encoding="utf-8") as f:
     raw = f.read()
 
-# arch/RHEL 硬件适配会把 "ignored-sinks" 行注释成整行 /* ... */（JSONC）；
-# 严格 json 解析前剥离整行块注释（写回后即为纯 JSON）。
-raw = re.sub(r"^[ \t]*/\*.*\*/[ \t]*\r?$", "", raw, flags=re.M)
+# 1. 剥离 JSONC 注释（// 与 /* */），同时严格保护双引号/单引号字符串内部不被破坏
+comment_pattern = re.compile(
+    r"(?P<comment>//[^\r\n]*|/\*.*?\*/)|(?P<string>\"(?:\\.|[^\"\\])*\"|\x27(?:\\.|[^\x27\\])*\x27)",
+    re.DOTALL
+)
 
-cfg = json.loads(raw)
+def strip_comment_sub(match):
+    if match.group("comment"):
+        return " "
+    return match.group("string")
 
-mods = cfg.get("modules-right", [])
-if "battery" not in mods:
-    pos = mods.index("tray") if "tray" in mods else 0
-    mods.insert(pos, "battery")
-cfg["modules-right"] = mods
+clean_json = comment_pattern.sub(strip_comment_sub, raw)
 
-cfg["battery"] = {
+# 2. 剥离 } 或 ] 前的末尾逗号（trailing commas），同时严格保护字符串内部
+comma_pattern = re.compile(
+    r"(?P<string>\"(?:\\.|[^\"\\])*\"|\x27(?:\\.|[^\x27\\])*\x27)|(?P<trailing_comma>,(?:\s*,)*\s*(?=[\]\}]))",
+    re.DOTALL
+)
+
+def strip_comma_sub(match):
+    if match.group("trailing_comma"):
+        return ""
+    return match.group("string")
+
+clean_json = comma_pattern.sub(strip_comma_sub, clean_json)
+
+cfg = json.loads(clean_json)
+
+battery_def = {
     "format": "{capacity}% {icon}",
     "format-charging": "{capacity}% \U000F0084",
     "format-plugged": "{capacity}% \U000F06A5",
@@ -298,6 +323,24 @@ cfg["battery"] = {
     "interval": 10,
     "tooltip-format": "<tt>\u7535\u91cf: {capacity}%\n\u5269\u4f59: {timeTo}</tt>",
 }
+
+def patch_bar(bar):
+    if not isinstance(bar, dict):
+        return
+    mods = bar.get("modules-right", [])
+    if "battery" not in mods:
+        pos = mods.index("tray") if "tray" in mods else 0
+        mods.insert(pos, "battery")
+        bar["modules-right"] = mods
+    bar["battery"] = battery_def
+
+if isinstance(cfg, list):
+    for b in cfg:
+        patch_bar(b)
+elif isinstance(cfg, dict):
+    patch_bar(cfg)
+else:
+    raise ValueError(f"Unsupported Waybar config format: {type(cfg).__name__}")
 
 with open(tmp, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=4, ensure_ascii=False)
@@ -535,16 +578,17 @@ eilNiri laptop-need-install.sh v$SCRIPT_VERSION
 笔记本与台式机通用（无电池机器 waybar 自动隐藏该模块，无害）。
 
 Usage:
-  sudo ./laptop-need-install.sh [--dry-run]
-  ./laptop-need-install.sh  [--dry-run]
+  sudo ./laptop-need-install.sh [-y|--yes] [--dry-run]
+  ./laptop-need-install.sh [-y|--yes] [--dry-run]
 
 Options:
+  -y, --yes    自动确认提示，非交互式运行（适用于自动化测试）
   --dry-run    只打印将要执行的动作，不做任何修改
   -h, --help   显示本帮助
 
 修改的文件（写前自动备份 *.bak-bat-<timestamp>）:
-  ~/.config/waybar/config      注入 battery 模块（interval 10s）
-  ~/.config/waybar/style.css   幂等追加 #battery 基础样式
+  ~/.config/waybar/config (或 config.jsonc) 注入 battery 模块（interval 10s）
+  ~/.config/waybar/style.css                幂等追加 #battery 基础样式
 
 回滚:
   cp ~/.config/waybar/config.bak-bat-<ts>      ~/.config/waybar/config
@@ -553,12 +597,14 @@ USAGEEOF
 }
 
 main() {
-    case "${1:-}" in
-        -h|--help) usage; exit 0 ;;
-        --dry-run) DRY_RUN=1 ;;
-        "")        : ;;
-        *)         error "$(_t "Unknown option: $1 (try --help)" "Unknown option: $1 (try --help)")"; exit 1 ;;
-    esac
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            -y|--yes)  ASSUME_YES=1; shift ;;
+            *)         error "$(_t "Unknown option: $1 (try --help)" "Unknown option: $1 (try --help)")"; exit 1 ;;
+        esac
+    done
 
     echo ""
     echo -e "${H_PURPLE}╭────────────────────────────────────────────────────────────────────────╮${NC}"
@@ -566,11 +612,12 @@ main() {
     echo -e "${H_PURPLE}│${NC} ${H_CYAN}after arch/deb/RHEL-install.sh · laptop & desktop · idempotent${NC}"
     echo -e "${H_PURPLE}╰────────────────────────────────────────────────────────────────────────╯${NC}"
     echo ""
-    write_log "SECTION" "laptop-need-install v$SCRIPT_VERSION started (dry-run=$DRY_RUN)"
+    write_log "SECTION" "laptop-need-install v$SCRIPT_VERSION started (dry-run=$DRY_RUN, yes=$ASSUME_YES)"
 
     detect_target_user
     preflight
     detect_battery
+    info_kv "$(_t "Waybar Config" "Waybar Config")" "$WAYBAR_CFG"
     info_kv "$(_t "Battery" "Battery")" "$([ "$BAT_DETECTED" = "Y" ] && echo "detected" || echo "not found")"
     if [ "$BAT_DETECTED" != "Y" ]; then
         log "$(_t "No battery detected — the module is written anyway; waybar auto-hides it on battery-less machines (desktops), which is harmless." "No battery detected — the module is written anyway; waybar auto-hides it on battery-less machines (desktops), which is harmless.")"

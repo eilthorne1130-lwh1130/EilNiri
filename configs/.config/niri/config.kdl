@@ -673,7 +673,7 @@ binds {
     // Mod+Space       { switch-layout "next"; }
     // Mod+Shift+Space { switch-layout "prev"; }
 
-    Mod+Shift+S { spawn-sh "grim -g \"$(slurp -d)\" - | satty --filename=- --output-filename='~/Pictures/Screenshots/Screenshot from %Y-%m-%d %H-%M-%S.png'"; }
+    Mod+Shift+S { spawn-sh "geom=$(slurp -d) && [ -n \"$geom\" ] && grim -g \"$geom\" - | satty --filename=- --output-filename='~/Pictures/Screenshots/Screenshot from %Y-%m-%d %H-%M-%S.png'"; }
     Ctrl+Print { screenshot-screen; }
     Alt+Print { screenshot-window; }
 

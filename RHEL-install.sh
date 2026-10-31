@@ -208,7 +208,7 @@ LOGO
 # 2. Data section — niri suite definition (single source of truth for export/restore)
 # ==============================================================================
 
-GROUP_ORDER=(core lock wallpaper clip media audio ime fonts keyring)
+GROUP_ORDER=(core lock wallpaper clip media audio ime fonts keyring tools)
 
 declare -A GROUP_EN=(
     [core]="Core"
@@ -220,6 +220,7 @@ declare -A GROUP_EN=(
     [ime]="IME"
     [fonts]="Fonts"
     [keyring]="Keyring"
+    [tools]="Tools"
 )
 
 declare -A GROUP_PKGS=(
@@ -245,6 +246,7 @@ declare -A GROUP_PKGS=(
     [ime]="fcitx5 fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git"
     [fonts]="ttf-jetbrains-mono-nerd wqy-zenhei"
     [keyring]="gnome-keyring"
+    [tools]="ripgrep zoxide bluetui"
 )
 
 # pkg -> group reverse lookup table (built at runtime)
@@ -276,6 +278,8 @@ declare -A RHEL_MAP=(
 declare -A RHEL_CANDIDATES=(
     # --- Fcitx5 IME stack (Fedora RPMs; on EL install_fcitx5_ime builds from
     #     source — these candidate names are only used when an RPM lane exists) ---
+    [fcitx5-gtk]="fcitx5-gtk fcitx5-gtk3 fcitx5-gtk4"
+    [fcitx5-qt]="fcitx5-qt fcitx5-qt5 fcitx5-qt6"
     # Panel: standalone polkit authentication agent. polkit-gnome is retired upstream and
     # packaged by neither Fedora nor EPEL; lxpolkit was merged into lxsession. Both
     # mates below are actively maintained and built for Fedora AND EPEL.
@@ -431,13 +435,8 @@ SRC_DEPS_COPYQ=(qt6-qtbase-devel qt6-qtbase-private-devel qt6-qtdeclarative-deve
     libXtst-devel libXfixes-devel libX11-devel)
 #   playerctl — GLib + gobject-introspection.
 SRC_DEPS_PLAYERCTL=(glib2-devel gobject-introspection-devel)
-# NOTE: there is deliberately no *source-build* dependency group for the IME any
-# more. The former fcitx5 chain (xcb-imdkit + fcitx5 core/gtk/qt + librime +
-# leveldb/opencc/marisa/trie) existed only because fcitx5 has no EL RPM at all.
-# The IBus stack is fully packaged — ibus/ibus-gtk3/ibus-gtk4/ibus-wayland in
-# AppStream, ibus-rime + librime + brise in EPEL 10 (verified 2026-10 by listing
-# the repo package indexes) — so the whole chain, its pins and its helper
-# functions are gone. See install_ibus_ime().
+# IME: Fcitx5 + fcitx5-rime (RPM on Fedora; COPR or source build via install_fcitx5_ime on EL).
+
 
 # System components (from other desktop environments) to disable when restoring
 # on a multi-DE target machine.  Only masked / hidden, NEVER uninstalled — the user
@@ -778,15 +777,17 @@ _menu_numbered() { # $1 = multi|single, $2 = header
 # fzf multi-select (see 99-apps.sh: select all by default / TAB toggle / Ctrl-A select all / Ctrl-D deselect all)
 #  stdin: lines of "field1\tfield2"; stdout: lines selected by the user
 fzf_multi() {
-    if command -v fzf >/dev/null 2>&1; then
+    if [ -t 1 ] && { :; } </dev/tty 2>/dev/null && command -v fzf >/dev/null 2>&1; then
         fzf --multi --layout=reverse --border=rounded --margin=1,2 \
             --delimiter=$'\t' --with-nth=1,2 \
             --bind 'load:select-all' \
             --bind 'ctrl-a:select-all,ctrl-d:deselect-all,j:down,k:up' \
             --pointer=">" --marker="* " --ansi \
             --header="$1"
-    else
+    elif [ -t 1 ] && { :; } </dev/tty 2>/dev/null && declare -f _menu_numbered >/dev/null 2>&1; then
         _menu_numbered multi "$1"
+    else
+        cat
     fi
 }
 
@@ -951,13 +952,13 @@ resolve_rhel_package() { # $1 = logical package name; prints an installable cand
 ensure_rhel_repos() {
     [ "$DRY_RUN" -eq 1 ] && { log "$(_t "[DRY-RUN] would enable EPEL + CRB/PowerTools repos." "[DRY-RUN] would enable EPEL + CRB/PowerTools repos.")"; return 0; }
     # Fedora: EVERYTHING this script installs is in the official repos
-    # (niri, ibus-rime/librime/librime-lua/brise, hyprlock, copyq, ...). EPEL and
+    # (niri, fcitx5/fcitx5-rime, hyprlock, copyq, ...). EPEL and
     # CRB are EL-only. An older script version still ran the EPEL block below on
     # Fedora: 'dnf install epel-release' fails (Fedora does not ship it) and the
     # fallback installs the EL10 epel-release RPM straight from a CN mirror —
     # that RPM DOES install on Fedora, but its repo uses $releasever (=4x), which
     # has no EPEL mirror, so every later dnf transaction died on the 404 metadata
-    # and the run cascaded into bogus "ibus-rime needs EPEL/COPR" messages.
+    # and the run cascaded into bogus repository error messages.
     # Heal that residue first, then skip the EPEL/CRB setup entirely.
     if [ "${DISTRO_ID:-}" = fedora ]; then
         if rpm -q epel-release >/dev/null 2>&1 || ls /etc/yum.repos.d/epel*.repo >/dev/null 2>&1; then
@@ -1208,6 +1209,8 @@ stage_preflight() {
             fi
             if [ "$DRY_RUN" -eq 1 ]; then
                 log "$(_t "[DRY-RUN] Skipping system upgrade." "[DRY-RUN] Skipping system upgrade.")"
+            elif [ "${EILNIRI_SKIP_SYS_UPGRADE:-0}" = "1" ]; then
+                log "$(_t "Skipping system upgrade (EILNIRI_SKIP_SYS_UPGRADE=1)." "Skipping system upgrade (EILNIRI_SKIP_SYS_UPGRADE=1).")"
             elif ! exe dnf -y upgrade --refresh; then
                 warn "$(_t "System update partially failed, continuing." "System update partially failed, continuing.")"
             fi
@@ -1335,8 +1338,12 @@ install_rhel() {
             install_satty
             continue
         fi
-        # rime-ice: no RPM; deploy the dictionary from GitHub (the ibus-rime package
-        # from EPEL provides the engine that consumes it)
+        if [ "$p" = "bluetui" ]; then
+            install_bluetui
+            continue
+        fi
+        # rime-ice: no RPM; deploy the dictionary from GitHub (the fcitx5-rime package
+        # provides the engine that consumes it)
         if [ "$p" = "rime-ice-pinyin-git" ]; then
             install_rime_ice
             continue
@@ -1660,7 +1667,10 @@ ensure_rust() {
     if [[ "$_tz" =~ Shanghai|Beijing|Asia/Chongqing|Asia/Urumqi|Asia/Hong_Kong ]]; then
         export RUSTUP_DIST_SERVER="https://rsproxy.cn" RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
     fi
-    if ! command -v rustup &>/dev/null; then
+    if ! command -v cargo &>/dev/null; then
+        pm_install rust cargo 2>/dev/null || true
+    fi
+    if ! command -v rustup &>/dev/null && ! command -v cargo &>/dev/null; then
         log "$(_t "Installing Rust toolchain (rustup)..." "Installing Rust toolchain (rustup)...")"
         exe bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable' || return 1
     fi
@@ -1927,6 +1937,16 @@ install_niri_binary() {
     if [ "$DRY_RUN" -eq 1 ]; then
         DRY_PKGS+=("niri (official prebuilt or source build)")
         return "$DRY_RUN_RC"
+    fi
+
+    # Try native distro package first (Fedora provides official niri RPM in updates repository)
+    if pm_install niri 2>/dev/null && command -v niri >/dev/null 2>&1; then
+        INSTALLED_PKGS+=("niri")
+        ensure_localbin_on_path
+        _ensure_niri_units
+        _ensure_niri_session_cmd
+        success "$(_t "niri installed from distro repository" "niri installed from distro repository")"
+        return 0
     fi
 
     local arch
@@ -2393,6 +2413,44 @@ EOF
     fi
 }
 
+# bluetui (pythops/bluetui): Bluetooth TUI, on-click target for waybar bluetooth module.
+BLUETUI_GH="https://github.com/pythops/bluetui/releases"
+
+install_bluetui() {
+    if command -v bluetui >/dev/null 2>&1; then
+        SKIPPED_PKGS+=("bluetui (already installed)")
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_PKGS+=("bluetui (official prebuilt)")
+        return "$DRY_RUN_RC"
+    fi
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch=x86_64 ;;
+        aarch64) arch=aarch64 ;;
+        *)
+            MANUAL_ITEMS+=("bluetui — unsupported architecture $(uname -m), install manually: $BLUETUI_GH")
+            return 1
+            ;;
+    esac
+    local asset="bluetui-${arch}-linux-musl"
+    local url="$BLUETUI_GH/latest/download/$asset"
+    log "$(_t "Downloading bluetui official prebuilt binary..." "Downloading bluetui official prebuilt binary...")"
+    local tmp
+    tmp=$(mktemp)
+    register_temp_path "$tmp"
+    if download_gh "$url" "$tmp" && [ -s "$tmp" ] && head -c 4 "$tmp" | grep -q $'\x7fELF'; then
+        exe install -Dm755 "$tmp" /usr/local/bin/bluetui
+        INSTALLED_PKGS+=("bluetui (official prebuilt)")
+        success "$(_t "bluetui installed from GitHub releases" "bluetui installed from GitHub releases")"
+        return 0
+    else
+        MANUAL_ITEMS+=("bluetui — download failed; install manually from $BLUETUI_GH (asset: $asset)")
+        return 1
+    fi
+}
+
 # --- satty install (Debian/RHEL families; no package) ---
 # Strategy: 1) official prebuilt binary from GitHub releases (satty-<arch>-unknown-linux-gnu.tar.gz)
 #           2) cargo install fallback (needs GTK4/libadwaita/librsvg dev packages) 3) manual report
@@ -2491,35 +2549,25 @@ install_satty() {
     return 1
 }
 
-# --- rime-ice (Lùsōng) dictionary deploy (RHEL family) ---
-# No RPM exists for the dictionary; upstream ships a release zip (the official
-# install method): download full.zip, extract, copy into the Rime USER data dir.
-# The engine (ibus-rime, EPEL) reads ~/.config/ibus/rime — verified against
-# ibus-rime's rime_main.c (get_ibus_rime_user_data_dir -> $HOME/.config/ibus/rime),
-# which is the ibus counterpart of fcitx5's ~/.local/share/fcitx5/rime.
+# --- rime-ice (雾凇拼音) dictionary deploy (RHEL family) ---
+# Upstream ships a release zip (the official install method): download full.zip,
+# extract, copy into ~/.local/share/fcitx5/rime.
 RIME_ICE_REPO="https://github.com/iDvel/rime-ice"
 RIME_ICE_ZIP_URL="https://github.com/iDvel/rime-ice/releases/latest/download/full.zip"
-RIME_IBUS_USER_DIR_SUFFIX=".config/ibus/rime"
 RIME_FCITX_USER_DIR_SUFFIX=".local/share/fcitx5/rime"
 
 # --- Fcitx5 IME stack (all RHEL family) ---
 # The IME is Fcitx5 + Rime on every lane, matching the Arch/Debian builders and
 # the repo's own configs/.config/fcitx5 snapshot (deployed verbatim by
 # stage_configs: 左Shift 切换中英文, page size 5, rime engine). Two lanes:
-#   Fedora -> official RPMs: fcitx5 fcitx5-gtk fcitx5-qt fcitx5-rime
-#            fcitx5-configtool. Nothing is compiled.
-#   EL     -> NO fcitx5 RPM exists in any repo (verified 2026-10: not in EPEL,
-#            no COPR epel chroot), so _fcitx5_source_build compiles
-#            xcb-imdkit -> fcitx5 -> fcitx5-gtk -> fcitx5-rime, using the
-#            librime RPM from EPEL 10 (on EPEL 9, which has no librime either,
-#            librime is built from source as well). fcitx5-qt and
-#            fcitx5-configtool are skipped on EL (heavy Qt6/KF5 deps); native
-#            Wayland Qt6 apps reach fcitx5 through niri's text-input-v3.
+#   Fedora -> official RPMs: fcitx5 fcitx5-chinese-addons fcitx5-gtk fcitx5-qt
+#            fcitx5-rime fcitx5-configtool. Nothing is compiled.
+#   EL     -> attempts COPR if available for this chroot, or _fcitx5_source_build
+#            compiles xcb-imdkit -> fcitx5 -> fcitx5-gtk -> fcitx5-rime.
 # Called ONCE from install_rhel via the "fcitx5" entry; covers the whole [ime]
 # group. Runtime per-user config = ~/.config/fcitx5 (repo snapshot) + the rime
 # user dir; IME env vars are written by stage_configs (environment.d +
-# /etc/environment), and _fcitx5_strip_ibus_leftovers removes this script's
-# former IBus lane so the two can never fight.
+# /etc/environment), and _fcitx5_strip_ibus_leftovers removes any former IBus residue.
 FCITX5_DONE=0          # 1 once this lane ran (idempotency across [ime] entries)
 FCITX5_RIME_READY=0    # 1 once a rime-capable engine is on disk
 
@@ -2534,11 +2582,12 @@ FCITX5_LIBRIME_TAG="1.11.2"
 
 install_fcitx5_ime() {
     [ "${FCITX5_DONE:-0}" -eq 1 ] && return 0
+    _fcitx5_strip_ibus_leftovers
     if [ "$DRY_RUN" -eq 1 ]; then
         if [ "${DISTRO_ID:-}" = fedora ]; then
-            DRY_PKGS+=("fcitx5 fcitx5-gtk fcitx5-qt fcitx5-rime fcitx5-configtool (official RPMs)")
+            DRY_PKGS+=("fcitx5 fcitx5-chinese-addons fcitx5-gtk fcitx5-qt fcitx5-rime fcitx5-configtool (official RPMs)")
         else
-            DRY_PKGS+=("fcitx5 stack (source build: xcb-imdkit + fcitx5 + fcitx5-gtk + fcitx5-rime)")
+            DRY_PKGS+=("fcitx5 stack (COPR or source build: xcb-imdkit + fcitx5 + fcitx5-gtk + fcitx5-rime)")
         fi
         return "$DRY_RUN_RC"
     fi
@@ -2546,9 +2595,20 @@ install_fcitx5_ime() {
 
     if [ "${DISTRO_ID:-}" = fedora ]; then
         log "$(_t "Installing the Fcitx5 IME framework (official RPMs)..." "Installing the Fcitx5 IME framework (official RPMs)...")"
-        dnf_install_tolerant fcitx5 fcitx5-gtk fcitx5-qt fcitx5-rime fcitx5-configtool || true
+        dnf_install_tolerant fcitx5 fcitx5-chinese-addons fcitx5-gtk fcitx5-qt fcitx5-rime fcitx5-configtool || true
+        # Candidate resolution fallback for modularized toolkit packages
+        if ! pkg_installed fcitx5-gtk; then
+            local _gtk_cand
+            _gtk_cand=$(resolve_rhel_package fcitx5-gtk 2>/dev/null || true)
+            [ -n "$_gtk_cand" ] && dnf_install_tolerant "$_gtk_cand" || true
+        fi
+        if ! pkg_installed fcitx5-qt; then
+            local _qt_cand
+            _qt_cand=$(resolve_rhel_package fcitx5-qt 2>/dev/null || true)
+            [ -n "$_qt_cand" ] && dnf_install_tolerant "$_qt_cand" || true
+        fi
         if ! pkg_installed fcitx5; then
-            FAILED_PKGS+=("dnf:fcitx5 (IBus 之后的输入法框架未安装成功，中文输入不可用；见 $LOG_DIR/dnf-errors.log)")
+            FAILED_PKGS+=("dnf:fcitx5 (输入法框架未安装成功，中文输入不可用；见 $LOG_DIR/dnf-errors.log)")
             return 1
         fi
         INSTALLED_PKGS+=("fcitx5 (RPM)")
@@ -2558,7 +2618,29 @@ install_fcitx5_ime() {
             warn "$(_t "fcitx5-rime did not install — the rime-ice dictionary will not be usable. See $LOG_DIR/dnf-errors.log" "fcitx5-rime did not install — the rime-ice dictionary will not be usable.")"
         fi
     else
-        _fcitx5_source_build || return 1
+        # On non-Fedora EL / RHEL: enable COPR if available, or fall back to source compilation.
+        local _copr_installed=0
+        local _chroot
+        _chroot=$(rhel_copr_chroot)
+        if [ -n "$_chroot" ]; then
+            for _c in yanqiyu/fcitx5; do
+                local _probe_url="https://copr.fedorainfracloud.org/coprs/${_c}/repo/${_chroot}/dnf.repo"
+                if curl -fsSL --connect-timeout 8 --max-time 15 -o /dev/null "$_probe_url" 2>/dev/null; then
+                    log "$(_t "Found COPR for fcitx5: " "Found COPR for fcitx5: ")$_c ($_chroot), enabling..."
+                    if dnf copr enable -y "$_c" "$_chroot" >>"$LOG_DIR/copr.log" 2>&1; then
+                        dnf_install_tolerant fcitx5 fcitx5-chinese-addons fcitx5-gtk fcitx5-qt fcitx5-rime fcitx5-configtool || true
+                        if pkg_installed fcitx5; then
+                            _copr_installed=1
+                            INSTALLED_PKGS+=("fcitx5 (COPR: $_c)")
+                            pkg_installed fcitx5-rime && INSTALLED_PKGS+=("fcitx5-rime (COPR)")
+                        fi
+                    fi
+                fi
+            done
+        fi
+        if [ "$_copr_installed" -eq 0 ]; then
+            _fcitx5_source_build || return 1
+        fi
     fi
     if [ "$FCITX5_RIME_READY" -eq 0 ] && _fcitx5_engine_ready; then
         FCITX5_RIME_READY=1
@@ -2676,14 +2758,44 @@ _fcitx5_strip_ibus_leftovers() {
     return 0
 }
 
+_ensure_rime_default_custom() { # $1 = rime user dir
+    local d="$1" _own
+    [ -n "$d" ] || return 0
+    _own="$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
+    mkdir -p "$d" 2>/dev/null || return 0
+
+    if [ ! -f "$d/default.custom.yaml" ] || ! grep -q 'rime_ice' "$d/default.custom.yaml" 2>/dev/null; then
+        if [ -f "$d/default.custom.yaml" ]; then
+            log "$(_t "Regenerated default.custom.yaml to pin rime_ice schema and Shift_L toggle" "Regenerated default.custom.yaml to pin rime_ice schema")"
+        fi
+        cat > "$d/default.custom.yaml" <<'RIMEEOF'
+# eilNiri: Fcitx5 + Rime defaults (managed file — delete to fall back to upstream)
+patch:
+  # Candidate page size (fcitx5: DefaultPageSize=5)
+  menu/page_size: 5
+  # Keep rime-ice as the only schema
+  schema_list:
+    - schema: rime_ice
+  # 左 Shift 切换中英文（fcitx5: TriggerKeys=Shift+Shift_L）
+  ascii_composer/good_old_caps_lock: true
+  ascii_composer/switch_key/Shift_L: commit_code
+  ascii_composer/switch_key/Shift_R: commit_text
+  __include: rime_ice_suggestion:/
+RIMEEOF
+        chown "$_own" "$d/default.custom.yaml" 2>/dev/null || true
+    fi
+    return 0
+}
+
 install_rime_ice() {
-    local dest="$HOME_DIR/$RIME_IBUS_USER_DIR_SUFFIX"
-    if [ -f "$dest/rime_ice.schema.yaml" ]; then
+    local dest="$HOME_DIR/$RIME_FCITX_USER_DIR_SUFFIX"
+    if [ -f "$dest/rime_ice.schema.yaml" ] && [ -f "$dest/rime_ice.dict.yaml" ] && [ -d "$dest/cn_dicts" ]; then
+        _ensure_rime_default_custom "$dest"
         SKIPPED_PKGS+=("rime-ice (already deployed)")
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        DRY_PKGS+=("rime-ice (dictionary deploy -> $RIME_IBUS_USER_DIR_SUFFIX)")
+        DRY_PKGS+=("rime-ice (dictionary deploy -> $RIME_FCITX_USER_DIR_SUFFIX)")
         return "$DRY_RUN_RC"
     fi
     if [ -z "$TARGET_USER" ] || [ -z "$HOME_DIR" ]; then
@@ -2691,79 +2803,17 @@ install_rime_ice() {
         return 1
     fi
 
-    # The dictionary is Rime data and is ONLY usable by a Rime engine. Probe for
-    # the actual engine instead of a package name (ibus-rime can be present while
-    # librime is not, and on EL9 neither exists at all — there ibus-libpinyin is
-    # the engine, so deploying ~80MB of Rime schemas would be pure waste).
-    if ! _ibus_pick_engine 2>/dev/null | grep -qx rime; then
-        # Not there yet: try once (the [ime] group runs before/after this entry in
-        # arbitrary order, so the engine may simply not have been installed yet).
-        # Skip when a previous step already proved rime unavailable on this release.
-        if ! pkg_installed ibus-rime && [ "${IBUS_RIME_FAILED:-0}" -eq 0 ]; then
-            log "$(_t "No Rime engine yet — trying to install ibus-rime before deploying the dictionary..." "No Rime engine yet — trying to install ibus-rime before deploying the dictionary...")"
-            dnf_install_tolerant ibus-rime librime librime-lua brise || true
-            if [ "$DISTRO_FAMILY" = rhel ] && ! pkg_installed ibus-rime; then
-                exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' ibus-rime librime brise \
-                    2>>"$LOG_DIR/dnf-errors.log" || true
-            fi
-            if ! pkg_installed ibus-rime && ! _ibus_pick_engine 2>/dev/null | grep -qx rime; then
-                IBUS_RIME_FAILED=1
-            fi
-        fi
-    fi
-    if ! _ibus_pick_engine 2>/dev/null | grep -qx rime; then
-        local _el_major=""
-        _el_major=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
-        if [ "$DISTRO_ID" != fedora ] && [ "$_el_major" = "9" ]; then
-            warn "$(_t "rime-ice skipped — EL9 has no ibus-rime in any repo (EPEL 9 never packaged it); the desktop uses ibus-libpinyin instead." "rime-ice skipped — EL9 has no ibus-rime in any repo; ibus-libpinyin is used instead.")"
-            MANUAL_ITEMS+=("rime-ice 词典跳过 — EL9 无 ibus-rime（EPEL9 未打包），当前使用 ibus-libpinyin；如需雾凇拼音需自行编译 ibus-rime+librime")
-        else
-            warn "$(_t "rime-ice skipped — no Rime engine on this system; the desktop uses the fallback pinyin engine." "rime-ice skipped — no Rime engine on this system.")"
-            MANUAL_ITEMS+=("rime-ice 词典跳过 — 系统无 rime 引擎（见 $LOG_DIR/dnf-errors.log）。可用后备引擎 ibus-libpinyin，或装好 ibus-rime 后重跑 restore 自动补齐词典")
-        fi
-        return 1
-    fi
-
-    # --- migrate an existing fcitx5 Rime profile (this script used fcitx5 before) ---
-    # Rime data is frontend-agnostic, so whatever the user built up (custom schemas,
-    # learned words, user dicts) keeps working under IBus — only the host directory
-    # changes. build/ is deliberately dropped: Rime regenerates it on first start.
-    local _legacy="$HOME_DIR/$RIME_FCITX_USER_DIR_SUFFIX"
-    if [ ! -e "$dest/rime_ice.schema.yaml" ] && [ -d "$_legacy" ]; then
-        log "$(_t "Found an existing fcitx5 Rime profile — migrating it to ~/.config/ibus/rime..." "Found an existing fcitx5 Rime profile — migrating it to ~/.config/ibus/rime...")"
-        mkdir -p "$dest"
-        local _mig _mb
-        shopt -s nullglob dotglob
-        for _mig in "$_legacy"/*; do
-            _mb=$(basename "$_mig")
-            [ "$_mb" = "build" ] && continue
-            [ -e "$dest/$_mb" ] && continue      # never overwrite an ibus-side file
-            exe cp -r "$_mig" "$dest/" 2>/dev/null || true
-        done
-        shopt -u nullglob dotglob
-        if [ -f "$dest/rime_ice.schema.yaml" ]; then
-            INSTALLED_PKGS+=("rime-ice (migrated from ~/.local/share/fcitx5/rime)")
-            success "$(_t "fcitx5 Rime profile migrated to ~/.config/ibus/rime" "fcitx5 Rime profile migrated to ~/.config/ibus/rime")"
-            _rime_ibus_write_custom "$dest"
-            IBUS_DICT_READY=1
-            return 0
-        fi
-        log "$(_t "Legacy profile contained no rime-ice schema — continuing with the upstream zip." "Legacy profile contained no rime-ice schema — continuing with the upstream zip.")"
-    fi
-
     if ! command -v unzip &>/dev/null; then
         pm_install unzip || { MANUAL_ITEMS+=("rime-ice — unzip missing, deploy manually: $RIME_ICE_REPO"); return 1; }
     fi
 
-
-    # Official release zip (much faster than git clone), GitHub direct
     local zipfile unzipdir item b
     zipfile=$(mktemp)
     unzipdir=$(mktemp -d)
     register_temp_path "$zipfile"
     register_temp_path "$unzipdir"
     log "$(_t "Downloading rime-ice release zip..." "Downloading rime-ice release zip...")"
-    
+
     local _rime_attempts=3 _rime_delay=10 _rimerc=0
     for (( _rattempt=1; _rattempt<=$_rime_attempts; _rattempt++ )); do
         if download_gh "$RIME_ICE_ZIP_URL" "$zipfile"; then
@@ -2778,7 +2828,7 @@ install_rime_ice() {
             zipfile=$(mktemp)
         fi
     done
-    
+
     if [ "$_rimerc" -ne 0 ]; then
         MANUAL_ITEMS+=("rime-ice — download failed after $_rime_attempts attempts, deploy manually: $RIME_ICE_REPO")
         return 1
@@ -2789,7 +2839,13 @@ install_rime_ice() {
     fi
 
     exe mkdir -p "$dest"
-    for item in "$unzipdir"/*; do
+    local rime_root
+    rime_root=$(find "$unzipdir" -type f -name rime_ice.schema.yaml -printf '%h\n' 2>/dev/null | head -n 1)
+    if [ -z "$rime_root" ]; then
+        rime_root="$unzipdir"
+    fi
+
+    for item in "$rime_root"/*; do
         [ -e "$item" ] || continue
         b=$(basename "$item")
         case "$b" in
@@ -2800,91 +2856,13 @@ install_rime_ice() {
     exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dest" 2>/dev/null || true
 
     if [ -f "$dest/rime_ice.schema.yaml" ]; then
-        _rime_ibus_write_custom "$dest"
-        IBUS_DICT_READY=1
+        _ensure_rime_default_custom "$dest"
         INSTALLED_PKGS+=("rime-ice (deployed to $dest)")
         success "$(_t "rime-ice deployed" "rime-ice deployed")"
         return 0
     fi
     MANUAL_ITEMS+=("rime-ice — deploy failed, do it manually: $RIME_ICE_REPO $dest")
     return 1
-}
-
-# Write the IBus-side Rime frontend overrides into the user data dir. Only created
-# when absent so a user's own tuning survives a rerun.
-#   default.custom.yaml — schema list + menu/page_size:5 (the fcitx5 config used
-#                         DefaultPageSize=5; rime-ice already ships 5, this pins it)
-#                         + ascii_composer/switch_key — 左 Shift 切换中英文, the
-#                         toggle this dotfiles shipped since the fcitx5 days
-#                         (TriggerKeys=Shift+Shift_L). Pinned explicitly instead
-#                         of relying on rime-ice's upstream defaults. A file from
-#                         an older script version (no switch_key line) is
-#                         regenerated with a timestamped backup.
-#   ibus_rime.yaml      — ibus-rime stops overwriting this file once it carries a
-#                         version (rime_main.c: deploy_config_file only when the
-#                         installed copy has no version field), so our values win.
-_rime_ibus_write_custom() { # $1 = rime user dir
-    local d="$1" _own
-    [ -n "$d" ] || return 0
-    # Only meaningful for the Rime engine — with the libpinyin fallback these files
-    # would be dead weight (and would confuse the next rime install).
-    if ! _ibus_pick_engine 2>/dev/null | grep -qx rime; then
-        return 0
-    fi
-    _own="$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
-    mkdir -p "$d" 2>/dev/null || return 0
-
-    if [ ! -f "$d/default.custom.yaml" ] || ! grep -q 'ascii_composer/switch_key' "$d/default.custom.yaml" 2>/dev/null; then
-        # An older script version wrote this file WITHOUT the Shift toggle patch
-        # (it relied on rime-ice's upstream defaults) — regenerate those with a
-        # backup. A file that already carries switch_key is the user's own tuning
-        # and is left alone.
-        if [ -f "$d/default.custom.yaml" ]; then
-            cp -f "$d/default.custom.yaml" "$d/default.custom.yaml.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
-            log "$(_t "Regenerated default.custom.yaml to pin the Shift_L CJK/ASCII toggle (old copy backed up)" "Regenerated default.custom.yaml to pin the Shift_L toggle (old copy backed up)")"
-        fi
-        cat > "$d/default.custom.yaml" <<'RIMEEOF'
-# eilNiri: IBus + Rime defaults (managed file — delete to fall back to upstream)
-# Mirrors the fcitx5 settings this script shipped before the IBus migration.
-patch:
-  # Candidate page size (fcitx5: DefaultPageSize=5)
-  menu/page_size: 5
-  # Keep rime-ice as the only schema; ibus preload-engines=['rime'] selects it.
-  schema_list:
-    - schema: rime_ice
-  # 左 Shift 切换中英文（fcitx5: TriggerKeys=Shift+Shift_L）。不依赖 rime-ice 上游
-  # 默认值：Shift_L 上屏已输入的编码并切英文，Shift_R 上屏整句切换。引擎级切换
-  # （Ctrl+Space）在 IBus 层 dconf trigger 里，带修饰键，与此互不冲突。
-  ascii_composer/good_old_caps_lock: true
-  ascii_composer/switch_key/Shift_L: commit_code
-  ascii_composer/switch_key/Shift_R: commit_text
-RIMEEOF
-        chown "$_own" "$d/default.custom.yaml" 2>/dev/null || true
-    fi
-
-    if [ ! -f "$d/ibus_rime.yaml" ]; then
-        cat > "$d/ibus_rime.yaml" <<'RIMEEOF'
-# ibus-rime frontend configuration (generated by eilNiri)
-# The version field makes ibus-rime keep this file instead of overwriting it.
-config_version: '1.7'
-
-style:
-  # Candidate list layout. IBus/IBus-Rime orientation is also pinned by the
-  # dconf key /desktop/ibus/panel/lookup-table-orientation=0 (horizontal).
-  horizontal: true
-  # Embed the composition text in the application's entry field (false) or show
-  # it in the candidate window (true). fcitx5 ran with PreeditEnabledByDefault=
-  # False to work around Wayland apps that render in-app preedit badly; match it.
-  inline_preedit: false
-  preedit_style: composition
-  cursor_type: insert
-  # Show the IME status hint at the cursor (Rime's own, independent of the
-  # IBus language panel which is disabled below).
-  status_hint: false
-RIMEEOF
-        chown "$_own" "$d/ibus_rime.yaml" 2>/dev/null || true
-    fi
-    return 0
 }
 
 # --- xwayland-satellite (Debian family & Rocky/Alma; Fedora's official repo already has it) ---
@@ -2898,6 +2876,12 @@ install_xwayland_satellite() {
     if [ "$DRY_RUN" -eq 1 ]; then
         DRY_PKGS+=("xwayland-satellite (cargo --git)")
         return "$DRY_RUN_RC"
+    fi
+    # Prefer native distro package (Fedora has official xwayland-satellite in repos)
+    if pm_install xwayland-satellite 2>/dev/null && command -v xwayland-satellite >/dev/null 2>&1; then
+        INSTALLED_PKGS+=("xwayland-satellite")
+        success "$(_t "xwayland-satellite installed from distro repository" "xwayland-satellite installed from distro repository")"
+        return 0
     fi
     # the Xwayland server it wraps (best effort; binary still installs without it)
     if ! command -v Xwayland >/dev/null 2>&1; then
@@ -3998,199 +3982,6 @@ fix_polkit_agent() {
     exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg"
 }
 
-# configs/.config/niri/config.kdl is SHARED by all three installers and still
-# starts fcitx5, which is exactly the component this script replaced. Debian and
-# Arch keep the fcitx5 line untouched (only this script calls this function); on
-# RHEL the line is repointed to the IBus launcher below.
-#
-# Why a launcher script instead of a plain "ibus-daemon -drx" line:
-#   * niri implements zwp_input_method_manager_v2, and upstream's documented
-#     niri setup is `ibus start --type wayland` (it spawns ibus-ui-gtk3 with
-#     --enable-wayland-im, giving native Wayland apps IME support through the
-#     protocol). Upstream notes plain spawn lines are unreliable there.
-#   * `ibus start` exits with an error if the Wayland IM protocol is missing, so
-#     the launcher falls back to `ibus-daemon -drx` (-d daemonize, -r replace a
-#     stale daemon, -x XIM server for XWayland/X11 apps), which always works.
-IBUS_SESSION_LAUNCHER=".config/ibus/eilniri-ime-session"
-
-_ibus_write_session_launcher() {
-    [ -n "${HOME_DIR:-}" ] || return 0
-    local _f="$HOME_DIR/$IBUS_SESSION_LAUNCHER"
-    mkdir -p "$(dirname "$_f")" 2>/dev/null || return 0
-    cat > "$_f" <<'LAUNCHEREOF'
-#!/bin/sh
-# eilNiri — start the IBus input method daemon for the niri session (RHEL family).
-# Written by RHEL-install.sh; safe to edit, and regenerated only if missing.
-#
-# PATH: the niri session env may not carry /usr/local/bin; the RPM binaries are
-# in /usr/bin, so make sure it is reachable.
-PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
-export PATH
-
-# Log to stderr AND ~/.cache/eilniri-ime.log — niri discards spawn-sh output on
-# most setups, so the file is the only way to see which start path was taken and
-# whether engine activation worked (check it when the tray icon is missing).
-_IME_LOG="${XDG_CACHE_HOME:-$HOME/.cache}/eilniri-ime.log"
-mkdir -p "$(dirname "$_IME_LOG")" 2>/dev/null
-log() {
-    printf '[%s] eilNiri-ime: %s\n' "$(date '+%F %T')" "$*" >>"$_IME_LOG" 2>/dev/null
-    printf 'eilNiri-ime: %s\n' "$*" >&2
-}
-
-# Already running (e.g. a second restore run / compositor reload)? Nothing to do.
-if pgrep -x ibus-daemon >/dev/null 2>&1; then
-    log "ibus-daemon already running"
-    exit 0
-fi
-
-# Make sure the engine the installer picked is the ACTIVE one. dconf's
-# preload-engines is honoured by the panel on startup (first entry wins), but
-# being explicit here also covers upgrades and manual dconf edits.
-select_engine() {
-    command -v ibus >/dev/null 2>&1 || return 0
-    # give the daemon/panel a moment to come up
-    i=0
-    while [ "$i" -lt 40 ]; do
-        cur=$(ibus engine 2>/dev/null || true)
-        [ -n "$cur" ] && break
-        i=$((i + 1)); sleep 0.5
-    done
-    want=""
-    # `ibus list-engine` prints "name : longname" per line (e.g. "rime : Rime"),
-    # so match the engine NAME as a whole word anywhere in the line — anchoring
-    # to end-of-line never matches the longname that follows it.
-    if ibus list-engine 2>/dev/null | grep -qw rime; then
-        want=rime
-    elif ibus list-engine 2>/dev/null | grep -qw libpinyin; then
-        want=libpinyin
-    fi
-    [ -n "$want" ] || { log "no Chinese engine registered; leaving IBus as-is"; return 0; }
-    if [ "${cur:-}" != "$want" ]; then
-        ibus engine "$want" >/dev/null 2>&1 \
-            && log "activated engine: $want" \
-            || log "could not activate engine '$want' (current: ${cur:-none})"
-    else
-        log "engine already active: $want"
-    fi
-}
-
-# Preferred: Wayland input-method bridge (niri supports input-method v2).
-if command -v ibus >/dev/null 2>&1; then
-    if ibus start --type wayland >/dev/null 2>&1; then
-        log "started via 'ibus start --type wayland'"
-        select_engine
-        exit 0
-    fi
-    log "'ibus start --type wayland' failed (no input-method protocol?); falling back to ibus-daemon -drx"
-fi
-
-if command -v ibus-daemon >/dev/null 2>&1; then
-    # -d daemonize, -r replace any stale instance, -x XIM server for X11 apps.
-    # NOTE: ibus-daemon has NO -R option (only -r/--replace) — an unknown short
-    # option makes GOption abort the daemon before it ever starts.
-    ibus-daemon -drx
-    select_engine
-    exit $?
-fi
-
-log "neither ibus nor ibus-daemon is installed — no Chinese input available"
-exit 1
-LAUNCHEREOF
-    chmod 0755 "$_f" 2>/dev/null || true
-    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_f" 2>/dev/null || true
-    return 0
-}
-
-_repoint_ime_spawn() {
-    [ "$DRY_RUN" -eq 1 ] && return 0
-    [ -n "${HOME_DIR:-}" ] || return 0
-    local _cfg="$HOME_DIR/.config/niri/config.kdl"
-    [ -f "$_cfg" ] || return 0
-    _ibus_write_session_launcher
-    local _spawn='spawn-sh-at-startup "$HOME/'"$IBUS_SESSION_LAUNCHER"'"'
-    # already repointed?
-    grep -qF "$IBUS_SESSION_LAUNCHER" "$_cfg" 2>/dev/null && return 0
-    local _cur
-    _cur=$(grep -oE 'spawn-at-startup[[:space:]]+"[^"]*(fcitx|ibus)[^"]*"' "$_cfg" 2>/dev/null | head -n 1)
-    if [ -z "$_cur" ]; then
-        # Custom config without any IME spawn line — append one (unless the file
-        # has no spawn-at-startup section at all, in which case just warn).
-        if ! grep -qE '^[[:space:]]*spawn-at-startup' "$_cfg" 2>/dev/null; then
-            warn "$(_t "niri config has no spawn-at-startup section — add '$IBUS_SESSION_LAUNCHER' to it manually." "niri config has no spawn-at-startup section — add the IBus launcher manually.")"
-            return 0
-        fi
-        log "$(_t "No fcitx5 spawn line in niri config — appending the IBus launcher line" "No fcitx5 spawn line in niri config — appending the IBus launcher line")"
-    else
-        cp -f "$_cfg" "$_cfg.bak-ime-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
-        log "$(_t "Repointing niri IME startup: fcitx5 -> $IBUS_SESSION_LAUNCHER" "Repointing niri IME startup: fcitx5 -> $IBUS_SESSION_LAUNCHER")"
-        sed -i -E "s#^[[:space:]]*spawn-at-startup[[:space:]]+\"[^\"]*(fcitx|ibus)[^\"]*\".*\$#${_spawn}#" "$_cfg"
-    fi
-    # Sanity net: never end up without an IME autostart (e.g. the sed pattern did
-    # not match because the user indented or reworded the line).
-    if ! grep -qF "$IBUS_SESSION_LAUNCHER" "$_cfg" 2>/dev/null; then
-        printf '\n// eilNiri: IBus input method (RHEL family — fcitx5 has no EL package)\n%s\n' "$_spawn" >> "$_cfg"
-    fi
-    exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg" 2>/dev/null || true
-    return 0
-}
-
-# The shared config.kdl also exports fcitx-specific IM module values in its
-# `environment { ... }` block. Those are exported INTO the niri session and rank
-# above environment.d, so they must be flipped to ibus here or every application
-# started by niri would keep looking for a fcitx daemon that no longer exists.
-# The block is byte-identical across the three scripts' snapshot; only the VALUE
-# is touched, which makes this safe for hand-edited configs.
-_repoint_ime_env_config() {
-    [ "$DRY_RUN" -eq 1 ] && return 0
-    [ -n "${HOME_DIR:-}" ] || return 0
-    local _cfg="$HOME_DIR/.config/niri/config.kdl"
-    [ -f "$_cfg" ] || return 0
-    local _changed=0 _k _want _cur
-    for _k in XMODIFIERS GTK_IM_MODULE QT_IM_MODULE SDL_IM_MODULE; do
-        # NOTE on the two patterns below: `[[:space:]]+` right before `"` is
-        # unreliable (the quantifier can swallow the quote and the match fails),
-        # so the value is matched by its inner text and the "\"" is a separate,
-        # non-quantified anchor. The keys live inside niri's environment{} block,
-        # hence the leading whitespace class.
-        [ "$_k" = XMODIFIERS ] && _want="@im=ibus" || _want="ibus"
-        if [ "$_k" = XMODIFIERS ]; then
-            grep -qE "^[[:space:]]*${_k}[[:space:]]*\"@im=fcitx\"" "$_cfg" 2>/dev/null || continue
-            sed -i -E "s#^([[:space:]]*${_k}[[:space:]]*)\"@im=fcitx\"#\1\"${_want}\"#" "$_cfg"
-        else
-            grep -qE "^[[:space:]]*${_k}[[:space:]]*\"fcitx\"" "$_cfg" 2>/dev/null || continue
-            sed -i -E "s#^([[:space:]]*${_k}[[:space:]]*)\"fcitx\"#\1\"${_want}\"#" "$_cfg"
-        fi
-        _changed=1
-        log "$(_t "niri config environment: " "niri config environment: ")$_k -> $_want"
-    done
-    # spawn-sh lines carry INLINE IM variables (the Mod+W kitty bind: "GLFW_IM_
-    # MODULE=ibus QT_IM_MODULE=fcitx ... kitty -e zsh"). The loop above only
-    # rewrites the environment{} block, so without this the terminal — and every
-    # app launched from it — would keep looking for the fcitx daemon that does
-    # not exist on the RHEL family (IBus is the IME there). Same VALUE-only
-    # substitution, anchored on the VAR=fcitx inline form, so the environment{}
-    # entries (KEY "value") are never touched twice.
-    if grep -qE '(IM_MODULE|XMODIFIERS)=@?(im=)?fcitx' "$_cfg" 2>/dev/null; then
-        cp -f "$_cfg" "$_cfg.bak-ime-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
-        sed -i -E 's/(IM_MODULE=)fcitx/\1ibus/g; s/(XMODIFIERS=@im=)fcitx/\1ibus/g' "$_cfg" 2>/dev/null || true
-        _changed=1
-        log "$(_t "niri config spawn-sh inline IM vars: fcitx -> ibus" "niri config spawn-sh inline IM vars: fcitx -> ibus")"
-    fi
-    # Extra keys IBus/toolkits look at: INPUT_METHOD is read by several toolkits,
-    # XDG_SESSION_DESKTOP tells IBus which session it runs in (it reads that
-    # variable directly), GLFW_IM_MODULE matters for kitty. Added once, when the
-    # fcitx -> ibus switch happens.
-    if [ "$_changed" -eq 1 ]; then
-        local _want_kv _wk _wv
-        for _want_kv in "GLFW_IM_MODULE=ibus" "INPUT_METHOD=ibus" "XDG_SESSION_DESKTOP=niri"; do
-            _wk="${_want_kv%%=*}"; _wv="${_want_kv#*=}"
-            grep -qE "^[[:space:]]*${_wk}[[:space:]]" "$_cfg" 2>/dev/null && continue
-            sed -i "/^[[:space:]]*SDL_IM_MODULE/a\\	${_wk} \"${_wv}\"" "$_cfg" 2>/dev/null || true
-        done
-        exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg" 2>/dev/null || true
-    fi
-    return 0
-}
 
 # --- in-place text surgery that also works on a read-only parent directory ---
 # `sed -i` creates its temp file in the SAME directory as the target, so it fails
@@ -4238,25 +4029,9 @@ _env_drop_lines() { # $1 = file, $2 = ERE
     return "$rc"
 }
 
-prune_config_backups() { # $1 = directory, $2 = basename glob
-    local dir="$1" pattern="$2" backup
-    [ -d "$dir" ] || return 0
-    mapfile -t backups < <(
-        find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
-            | sort -rn | awk 'NR > 1 { sub(/^[^ ]+ /, ""); print }'
-    )
-    for backup in "${backups[@]}"; do
-        [ -n "$backup" ] && rm -f -- "$backup"
-    done
-}
-
 deploy_one() { # $1 = source path, $2 = destination path
     local src="$1" dst="$2" ts="$3"
-    if [ -e "$dst" ] || [ -L "$dst" ]; then
-        log "$(_t "Backup existing: " "Backup existing: ")$dst -> $dst.bak-$ts"
-        exe mv "$dst" "$dst.bak-$ts"
-        prune_config_backups "$(dirname "$dst")" "$(basename "$dst").bak-*"
-    fi
+    [ -e "$dst" ] || [ -L "$dst" ] && exe rm -rf "$dst"
     exe cp -r "$src" "$dst"
     exe chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dst"
 }
@@ -4346,18 +4121,8 @@ stage_configs() {
     # ~/.config/<name>
     for item in "$snap/.config"/*; do
         name=$(basename "$item")
-        # configs/.config/fcitx5 belongs to the Debian/Arch builders — this script
-        # replaced Fcitx5 with IBus, so deploying it would leave a stale, wrong
-        # configuration behind. Any pre-existing user configuration is preserved.
-        if [ "$name" = "fcitx5" ]; then
-            log "$(_t "skip (IBus build): " "skip (IBus build): ") .config/fcitx5"
-            continue
-        fi
-        # ~/.config/ibus must NOT be replaced wholesale: besides the config
-        # snapshot it holds the daemon's live state (~/.config/ibus/bus/<address>).
-        # install_ibus_ime() copies the individual files instead.
+        # .config/ibus is legacy/deprecated (Fcitx5 is the active IME)
         if [ "$name" = "ibus" ]; then
-            log "$(_t "skip (handled file-by-file by install_ibus_ime): " "skip (handled by install_ibus_ime): ") .config/ibus"
             continue
         fi
         if is_privacy_risk "$item"; then
@@ -4494,51 +4259,36 @@ stage_configs() {
         _ensure_wallpaper
         _ensure_waypaper_desktop   # pip 装的 waypaper 无 .desktop → fuzzel 无图标
         fix_polkit_agent           # niri 配置里的 agent 路径按本机实际安装改写
-        _repoint_ime_env_config    # niri environment{} 里的 fcitx 变量值改成 ibus
-        _repoint_ime_spawn         # niri 启动的 fcitx5 -> ibus-daemon -drx
     fi
 
-    # IBus IME environment variables: ~/.pam_environment is disabled by default on
+    # Fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
     # modern distros, so write environment.d (imported by systemd --user).
-    # GTK/QT/SDL/GLFW/X11 all use the module name "ibus" (no per-toolkit alias like
-    # fcitx5's "fcitx"), so every client toolkit finds the same daemon.
-    # NOTE: this block REWRITES 00-ime.conf when it still carries the old fcitx
-    # values — a leftover "GTK_IM_MODULE=fcitx" makes IBus silently unusable.
+    # GTK/QT/SDL all use "fcitx", GLFW uses "ibus" (for kitty compatibility with fcitx5).
     if [ "$DRY_RUN" -eq 0 ]; then
         local _has_ime=0
         for _p in ${REPO_SEL[@]+"${REPO_SEL[@]}"}; do
-            case "$_p" in ibus|ibus-*|rime-ice-pinyin-git) _has_ime=1; break ;; esac
+            case "$_p" in fcitx5|fcitx5-*|rime-ice|rime-ice-pinyin-git) _has_ime=1; break ;; esac
         done
         if [ "$_has_ime" -eq 1 ] && [ -n "$TARGET_USER" ]; then
+            _fcitx5_strip_ibus_leftovers
             local _imed="$HOME_DIR/.config/environment.d"
             mkdir -p "$_imed"
-            # 旧版（fcitx5 时代）文件名 ime.conf 按字母序在 00-ime.conf 之后，且值也
-            # 是 fcitx 的 —— 只要还带 fcitx 就删除，避免把 IBus 覆盖回不可用状态。
-            if [ -f "$_imed/ime.conf" ] && grep -qi "fcitx" "$_imed/ime.conf" 2>/dev/null; then
+            # Remove any legacy ime.conf or stale IBus configs
+            if [ -f "$_imed/ime.conf" ]; then
                 rm -f "$_imed/ime.conf"
-                log "$(_t "Removed stale environment.d/ime.conf (fcitx values)" "Removed stale environment.d/ime.conf (fcitx values)")"
             fi
-            if [ ! -f "$_imed/00-ime.conf" ] || grep -qi "fcitx" "$_imed/00-ime.conf" 2>/dev/null; then
-                [ -f "$_imed/00-ime.conf" ] && cp -f "$_imed/00-ime.conf" "$_imed/00-ime.conf.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
-                cat > "$_imed/00-ime.conf" <<'IMEEOF'
-# eilNiri: IBus 输入法环境变量（覆盖 systemd 用户服务与 XDG autostart 启动的应用）
-GTK_IM_MODULE=ibus
-QT_IM_MODULE=ibus
-XMODIFIERS=@im=ibus
-SDL_IM_MODULE=ibus
+            cat > "$_imed/00-ime.conf" <<'IMEEOF'
+# eilNiri: Fcitx5 输入法环境变量（覆盖 systemd 用户服务与 XDG autostart 启动的应用）
+GTK_IM_MODULE=fcitx
+QT_IM_MODULE=fcitx
+XMODIFIERS=@im=fcitx
+SDL_IM_MODULE=fcitx
 GLFW_IM_MODULE=ibus
-INPUT_METHOD=ibus
 IMEEOF
-                chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_imed/00-ime.conf" 2>/dev/null || true
-                log "$(_t "Wrote ~/.config/environment.d/00-ime.conf (ibus IME vars)" "Wrote ~/.config/environment.d/00-ime.conf (ibus IME vars)")"
-            fi
+            chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_imed/00-ime.conf" 2>/dev/null || true
+            log "$(_t "Wrote ~/.config/environment.d/00-ime.conf (fcitx5 IME vars)" "Wrote ~/.config/environment.d/00-ime.conf (fcitx5 IME vars)")"
+
             # /etc/environment：PAM 会话级兜底（DM 直接拉起的会话也拿得到这些变量）。
-            # 旧版 fcitx 的块/散行必须先删除，否则同名变量后出现的值反而不会生效
-            # ——因此这里是"整块替换"而不是"存在就跳过"。
-            # NOTE: `sed -i` writes a temp file NEXT TO the target, so it fails on
-            # a read-only /etc even when the file itself is writable (seen in
-            # containers / immutable-root setups). awk can rewrite the same file
-            # without a temp file, so it is used as the fallback below.
             if grep -q "^# >>> eilNiri IME >>>" /etc/environment 2>/dev/null; then
                 if _env_strip_ime_block /etc/environment; then
                     log "$(_t "Removed the previous eilNiri IME block from /etc/environment" "Removed the previous eilNiri IME block from /etc/environment")"
@@ -4546,27 +4296,24 @@ IMEEOF
                     warn "$(_t "Could not clean the old IME block in /etc/environment — check it manually." "Could not clean the old IME block in /etc/environment.")"
                 fi
             fi
-            # 散落在外面的 fcitx 行（更早期的脚本版本没有标记块）——留着会让 IBus 失效。
-            if grep -qE '^(GTK_IM_MODULE|QT_IM_MODULE|SDL_IM_MODULE|GLFW_IM_MODULE|INPUT_METHOD|XMODIFIERS)=.*fcitx' /etc/environment 2>/dev/null; then
-                if _env_drop_lines /etc/environment '^(# *)?(GTK_IM_MODULE|QT_IM_MODULE|SDL_IM_MODULE|GLFW_IM_MODULE|INPUT_METHOD|XMODIFIERS)=.*fcitx'; then
-                    log "$(_t "Removed leftover fcitx IM variables from /etc/environment" "Removed leftover fcitx IM variables from /etc/environment")"
+            # 散落在外面的 ibus / fcitx 行（更早期的脚本版本没有标记块）
+            if grep -qE '^(GTK_IM_MODULE|QT_IM_MODULE|SDL_IM_MODULE|GLFW_IM_MODULE|INPUT_METHOD|XMODIFIERS)=.*(ibus|fcitx)' /etc/environment 2>/dev/null; then
+                if _env_drop_lines /etc/environment '^(# *)?(GTK_IM_MODULE|QT_IM_MODULE|SDL_IM_MODULE|GLFW_IM_MODULE|INPUT_METHOD|XMODIFIERS)=.*(ibus|fcitx)'; then
+                    log "$(_t "Removed leftover IM variables from /etc/environment" "Removed leftover IM variables from /etc/environment")"
                 fi
             fi
-            if ! grep -q "^GTK_IM_MODULE=ibus$" /etc/environment 2>/dev/null; then
-                [ -f /etc/environment ] || touch /etc/environment
-                {
-                    echo ""
-                    echo "# >>> eilNiri IME >>>"
-                    echo "GTK_IM_MODULE=ibus"
-                    echo "QT_IM_MODULE=ibus"
-                    echo "XMODIFIERS=@im=ibus"
-                    echo "SDL_IM_MODULE=ibus"
-                    echo "GLFW_IM_MODULE=ibus"
-                    echo "INPUT_METHOD=ibus"
-                    echo "# <<< eilNiri IME <<<"
-                } >> /etc/environment
-                log "$(_t "Wrote ibus IME vars to /etc/environment (replacing any fcitx block)" "Wrote ibus IME vars to /etc/environment (replacing any fcitx block)")"
-            fi
+            [ -f /etc/environment ] || touch /etc/environment
+            {
+                echo ""
+                echo "# >>> eilNiri IME >>>"
+                echo "GTK_IM_MODULE=fcitx"
+                echo "QT_IM_MODULE=fcitx"
+                echo "XMODIFIERS=@im=fcitx"
+                echo "SDL_IM_MODULE=fcitx"
+                echo "GLFW_IM_MODULE=ibus"
+                echo "# <<< eilNiri IME <<<"
+            } >> /etc/environment
+            log "$(_t "Wrote fcitx5 IME vars to /etc/environment" "Wrote fcitx5 IME vars to /etc/environment")"
         fi
     fi
     # zsh 美化：把登录 shell 换成 zsh 并安装 configs/.zshrc 依赖的运行时
@@ -4840,9 +4587,6 @@ stage_hardware_adapt() {
     # --- 2) fix niri config ---
     if [ -f "$niri_cfg" ]; then
         log "$(_t "Adapting niri output config..." "Adapting niri output config...")"
-        # backup
-        cp "$niri_cfg" "$niri_cfg.bak-hw-$(date +%Y%m%d-%H%M%S)"
-        prune_config_backups "$(dirname "$niri_cfg")" "$(basename "$niri_cfg").bak-hw-*"
 
         # find the first active output block and replace its name and mode
         local tmp
@@ -4932,11 +4676,8 @@ stage_verify() {
                     continue
                     ;;
                 rime-ice-pinyin-git)
-                    # IBus engine layout (~/.config/ibus/rime). The old fcitx5 path is
-                    # accepted as well so a machine migrated by hand is not reported
-                    # as broken.
-                    if [ -f "$HOME_DIR/$RIME_IBUS_USER_DIR_SUFFIX/rime_ice.schema.yaml" ] \
-                        || [ -f "$HOME_DIR/$RIME_FCITX_USER_DIR_SUFFIX/rime_ice.schema.yaml" ]; then
+                    # Fcitx5 engine layout (~/.local/share/fcitx5/rime)
+                    if [ -f "$HOME_DIR/$RIME_FCITX_USER_DIR_SUFFIX/rime_ice.schema.yaml" ]; then
                         :
                     else
                         missing+=("rime-ice")
@@ -4982,7 +4723,7 @@ stage_verify() {
 
     # config audit
     local cfg_errors=0 d
-    for d in niri waybar kitty mako hypr ibus; do
+    for d in niri waybar kitty mako hypr fcitx5; do
         if [ -e "$HOME_DIR/.config/$d" ]; then
             log "  [OK] $HOME_DIR/.config/$d"
         else
@@ -5068,7 +4809,6 @@ do_restore() {
     boot_env_check
     print_niri_status
     print_summary
-    save_diag_bundle
 }
 
 # --- 4.10c one-line niri status (printed right before the summary) ---
@@ -5083,74 +4823,6 @@ print_niri_status() {
     fi
     echo ""
     info_kv "$(_t "NIRI STATUS" "NIRI STATUS")" "binary=$_bin | desktop=$_desk | gdm Session=$_sess"
-}
-
-# --- 4.10d diagnostic bundle (so a failed run can be shared for offline analysis) ---
-save_diag_bundle() {
-    [ "$DRY_RUN" -eq 1 ] && return 0
-    local _ts _bundle _tmpdir
-    _ts=$(date +%Y%m%d-%H%M%S)
-    _tmpdir=$(mktemp -d)
-    register_temp_path "$_tmpdir"
-    # gather plain-text snapshots (best effort; never fail the whole restore here)
-    {
-        echo "=== eilNiri diagnostic bundle ==="
-        echo "Date: $(date)"
-        echo "Script: v$SCRIPT_VERSION  Progress: $PROGRESS_VERSION"
-        echo "Distro: $DISTRO_FAMILY ($DISTRO_ID)"
-        echo "Target user: $TARGET_USER  Home: $HOME_DIR"
-        echo
-        echo "=== systemctl get-default ==="
-        systemctl get-default 2>/dev/null
-        echo
-        echo "=== display-manager.service ==="
-        readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "(missing)"
-        echo
-        echo "=== enabled DMs ==="
-        for _d in gdm gdm3; do systemctl is-enabled --quiet "$_d" 2>/dev/null && echo "$_d enabled"; done
-        echo
-        echo "=== AccountsService users/$TARGET_USER ==="
-        cat "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null || echo "(missing)"
-        echo
-        echo "=== gdm custom.conf ==="
-        cat /etc/gdm/custom.conf /etc/gdm3/custom.conf 2>/dev/null || echo "(none)"
-        echo
-        echo "=== niri.desktop locations ==="
-        ls -l /usr/local/share/wayland-sessions/niri.desktop /usr/share/wayland-sessions/niri.desktop 2>/dev/null || echo "(none)"
-        echo
-        echo "=== niri binary ==="
-        command -v niri 2>/dev/null && niri --version 2>&1 | head -1 || echo "(not found)"
-        echo
-        echo "=== installed pkgs (gdm/niri/rust/accountsservice/hypr) ==="
-        rpm -qa 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr'
-        echo
-        echo "=== build logs tail ==="
-        for _f in "$LOG_DIR/niri-build.log" "$LOG_DIR/awww-build.log" "$LOG_DIR/xwayland-satellite-build.log" "$LOG_DIR/hyprlock-build.log" "$LOG_DIR/hypridle-build.log"; do
-            [ -f "$_f" ] && { echo "--- $_f (tail 30) ---"; tail -n 30 "$_f" 2>/dev/null; }
-        done
-    } > "$_tmpdir/diag.txt" 2>/dev/null
-    # attach the full replicate log too
-    [ -f "$TEMP_LOG_FILE" ] && cp "$TEMP_LOG_FILE" "$_tmpdir/replicate.log" 2>/dev/null
-    # The session entry point and its log: "login from GDM shows nothing" is almost
-    # always diagnosed from these two, so ship them with the bundle.
-    [ -x /usr/local/bin/niri-session ] && cp /usr/local/bin/niri-session "$_tmpdir/niri-session" 2>/dev/null
-    if [ -n "${TARGET_USER:-}" ]; then
-        local _uhome
-        _uhome=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
-        if [ -n "$_uhome" ] && [ -f "$_uhome/.local/state/eilNiri/session.log" ]; then
-            cp "$_uhome/.local/state/eilNiri/session.log" "$_tmpdir/session.log" 2>/dev/null
-        fi
-    fi
-    # The PATH a fresh session sees decides whether the DM finds "niri-session";
-    # record it so a missing-/usr/local/bin regression is visible at a glance.
-    { printf 'runtime PATH=%s\n' "$PATH"
-      grep -nE '^PATH=' /etc/environment 2>/dev/null || true; } > "$_tmpdir/session-path.txt" 2>/dev/null || true
-    _bundle="$LOG_DIR/diag-$_ts.tar.gz"
-    if tar czf "$_bundle" -C "$_tmpdir" . 2>/dev/null; then
-        echo ""
-        info_kv "$(_t "Diagnostic Bundle" "Diagnostic Bundle")" "$_bundle" "$(_t "(share this if niri fails to start)" "(share this if niri fails to start)")"
-        write_log "DIAG" "bundle saved: $_bundle"
-    fi
 }
 
 # --- 4.10b ensure display manager default session = niri (idempotent, runs on EVERY restore) ---
@@ -5470,6 +5142,7 @@ Environment:
   EILNIRI_KEEP_DM=1    keep existing display manager unchanged
   (display manager)    always gdm; the GNOME *desktop* is never installed
   EILNIRI_KEEP_SYS=1   skip disabling other-DE components during restore
+  EILNIRI_SKIP_SYS_UPGRADE=1 skip whole-distro upgrade during preflight
   EILNIRI_GH_PROXY     space-separated GitHub proxy URLs (default: ghfast.top gh-proxy.com ghproxy.net gh.llkk.cc)
 
 Workflow:
@@ -5478,9 +5151,8 @@ Workflow:
      optionally drop your own dotfiles into configs/.config/ and they get deployed
      - niri/awww compile in background:  ./RHEL-install.sh status   (live progress)
      - watch logs:                       tail -f ~/.local/state/eilNiri/{niri,awww}-build.log
-     - IME: IBus + ibus-rime + rime-ice (no compilation). The engine lives in
-       EPEL on EL; if it is missing, rerun after 'dnf install epel-release'.
-       Verify with: ibus engine  (should print "rime" inside the desktop session)
+     - IME: Fcitx5 + fcitx5-rime + rime-ice. Official RPMs on Fedora; COPR or
+       source compilation fallback on EL.
   3. Re-enable other-DE comps:   sudo ./RHEL-install.sh restore-system
 EOF
 }

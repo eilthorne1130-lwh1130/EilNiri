@@ -784,20 +784,28 @@ ensure_fzf() {
 # fzf multi-select (see 99-apps.sh: select all by default / TAB toggle / Ctrl-A select all / Ctrl-D deselect all)
 #  stdin: lines of "field1\tfield2"; stdout: lines selected by the user
 fzf_multi() {
-    fzf --multi --layout=reverse --border=rounded --margin=1,2 \
-        --delimiter=$'\t' --with-nth=1,2 \
-        --bind 'load:select-all' \
-        --bind 'ctrl-a:select-all,ctrl-d:deselect-all,j:down,k:up' \
-        --pointer=">" --marker="* " --ansi \
-        --header="$1"
+    if [ -t 1 ] && { :; } </dev/tty 2>/dev/null && command -v fzf >/dev/null 2>&1; then
+        fzf --multi --layout=reverse --border=rounded --margin=1,2 \
+            --delimiter=$'\t' --with-nth=1,2 \
+            --bind 'load:select-all' \
+            --bind 'ctrl-a:select-all,ctrl-d:deselect-all,j:down,k:up' \
+            --pointer=">" --marker="* " --ansi \
+            --header="$1"
+    else
+        cat
+    fi
 }
 
 # fzf single-select (mirror switch etc.: nothing preselected, TAB/Ctrl-D meaningless)
 fzf_single() {
-    fzf --layout=reverse --border=rounded --margin=1,2 \
-        --delimiter=$'\t' --with-nth=1,2 \
-        --pointer=">" --marker="" --ansi \
-        --header="$1"
+    if [ -t 1 ] && { :; } </dev/tty 2>/dev/null && command -v fzf >/dev/null 2>&1; then
+        fzf --layout=reverse --border=rounded --margin=1,2 \
+            --delimiter=$'\t' --with-nth=1,2 \
+            --pointer=">" --marker="" --ansi \
+            --header="$1"
+    else
+        head -n 1
+    fi
 }
 
 # Resolve the DRM connector at session startup, after GDM has handed the device
@@ -4075,18 +4083,120 @@ install_waypaper_pipx() {
 }
 
 # --- satty install (Debian/RHEL families; no package) ---
-# Strategy: 1) official prebuilt binary from GitHub releases (satty-<arch>-unknown-linux-gnu.tar.gz)
-#           2) cargo install fallback (needs GTK4/libadwaita/librsvg dev packages) 3) manual report
+# Strategy: 1) native swappy package + satty compatibility bridge (Debian family)
+#           2) official prebuilt binary from GitHub releases (satty-<arch>-unknown-linux-gnu.tar.gz)
+#           3) cargo install fallback (needs GTK4/libadwaita/librsvg dev packages) 4) manual report
 SATTY_GH="https://github.com/Satty-org/Satty/releases"
+
+_deploy_satty_swappy_wrapper() {
+    mkdir -p /usr/local/bin
+    cat > /usr/local/bin/satty <<'SWAPPY_WRAPPER'
+#!/usr/bin/env bash
+# satty -> swappy compatibility bridge for EilNiri on Debian
+
+input_file="-"
+output_file=""
+show_help=0
+show_version=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help=1
+            shift
+            ;;
+        -v|-V|--version)
+            show_version=1
+            shift
+            ;;
+        -f|--filename)
+            input_file="$2"
+            shift 2
+            ;;
+        --filename=*)
+            input_file="${1#*=}"
+            shift
+            ;;
+        -o|--output-filename)
+            output_file="$2"
+            shift 2
+            ;;
+        --output-filename=*)
+            output_file="${1#*=}"
+            shift
+            ;;
+        *)
+            if [ -f "$1" ] && [ "$input_file" = "-" ]; then
+                input_file="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ "$show_help" -eq 1 ]; then
+    echo "satty (swappy compatibility bridge) - A Wayland screenshot annotation tool"
+    echo "Usage: satty [options]"
+    echo "  -f, --filename <file>          Input file or '-' for stdin"
+    echo "  -o, --output-filename <file>   Output file path (supports %Y-%m-%d etc.)"
+    echo "  -h, --help                     Print help"
+    echo "  -v, --version                  Print version"
+    exit 0
+fi
+
+if [ "$show_version" -eq 1 ]; then
+    echo "satty 0.1.0 (swappy compatibility bridge)"
+    exit 0
+fi
+
+if ! command -v swappy >/dev/null 2>&1; then
+    echo "satty wrapper error: swappy not found. Please install swappy (apt-get install -y swappy)." >&2
+    exit 1
+fi
+
+output_file="${output_file#[\'\"]}"
+output_file="${output_file%[\'\"]}"
+output_file="${output_file/#\~/$HOME}"
+if [[ "$output_file" == *"%"* ]]; then
+    output_file=$(date +"$output_file")
+fi
+
+if [ -n "$output_file" ]; then
+    mkdir -p "$(dirname "$output_file")"
+    exec swappy -f "$input_file" -o "$output_file"
+else
+    exec swappy -f "$input_file"
+fi
+SWAPPY_WRAPPER
+    chmod 755 /usr/local/bin/satty
+}
 
 install_satty() {
     if command -v satty >/dev/null 2>&1; then
-        SKIPPED_PKGS+=("satty (already installed)")
-        return 0
+        if satty --help >/dev/null 2>&1; then
+            SKIPPED_PKGS+=("satty (already installed)")
+            return 0
+        fi
+        log "$(_t "Existing satty failed verification, reinstalling..." "Existing satty failed verification, reinstalling...")"
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        DRY_PKGS+=("satty (official prebuilt or cargo)")
+        DRY_PKGS+=("satty (swappy bridge or official prebuilt)")
         return "$DRY_RUN_RC"
+    fi
+
+    # Debian family: upstream official prebuilt satty links against GLIBC >= 2.43 and libglycin-2,
+    # which Debian 13/Ubuntu LTS do not provide. Use native swappy package + satty compatibility bridge.
+    if [ "$DISTRO_FAMILY" = debian ]; then
+        log "$(_t "Installing native swappy and satty compatibility bridge..." "Installing native swappy and satty compatibility bridge...")"
+        if exe apt-get install -y swappy; then
+            _deploy_satty_swappy_wrapper
+            if /usr/local/bin/satty --help >/dev/null 2>&1; then
+                INSTALLED_PKGS+=("satty (swappy bridge)")
+                success "$(_t "satty compatibility bridge installed" "satty compatibility bridge installed")"
+                return 0
+            fi
+        fi
+        warn "$(_t "swappy bridge installation failed, attempting prebuilt/cargo fallback..." "swappy bridge installation failed, attempting prebuilt/cargo fallback...")"
     fi
 
     local arch
@@ -4148,10 +4258,15 @@ install_satty() {
         fi
         if [ -n "$satty_bin" ]; then
             exe install -Dm755 "$satty_bin" /usr/local/bin/satty
-            [ -d "$work/share" ] && exe cp -r "$work"/share/. /usr/local/share/ 2>/dev/null || true
-            INSTALLED_PKGS+=("satty (official prebuilt)")
-            success "$(_t "satty installed" "satty installed")"
-            return 0
+            if /usr/local/bin/satty --help >/dev/null 2>&1; then
+                [ -d "$work/share" ] && exe cp -r "$work"/share/. /usr/local/share/ 2>/dev/null || true
+                INSTALLED_PKGS+=("satty (official prebuilt)")
+                success "$(_t "satty installed" "satty installed")"
+                return 0
+            else
+                warn "$(_t "Prebuilt satty binary failed runtime verification, trying fallback..." "Prebuilt satty binary failed runtime verification, trying fallback...")"
+                rm -f /usr/local/bin/satty
+            fi
         fi
     fi
     warn "$(_t "Prebuilt satty download failed, falling back to cargo." "Prebuilt satty download failed, falling back to cargo.")"
@@ -4177,9 +4292,14 @@ install_satty() {
     log "$(_t "Building satty via cargo (about 5 min)..." "Building satty via cargo (about 5 min)...")"
     local satty_log="$LOG_DIR/satty-build.log"
     if exe bash -c "cargo install --root /usr/local satty >'$satty_log' 2>&1"; then
-        INSTALLED_PKGS+=("satty (cargo build)")
-        success "$(_t "satty built from source" "satty built from source")"
-        return 0
+        if /usr/local/bin/satty --help >/dev/null 2>&1; then
+            INSTALLED_PKGS+=("satty (cargo build)")
+            success "$(_t "satty built from source" "satty built from source")"
+            return 0
+        else
+            warn "$(_t "Compiled satty binary failed verification." "Compiled satty binary failed verification.")"
+            rm -f /usr/local/bin/satty
+        fi
     fi
     local satty_tail
     satty_tail=$(tail -n 8 "$satty_log" 2>/dev/null | tr '\n' ' ')

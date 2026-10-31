@@ -661,12 +661,16 @@ ensure_fzf() {
 # fzf multi-select (see 99-apps.sh: select all by default / TAB toggle / Ctrl-A select all / Ctrl-D deselect all)
 #  stdin: lines of "field1\tfield2"; stdout: lines selected by the user
 fzf_multi() {
-    fzf --multi --layout=reverse --border=rounded --margin=1,2 \
-        --delimiter=$'\t' --with-nth=1,2 \
-        --bind 'load:select-all' \
-        --bind 'ctrl-a:select-all,ctrl-d:deselect-all,j:down,k:up' \
-        --pointer=">" --marker="* " --ansi \
-        --header="$1"
+    if [ -t 1 ] && { :; } </dev/tty 2>/dev/null && command -v fzf >/dev/null 2>&1; then
+        fzf --multi --layout=reverse --border=rounded --margin=1,2 \
+            --delimiter=$'\t' --with-nth=1,2 \
+            --bind 'load:select-all' \
+            --bind 'ctrl-a:select-all,ctrl-d:deselect-all,j:down,k:up' \
+            --pointer=">" --marker="* " --ansi \
+            --header="$1"
+    else
+        cat
+    fi
 }
 
 # --- 4.1 preflight (pacman settings, mirror refresh, keyring, locales, upgrade) ---
@@ -1241,13 +1245,11 @@ install_rime_ice() {
 # default.custom.yaml：把 rime_ice 指定为默认方案（参考机同款）。repo 不随 configs
 # 发（deploy_one 的隐私安全网会剥掉 rime 子目录），由本函数在 rime 数据就绪后写入。
 _ensure_rime_default_custom() {
-    local dest="$HOME_DIR/.local/share/fcitx5/rime" _ts
+    local dest="$HOME_DIR/.local/share/fcitx5/rime"
     [ -d "$dest" ] || return 0
     if [ -f "$dest/default.custom.yaml" ] && grep -q "rime_ice" "$dest/default.custom.yaml" 2>/dev/null; then
         return 0
     fi
-    _ts=$(date +%Y%m%d-%H%M%S)
-    [ -f "$dest/default.custom.yaml" ] && cp "$dest/default.custom.yaml" "$dest/default.custom.yaml.bak-$_ts"
     cat > "$dest/default.custom.yaml" <<RIMEDCEOF
 patch:
   schema_list:
@@ -1823,34 +1825,18 @@ install_zsh_extras() {
     fi
 }
 
-prune_config_backups() { # $1 = directory, $2 = basename glob
-    local dir="$1" pattern="$2" backup
-    [ -d "$dir" ] || return 0
-    mapfile -t backups < <(
-        find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
-            | sort -rn | awk 'NR > 1 { sub(/^[^ ]+ /, ""); print }'
-    )
-    for backup in "${backups[@]}"; do
-        [ -n "$backup" ] && rm -f -- "$backup"
-    done
-}
-
 deploy_one() { # $1 = source path, $2 = destination path, $3 = timestamp
     local src="$1" dst="$2" ts="$3"
     if [ "$DRY_RUN" -eq 1 ]; then
         if [ -e "$dst" ] || [ -L "$dst" ]; then
-            log "$(_t "[DRY-RUN] would backup & replace: " "[DRY-RUN] would backup & replace: ")$dst"
+            log "$(_t "[DRY-RUN] would replace: " "[DRY-RUN] would replace: ")$dst"
         else
             log "$(_t "[DRY-RUN] would deploy: " "[DRY-RUN] would deploy: ")$dst"
         fi
         return 0
     fi
     mkdir -p "$(dirname "$dst")"
-    if [ -e "$dst" ] || [ -L "$dst" ]; then
-        log "$(_t "Backup existing: " "Backup existing: ")$dst -> $dst.bak-$ts"
-        exe mv "$dst" "$dst.bak-$ts"
-        prune_config_backups "$(dirname "$dst")" "$(basename "$dst").bak-*"
-    fi
+    [ -e "$dst" ] || [ -L "$dst" ] && exe rm -rf "$dst"
     exe cp -r "$src" "$dst"
     # Safety net: a top-level directory may legitimately ship while containing
     # privacy-risk files deeper inside (e.g. fcitx5/cached_layouts). Strip them
@@ -2393,9 +2379,6 @@ stage_hardware_adapt() {
     # --- 2) fix niri config ---
     if [ -f "$niri_cfg" ]; then
         log "$(_t "Adapting niri output config..." "Adapting niri output config...")"
-        # backup
-        cp "$niri_cfg" "$niri_cfg.bak-hw-$(date +%Y%m%d-%H%M%S)"
-        prune_config_backups "$(dirname "$niri_cfg")" "$(basename "$niri_cfg").bak-hw-*"
 
         # find the first active output block and replace its name and mode
         local tmp
@@ -2633,7 +2616,6 @@ do_restore() {
     boot_env_check
     print_niri_status
     print_summary
-    save_diag_bundle
 }
 
 # --- 4.10c one-line niri status (printed right before the summary) ---
@@ -2651,60 +2633,6 @@ print_niri_status() {
     fi
     echo ""
     info_kv "$(_t "NIRI STATUS" "NIRI STATUS")" "binary=$_bin | desktop=$_desk | DM=$_dm | AccountsService Session=$_sess"
-}
-
-# --- 4.10d diagnostic bundle (so a failed run can be shared for offline analysis) ---
-save_diag_bundle() {
-    [ "$DRY_RUN" -eq 1 ] && return 0
-    local _ts _bundle _tmpdir
-    _ts=$(date +%Y%m%d-%H%M%S)
-    _tmpdir=$(mktemp -d)
-    register_temp_path "$_tmpdir"
-    # gather plain-text snapshots (best effort; never fail the whole restore here)
-    {
-        echo "=== eilNiri diagnostic bundle ==="
-        echo "Date: $(date)"
-        echo "Script: v$SCRIPT_VERSION  Progress: $PROGRESS_VERSION"
-        echo "Distro: $DISTRO_FAMILY ($DISTRO_ID)  Ubuntu: $UBUNTU_VER_NUM"
-        echo "Target user: $TARGET_USER  Home: $HOME_DIR"
-        echo
-        echo "=== systemctl get-default ==="
-        systemctl get-default 2>/dev/null
-        echo
-        echo "=== display-manager.service ==="
-        readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || echo "(missing)"
-        echo
-        echo "=== enabled DMs ==="
-        for _d in gdm gdm3 sddm ly lightdm; do systemctl is-enabled --quiet "$_d" 2>/dev/null && echo "$_d enabled"; done
-        echo
-        echo "=== AccountsService users/$TARGET_USER ==="
-        cat "/var/lib/AccountsService/users/$TARGET_USER" 2>/dev/null || echo "(missing)"
-        echo
-        echo "=== gdm custom.conf ==="
-        cat /etc/gdm/custom.conf /etc/gdm3/custom.conf 2>/dev/null || echo "(none)"
-        echo
-        echo "=== niri.desktop locations ==="
-        ls -l /usr/local/share/wayland-sessions/niri.desktop /usr/share/wayland-sessions/niri.desktop 2>/dev/null || echo "(none)"
-        echo
-        echo "=== niri binary ==="
-        command -v niri 2>/dev/null && niri --version 2>&1 | head -1 || echo "(not found)"
-        echo
-        echo "=== installed pkgs (gdm/niri/rust/accountsservice/hypr) ==="
-        pacman -Q 2>/dev/null | grep -iE 'gdm|niri|rust|accountsservice|hypr'
-        echo
-        echo "=== build logs tail ==="
-        for _f in "$LOG_DIR/niri-build.log" "$LOG_DIR/awww-build.log" "$LOG_DIR/xwayland-satellite-build.log" "$LOG_DIR/hyprlock-build.log" "$LOG_DIR/hypridle-build.log"; do
-            [ -f "$_f" ] && { echo "--- $_f (tail 30) ---"; tail -n 30 "$_f" 2>/dev/null; }
-        done
-    } > "$_tmpdir/diag.txt" 2>/dev/null
-    # attach the full replicate log too
-    [ -f "$TEMP_LOG_FILE" ] && cp "$TEMP_LOG_FILE" "$_tmpdir/replicate.log" 2>/dev/null
-    _bundle="$LOG_DIR/diag-$_ts.tar.gz"
-    if tar czf "$_bundle" -C "$_tmpdir" . 2>/dev/null; then
-        echo ""
-        info_kv "$(_t "Diagnostic Bundle" "Diagnostic Bundle")" "$_bundle" "$(_t "(share this if niri fails to start)" "(share this if niri fails to start)")"
-        write_log "DIAG" "bundle saved: $_bundle"
-    fi
 }
 
 # --- 4.10b ensure display manager default session = niri (idempotent, runs on EVERY restore) ---
