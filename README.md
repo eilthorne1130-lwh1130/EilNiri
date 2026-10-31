@@ -48,7 +48,7 @@
 ### ✨ 核心特性
 
 - 🎯 **跨三大发行版家族全自动化**：提供 `arch-install.sh`、`deb-install.sh`、`RHEL-install.sh`，覆盖 Arch Linux / Manjaro、Debian / Ubuntu / Pop!_OS、Fedora / RHEL / Rocky 等主流平台。
-- ⌨️ **Vim 风格人体工程学快捷键**：全面支持 `H/J/K/L` 导航与移动，分工明确的修饰键分级体系，双手不离键盘即可完成所有视窗编排。
+- ⌨️ **人体工程学快捷键设计**：全面支持 `H/J/K/L` 与物理方向键导航与移动，分工明确的修饰键分级体系，双手不离键盘即可完成所有视窗编排。
 - 🌏 **统一且开箱即用的中文输入体验**：三大家族全平台统一 Fcitx5 + Rime（雾凇拼音 rime-ice），原生解决 Wayland 与 Kitty 终端中文输入环境。
 - 🔋 **智能模块热注入**：自带 `laptop-need-install.sh`，采用 AST 级幂等语法注入，自动补齐 Waybar 电量监视模块与低电量告警。
 - 🛡️ **高稳定与会话容错**：定制防误触退出、XWayland 视频网桥透明抑制、防黑屏穿透规则及进程守护。
@@ -84,11 +84,10 @@ vlc "/home/eilthorne/2-disk/演示/EilNiri演示.mp4"
 | 场景 | 截图展示 | 关键功能特性 |
 | :--- | :--- | :--- |
 | **01. 纯净桌面与状态栏** | <img src="assets/screenshots/01_desktop.png" width="420" /> | • 4K 唯美动态壁纸渲染<br>• Waybar 顶置极简状态栏<br>• 模块化系统托盘与电量/网络指标 |
-| **02. Fuzzel 应用启动器** | <img src="assets/screenshots/02_fuzzel.png" width="420" /> | • `Mod+Z` 瞬时唤起<br>• Wayland 原生极速轻量启动器<br>• 半透明深紫灰配色 (`1e1e2edd`) 与 Papirus-Dark 图标支持<br>• 应用名称、通用描述与命令模糊匹配过滤 |
-| **03. Kitty 终端微透质感** | <img src="assets/screenshots/03_kitty.png" width="420" /> | • `Mod+W` 极速打开终端<br>• 85% 亚克力半透明与 12px 圆角<br>• Starship 现代化三段式状态提示符 |
-| **04. 监控与 Waybar 折叠抽屉** | <img src="assets/screenshots/04_btop.png" width="420" /> | • 点击状态栏触发 `group/sys` 平滑展开<br>• 实时硬件占用（CPU/内存/磁盘）<br>• 一键联动进入全功能 `btop` 面板 |
-| **05. 无限水平滚动与比例预设** | <img src="assets/screenshots/05_tiling.png" width="420" /> | • `Mod+R` 在 1/3、1/2、2/3 宽度间循环<br>• `Mod+F` 独占当前列最大化<br>• 视窗平滑阻尼物理弹性滚动动画 |
-| **06. Hyprlock 华丽锁屏** | <img src="assets/screenshots/06_hyprlock.png" width="420" /> | • `Super+Alt+L` 立即锁屏 / 闲置自动锁屏<br>• 双通道高斯模糊壁纸虚化<br>• 130px JetBrains Mono 大字体与 PAM 校验反馈 |
+| **02. Kitty 终端微透质感** | <img src="assets/screenshots/03_kitty.png" width="420" /> | • `Mod+W` 极速打开终端<br>• 85% 亚克力半透明与 12px 圆角<br>• Starship 现代化三段式状态提示符 |
+| **03. 监控与 Waybar 折叠抽屉** | <img src="assets/screenshots/04_btop.png" width="420" /> | • 点击状态栏触发 `group/sys` 平滑展开<br>• 实时硬件占用（CPU/内存/磁盘）<br>• 一键联动进入全功能 `btop` 面板 |
+| **04. 无限水平滚动与比例预设** | <img src="assets/screenshots/05_tiling.png" width="420" /> | • `Mod+R` 在 1/3、1/2、2/3 宽度间循环<br>• `Mod+F` 独占当前列最大化<br>• 视窗平滑阻尼物理弹性滚动动画 |
+| **05. Hyprlock 华丽锁屏** | <img src="assets/screenshots/06_hyprlock.png" width="420" /> | • `Super+Alt+L` 立即锁屏 / 闲置自动锁屏<br>• 双通道高斯模糊壁纸虚化<br>• 130px JetBrains Mono 大字体与 PAM 校验反馈 |
 
 ---
 
@@ -254,7 +253,7 @@ sudo ./laptop-need-install.sh -y
 
 EilNiri 的键盘映射方案遵循以下三大原则：
 
-1. **极客优先与肌肉记忆**：全面引入 `Vim` 核心方向键 `H / J / K / L`，并与标准物理方向键 `← / ↓ / ↑ / →` 保持 100% 行为等价。
+1. **流畅高效的键位映射**：全面支持 `H / J / K / L` 与标准物理方向键 `← / ↓ / ↑ / →` 保持 100% 行为等价。
 2. **层次分明的修饰键分级 (Modifier Hierarchy)**：
    - `Mod` (即 `Super` / `Windows` 键)：**视窗浏览与基础聚焦**。
    - `Mod + Ctrl`：**窗口列/卡片位置移动与空间重排**。
