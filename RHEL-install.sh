@@ -505,6 +505,10 @@ DISABLE_SYS=(
     # --- KDE screen locker (replaced by hyprlock + hypridle) ---
     "systemunit|kscreenlocker.service|KDE screen locker (replaced by hyprlock)"
     "autostart|kscreenlocker.desktop|KDE screen locker (replaced by hyprlock)"
+
+    # --- XWayland video bridge (KDE autostart creates a dummy white window in tiled Wayland) ---
+    "autostart|org.kde.xwaylandvideobridge.desktop|Xwayland video bridge"
+    "autostart|xwaylandvideobridge.desktop|Xwayland video bridge"
 )
 
 
@@ -560,7 +564,7 @@ pkg_installed() { # $1 = package name
 RHEL_DNF_ENABLEREPO=()
 
 pm_install() { # $@ = package names
-    exe dnf install -y ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$@"
+    exe dnf install -y --allowerasing ${RHEL_DNF_ENABLEREPO[@]+"${RHEL_DNF_ENABLEREPO[@]}"} "$@"
 }
 
 # Install as many packages of a batch as possible; return non-zero only when one or more
@@ -3982,6 +3986,26 @@ fix_polkit_agent() {
     exe chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cfg"
 }
 
+configure_copyq_hidden_window() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _cqconf="$HOME_DIR/.config/copyq/copyq.conf"
+    mkdir -p "$(dirname "$_cqconf")"
+    if [ ! -f "$_cqconf" ]; then
+        printf '[General]\nhide_main_window=true\n' > "$_cqconf"
+        log "$(_t "Created ~/.config/copyq/copyq.conf (hide_main_window=true; no CopyQ window at startup)" "Created ~/.config/copyq/copyq.conf (hide_main_window=true; no CopyQ window at startup)")"
+    elif ! grep -q '^hide_main_window=true' "$_cqconf" 2>/dev/null; then
+        if grep -q '^hide_main_window=' "$_cqconf" 2>/dev/null; then
+            sed -i 's/^hide_main_window=.*/hide_main_window=true/' "$_cqconf" 2>/dev/null || true
+        elif grep -q '^\[General\]' "$_cqconf" 2>/dev/null; then
+            sed -i '0,/^\[General\]/s//&\nhide_main_window=true/' "$_cqconf" 2>/dev/null || true
+        else
+            sed -i '1i [General]\nhide_main_window=true' "$_cqconf" 2>/dev/null || true
+        fi
+        log "$(_t "Set hide_main_window=true in ~/.config/copyq/copyq.conf (no CopyQ window at startup)" "Set hide_main_window=true in ~/.config/copyq/copyq.conf (no CopyQ window at startup)")"
+    fi
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cqconf" 2>/dev/null || true
+}
+
 
 # --- in-place text surgery that also works on a read-only parent directory ---
 # `sed -i` creates its temp file in the SAME directory as the target, so it fails
@@ -4259,6 +4283,7 @@ stage_configs() {
         _ensure_wallpaper
         _ensure_waypaper_desktop   # pip 装的 waypaper 无 .desktop → fuzzel 无图标
         fix_polkit_agent           # niri 配置里的 agent 路径按本机实际安装改写
+        configure_copyq_hidden_window # 隐藏 copyq 启动窗口，避免平铺桌面弹出空白主窗口
     fi
 
     # Fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
@@ -4977,7 +5002,7 @@ ensure_gdm_only() {
         log "$(_t "Installing gdm (display manager only — no GNOME desktop)..." "Installing gdm (display manager only, no GNOME desktop)...")"
         # --setopt=install_weak_deps=False keeps "Recommends"-style extras out (e.g.
         # gnome-tour). Explicit package name only: never "group install gnome-desktop".
-        exe dnf install -y --setopt=install_weak_deps=False gdm 2>>"$LOG_DIR/dnf-errors.log" \
+        exe dnf install -y --allowerasing --setopt=install_weak_deps=False gdm 2>>"$LOG_DIR/dnf-errors.log" \
             || pm_install gdm || return 1
     fi
 

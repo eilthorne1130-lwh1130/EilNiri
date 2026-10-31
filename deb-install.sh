@@ -411,6 +411,10 @@ DISABLE_SYS=(
     # --- KDE screen locker (replaced by hyprlock + hypridle) ---
     "systemunit|kscreenlocker.service|KDE screen locker (replaced by hyprlock)"
     "autostart|kscreenlocker.desktop|KDE screen locker (replaced by hyprlock)"
+
+    # --- XWayland video bridge (KDE autostart creates a dummy white window in tiled Wayland) ---
+    "autostart|org.kde.xwaylandvideobridge.desktop|Xwayland video bridge"
+    "autostart|xwaylandvideobridge.desktop|Xwayland video bridge"
 )
 
 

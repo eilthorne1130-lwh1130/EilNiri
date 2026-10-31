@@ -295,7 +295,7 @@ spawn-at-startup "waybar"
 spawn-at-startup "/usr/lib/polkit-gnome-authentication-agent-1"
 spawn-at-startup "mako"
 spawn-at-startup "fcitx5"
-spawn-at-startup "copyq" "--start-server"
+spawn-at-startup "copyq" "--start-server" "hide"
 // spawn-at-startup "hyprlock"  // do not lock immediately; hypridle handles idle lock
 spawn-at-startup "hypridle"
 spawn-at-startup "awww-daemon"
@@ -307,7 +307,7 @@ spawn-at-startup "awww-daemon"
 
 hotkey-overlay {
     // Uncomment this line to disable the "Important Hotkeys" pop-up at startup.
-    // skip-at-startup
+    skip-at-startup
 }
 
 // Uncomment this line to ask the clients to omit their client-side decorations if possible.
@@ -394,6 +394,26 @@ window-rule {
     match app-id=r#"^gsimplecal$"#
     open-floating true
     geometry-corner-radius 14
+}
+
+// Xwayland Video Bridge (KDE background capture tool — suppress dummy window)
+window-rule {
+    match app-id=r#"^org\.kde\.xwaylandvideobridge$"#
+    match title=r#"^Wayland to X11 video bridge$"#
+    open-floating true
+    default-column-width { fixed 0; }
+    default-window-height { fixed 0; }
+    opacity 0.0
+}
+
+// CopyQ clipboard manager: open as floating window
+window-rule {
+    match app-id=r#"^com\.github\.hluk\.copyq$"#
+    match app-id=r#"^copyq$"#
+    match title=r#"^CopyQ"#
+    open-floating true
+    default-column-width { fixed 600; }
+    default-window-height { fixed 500; }
 }
 
 // Example: block out two password managers from screen capture.

@@ -323,6 +323,10 @@ DISABLE_SYS=(
     # --- KDE screen locker (replaced by hyprlock + hypridle) ---
     "systemunit|kscreenlocker.service|KDE screen locker (replaced by hyprlock)"
     "autostart|kscreenlocker.desktop|KDE screen locker (replaced by hyprlock)"
+
+    # --- XWayland video bridge (KDE autostart creates a dummy white window in tiled Wayland) ---
+    "autostart|org.kde.xwaylandvideobridge.desktop|Xwayland video bridge"
+    "autostart|xwaylandvideobridge.desktop|Xwayland video bridge"
 )
 
 
@@ -1890,6 +1894,26 @@ fix_polkit_agent() {
     warn "$(_t "No polkit agent found — GUI privilege prompts (disks, users...) will not appear." "No polkit agent found — GUI privilege prompts (disks, users...) will not appear.")"
 }
 
+configure_copyq_hidden_window() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local _cqconf="$HOME_DIR/.config/copyq/copyq.conf"
+    mkdir -p "$(dirname "$_cqconf")"
+    if [ ! -f "$_cqconf" ]; then
+        printf '[General]\nhide_main_window=true\n' > "$_cqconf"
+        log "$(_t "Created ~/.config/copyq/copyq.conf (hide_main_window=true; no CopyQ window at startup)" "Created ~/.config/copyq/copyq.conf (hide_main_window=true; no CopyQ window at startup)")"
+    elif ! grep -q '^hide_main_window=true' "$_cqconf" 2>/dev/null; then
+        if grep -q '^hide_main_window=' "$_cqconf" 2>/dev/null; then
+            sed -i 's/^hide_main_window=.*/hide_main_window=true/' "$_cqconf" 2>/dev/null || true
+        elif grep -q '^\[General\]' "$_cqconf" 2>/dev/null; then
+            sed -i '0,/^\[General\]/s//&\nhide_main_window=true/' "$_cqconf" 2>/dev/null || true
+        else
+            sed -i '1i [General]\nhide_main_window=true' "$_cqconf" 2>/dev/null || true
+        fi
+        log "$(_t "Set hide_main_window=true in ~/.config/copyq/copyq.conf (no CopyQ window at startup)" "Set hide_main_window=true in ~/.config/copyq/copyq.conf (no CopyQ window at startup)")"
+    fi
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cqconf" 2>/dev/null || true
+}
+
 # Privacy guard: configs/ ships shareable dotfiles and must never carry clipboard
 # history, input-method user data or other personal traces. Anything matching these
 # patterns is skipped (with a warning) instead of deployed — e.g. CopyQ's
@@ -2077,6 +2101,7 @@ stage_configs() {
         _ensure_waypaper_desktop   # pip 装的 waypaper 无 .desktop → fuzzel 无图标
         ensure_hyprlock_pam        # hyprlock 包可能不带 PAM 文件 → 锁屏无法验证密码
         fix_polkit_agent           # niri 配置里的 agent 路径按本机实际安装改写
+        configure_copyq_hidden_window # 隐藏 copyq 启动窗口，避免平铺桌面弹出空白主窗口
     fi
 
     # fcitx5 IME environment variables: ~/.pam_environment is disabled by default on
