@@ -4,14 +4,15 @@
 #
 #   One-click niri desktop setup for a fresh Fedora / Rocky / Alma / CentOS Stream / RHEL system.
 #   Packages come from a built-in list and the script installs everything:
-#   niri/awww/satty builds, the Chinese IME (IBus: ibus-rime + rime-ice where
-#   packaged, ibus-libpinyin fallback otherwise; fcitx5 has no EL package), display manager (replacing any existing one), services and
+#   niri/awww/satty builds, the Chinese IME (Fcitx5 + rime-ice: official RPMs on
+#   Fedora, source build on EL where no fcitx5 RPM exists), display manager (replacing any existing one), services and
 #   config deploy. Desktop config is optional and read from the repo's
 #   configs/.config/ if you choose to ship any.
 #
-#   IME note: Debian/Arch builders keep Fcitx5 + Rime; this RHEL builder uses the
-#   IBus stack because it is the only one fully packaged for EL (ibus/ibus-gtk3/
-#   ibus-gtk4 in AppStream, ibus-rime/librime/brise in EPEL) — nothing is compiled.
+#   IME note: all three builders (Arch/Debian/RHEL) now use the SAME Fcitx5 + Rime
+#   stack — configs/.config/fcitx5 is deployed verbatim (左Shift 切换中英文).
+#   Fedora installs fcitx5* RPMs; on EL install_fcitx5_ime compiles
+#   xcb-imdkit + fcitx5 + fcitx5-gtk + fcitx5-rime from source (librime from EPEL).
 #
 #   Usage:
 #     ./RHEL-install.sh restore [--dry-run]     restore on new system (root)
@@ -232,18 +233,16 @@ declare -A GROUP_PKGS=(
     [clip]="copyq satty grim slurp"
     [media]="playerctl brightnessctl btop"
     [audio]="pipewire-pulse wireplumber"
-    # IME: IBus (NOT fcitx5). fcitx5 exists in NO EL repository (verified 2026-10:
-    # absent from EPEL 10, no COPR epel-10 chroot) whereas the IBus stack ships in
-    # the base OS on both Fedora and EL: ibus/ibus-gtk3/ibus-gtk4/ibus-wayland/
-    # ibus-libpinyin come from AppStream, ibus-panel from CRB, and the Rime engine
-    # (ibus-rime + librime + librime-lua + brise) from EPEL. Nothing is compiled.
-    # Engine = ibus-rime, dictionary = rime-ice (same Rime data files as the fcitx5
-    # build used, different host dir).
-    # NOTE: ibus-panel is listed explicitly — the ibus RPM only Requires it when a
-    # known panel host is installed (gnome/kde/sway/hyprland/waybar...), and niri is
-    # not on that list, so without it /usr/libexec/ibus-ui-gtk3 would be missing and
-    # ibus-daemon would abort with "Can not execute default panel program".
-    [ime]="ibus ibus-panel ibus-gtk3 ibus-gtk4 ibus-wayland ibus-qt ibus-rime rime-ice-pinyin-git"
+    # IME: Fcitx5 (back by popular demand — the fcitx5 config in
+    # configs/.config/fcitx5 is the native one this dotfiles shipped all along:
+    # 左Shift 切中英 / page size 5 / rime engine). Two lanes:
+    #   Fedora  -> everything above is an official-repo RPM (incl. fcitx5-rime).
+    #   EL      -> NO fcitx5 RPM exists anywhere (EPEL/COPR verified), so
+    #              install_fcitx5_ime builds xcb-imdkit + fcitx5 + fcitx5-gtk +
+    #              fcitx5-rime from source (librime from EPEL where available).
+    # rime-ice-pinyin-git = the 雾凇拼音 dictionary, deployed by install_rime_ice
+    # into ~/.local/share/fcitx5/rime regardless of how the engine got there.
+    [ime]="fcitx5 fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git"
     [fonts]="ttf-jetbrains-mono-nerd wqy-zenhei"
     [keyring]="gnome-keyring"
 )
@@ -275,23 +274,9 @@ declare -A RHEL_MAP=(
 # RHEL-family package names vary between EPEL, Fedora-derived COPRs, and EL10.
 # Resolve these candidates against the enabled repositories before installing.
 declare -A RHEL_CANDIDATES=(
-    # --- IBus IME stack (see GROUP_PKGS[ime] — fcitx5 is unavailable on EL) ---
-    # Engine backend: ibus-rime (EPEL 10 / Fedora official) pulls librime; brise
-    # ships the stock Rime schemas that rime-ice's default.custom.yaml falls back
-    # to, and librime-lua provides /usr/lib64/rime-plugins/librime-lua.so which
-    # rime-ice's Lua filters require (its README asks for it manually on the Red Hat
-    # family). All three are kept as explicit fallback candidates (weak deps are not
-    # guaranteed on every release).
-    [ibus-rime]="ibus-rime librime librime-lua brise"
-    # Panel: ibus Requires it only when a known panel host is present and niri is
-    # not on that list, so the dependency is resolved explicitly. On EL 10 it lives
-    # in CRB (ensure_rhel_repos enables CRB before apps are installed).
-    [ibus-panel]="ibus-panel"
-    # Qt frontend: ibus-qt is Fedora-only (EPEL 10 never built it). Native Qt6
-    # Wayland apps use the compositor's text-input protocol and do not need it;
-    # only XWayland Qt apps degrade to XIM. Falls through to the RHEL_FAIL_HINT.
-    [ibus-qt]="ibus-qt ibus-qt5 ibus-qt4"
-    # Standalone polkit authentication agent. polkit-gnome is retired upstream and
+    # --- Fcitx5 IME stack (Fedora RPMs; on EL install_fcitx5_ime builds from
+    #     source — these candidate names are only used when an RPM lane exists) ---
+    # Panel: standalone polkit authentication agent. polkit-gnome is retired upstream and
     # packaged by neither Fedora nor EPEL; lxpolkit was merged into lxsession. Both
     # mates below are actively maintained and built for Fedora AND EPEL.
     [polkit-agent]="mate-polkit polkit-kde"
@@ -319,14 +304,15 @@ declare -A RHEL_COPR_PKG=(
 )
 # Packages expected from EPEL on EL10 (Fedora has them in the base repo).
 # After a failed dnf, retry with --enablerepo=epel* before COPR/source.
-RHEL_EPEL_PKGS=(copyq playerctl brightnessctl ibus-rime librime librime-lua brise power-profiles-daemon)
+# (librime is the EL10 engine backend for the fcitx5-rime source build.)
+RHEL_EPEL_PKGS=(copyq playerctl brightnessctl librime power-profiles-daemon)
 # Runtime graphics packages required by niri on EL systems.  These are separate
 # from the compiler dependencies below: a minimal Rocky/Alma install can build
 # niri successfully while still lacking Mesa/DRM support for a virtio GPU.
 RHEL_GRAPHICS_RUNTIME=(mesa-dri-drivers mesa-libGL mesa-libEGL mesa-libgbm libdrm mesa-vulkan-drivers)
 # Build/runtime packages used by optional RHEL components. Keep these names
 # separate from RHEL_MAP because they are dependency groups, not app aliases.
-RHEL_OPTIONAL_DEPS=(ibus-rime)
+RHEL_OPTIONAL_DEPS=(librime)
 # Packages with no official RPM -> go to the "manual install" report (value = reason/advice)
 # (awww/satty handled by install_awww / install_satty, rime-ice by install_rime_ice)
 declare -A RHEL_MANUAL=(
@@ -336,11 +322,12 @@ declare -A RHEL_MANUAL=(
 # NOTE: no hyprlock/hypridle entries — install_rhel routes them to
 # install_hypr_source via SOURCE_PKGS before this table is ever consulted.
 declare -A RHEL_FAIL_HINT=(
-    # ibus-qt never got an EPEL 10 build. Not fatal: GTK/Qt6-Wayland apps reach
-    # IBus through the IM modules / text-input protocol; only Qt apps running
-    # under XWayland need this plugin and fall back to the XIM protocol that
-    # ibus-daemon -x already provides.
-    [ibus-qt]="EL has no ibus-qt RPM (Fedora does). Harmless: XWayland Qt apps use XIM (ibus-daemon -x), native Wayland Qt apps use text-input."
+    # fcitx5-configtool needs KDE Frameworks bits that are heavy to build on EL;
+    # fcitx5-qt likewise needs qt6-qtbase-devel. Neither blocks Chinese input:
+    # native Wayland Qt6 apps reach fcitx5 through niri's text-input-v3 support,
+    # and the config shipped in this repo already sets everything up.
+    [fcitx5-configtool]="EL has no fcitx5-configtool build. Not fatal: the repo's configs/.config/fcitx5 config is deployed as-is; tweak files under ~/.config/fcitx5 manually."
+    [fcitx5-qt]="EL source lane skips fcitx5-qt. Not fatal: native Wayland Qt6 apps use text-input-v3 via niri; only XWayland Qt apps lose preedit."
 )
 # Packages installable via pip as a fallback (common to Arch/RHEL/Debian)
 declare -A PIP_PKGS=(
@@ -981,7 +968,7 @@ ensure_rhel_repos() {
             dnf makecache --refresh >/dev/null 2>&1 || true
             log "$(_t "Removed the broken EPEL repo from Fedora and refreshed the dnf cache" "Removed the broken EPEL repo and refreshed the dnf cache")"
         fi
-        log "$(_t "Fedora: the official repos cover every dependency (incl. ibus-rime) — skipping EPEL/CRB/COPR setup" "Fedora: official repos cover every dependency — skipping EPEL/CRB/COPR setup")"
+        log "$(_t "Fedora: the official repos cover every dependency (incl. the fcitx5 IME) — skipping EPEL/CRB/COPR setup" "Fedora: official repos cover every dependency — skipping EPEL/CRB/COPR setup")"
         # Keep the -testing repo self-heal: incomplete *-testing metadata on fresh
         # Fedora minors wedges dnf the same way it does on EL.
         local _trepo _tdisabled=0
@@ -1101,8 +1088,8 @@ ensure_rhel_repos() {
             if dnf repolist 2>/dev/null | grep -qiE '(^|/)epel'; then
                 log "$(_t "EPEL recovered after importing its signing key." "EPEL recovered after importing its signing key.")"
             else
-                warn "$(_t "EPEL is NOT active — packages that only EPEL carries (e.g. ibus-rime on EL10) will fall back or fail. Cause: see $LOG_DIR/dnf-errors.log" "EPEL is NOT active — EPEL-only packages will fall back or fail. See the error log.")"
-                MANUAL_ITEMS+=("EPEL 仓库未启用 — 手动执行 'sudo dnf install -y epel-release && sudo dnf clean all && sudo dnf makecache'；若报 GPG 错误: 'sudo rpm --import https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-10'。装好后重跑 restore 即可补上 ibus-rime")
+                warn "$(_t "EPEL is NOT active — packages that only EPEL carries (e.g. librime for the fcitx5-rime build on EL10) will fall back or fail. Cause: see $LOG_DIR/dnf-errors.log" "EPEL is NOT active — EPEL-only packages will fall back or fail. See the error log.")"
+                MANUAL_ITEMS+=("EPEL 仓库未启用 — 手动执行 'sudo dnf install -y epel-release && sudo dnf clean all && sudo dnf makecache'；若报 GPG 错误: 'sudo rpm --import https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-10'。装好后重跑 restore 即可补上 librime（fcitx5-rime 编译依赖）")
             fi
         fi
     fi
@@ -1256,14 +1243,14 @@ stage_apps_select() {
     load_app_universe
 
     # Chinese component selection
-    # The Chinese IME is IBus + Rime on this family (engine = ibus-rime from EPEL,
-    # dictionary = rime-ice). fcitx5 exists in no EL repository, so it is NOT an
-    # option here — that is the whole reason the script uses IBus. ibus / ibus-gtk3
-    # / ibus-gtk4 / ibus-wayland live in AppStream (base OS), only the Rime engine
-    # needs EPEL — which ensure_rhel_repos has already enabled at this point.
-    info_kv "$(_t "Chinese IME" "Chinese IME")" "IBus (rime, 或 libpinyin)" "$(_t "fcitx5 has no EL package; the engine is chosen from what the repos provide" "fcitx5 has no EL package; the engine is chosen from what the repos provide")"
-    if ! confirm "$(_t "Install Chinese IME (ibus+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):" "Install Chinese IME (ibus+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):")" "Y" 15; then
-        local _cn_exclude=(ibus ibus-gtk3 ibus-gtk4 ibus-qt ibus-rime rime-ice-pinyin-git wqy-zenhei)
+    # The Chinese IME is Fcitx5 + Rime on this family (engine = fcitx5-rime,
+    # dictionary = rime-ice), matching the Arch/Debian builders: the repo's
+    # configs/.config/fcitx5 is deployed verbatim (左Shift 切换中英文).
+    # Fedora installs the whole stack as official RPMs; on EL no fcitx5 RPM
+    # exists anywhere, so install_fcitx5_ime compiles it from source.
+    info_kv "$(_t "Chinese IME" "Chinese IME")" "Fcitx5 (rime)" "$(_t "official RPMs on Fedora; source build on EL" "official RPMs on Fedora; source build on EL")"
+    if ! confirm "$(_t "Install Chinese IME (fcitx5+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):" "Install Chinese IME (fcitx5+rime) and font (wqy-zenhei)? [Y/n] (default Y, 15s):")" "Y" 15; then
+        local _cn_exclude=(fcitx5 fcitx5-gtk fcitx5-qt fcitx5-rime rime-ice-pinyin-git wqy-zenhei)
         local _tmp_arr=() _p
         for _p in ${REPO_UNIVERSE[@]+"${REPO_UNIVERSE[@]}"}; do
             local _keep=1 _ex
@@ -1354,18 +1341,18 @@ install_rhel() {
             install_rime_ice
             continue
         fi
-        # EL has no fcitx5 packages at all (not in EPEL, no COPR epel-10 chroot —
-        # verified 2026-10), so the IME is IBus instead: ibus/ibus-gtk3/ibus-gtk4
-        # come from AppStream and the Rime engine (ibus-rime + librime + brise)
-        # from EPEL. The whole stack is RPM-packaged — nothing is compiled any
-        # more. install_ibus_ime runs ONCE, from the "ibus" entry, and covers the
-        # rest of the family (gtk/qt frontends, the rime engine and the non-
-        # interactive dconf/engine configuration); the other members are only
-        # bookkeeping here so the work is not repeated four times.
-        if [[ "$p" =~ ^ibus($|-) ]]; then
+        # The IME is Fcitx5 + Rime everywhere on this family (matching the Arch/
+        # Debian builders and the repo's own configs/.config/fcitx5). Fedora gets
+        # official RPMs; on EL — where NO fcitx5 RPM exists in any repo (verified
+        # 2026-10: not in EPEL, no COPR epel-10 chroot) — install_fcitx5_ime
+        # builds xcb-imdkit + fcitx5 + fcitx5-gtk + fcitx5-rime from source.
+        # It runs ONCE from the "fcitx5" entry and covers the whole [ime] group
+        # (gtk/qt frontends, the rime engine); the other members are bookkeeping
+        # here so the work is not repeated.
+        if [[ "$p" =~ ^fcitx5($|-) ]]; then
             case "$p" in
-                ibus) install_ibus_ime ;;
-                *)    SKIPPED_PKGS+=("$p (随 ibus 栈统一安装/配置)") ;;
+                fcitx5) install_fcitx5_ime ;;
+                *)    SKIPPED_PKGS+=("$p (随 fcitx5 栈统一安装/配置)") ;;
             esac
             continue
         fi
@@ -2515,345 +2502,178 @@ RIME_ICE_ZIP_URL="https://github.com/iDvel/rime-ice/releases/latest/download/ful
 RIME_IBUS_USER_DIR_SUFFIX=".config/ibus/rime"
 RIME_FCITX_USER_DIR_SUFFIX=".local/share/fcitx5/rime"
 
-# --- IBus IME stack (EL + Fedora) ---
-# Replaces the former fcitx5 source-build chain. Everything here is an RPM:
-#   ibus/ibus-libs/ibus-gtk3/ibus-gtk4/ibus-wayland/ibus-panel  -> AppStream (base OS)
-#   ibus-rime + librime + brise (stock Rime schemas)            -> EPEL 10 / Fedora
-# Called ONCE from install_rhel when the "ibus" entry is selected; covers the whole
-# [ime] group. The per-user runtime knobs live in two places:
-#   * /etc/dconf/db/ibus.d/00-eilniri-ime — the ibus dconf profile is
-#     "user-db:user + system-db:ibus" (shipped by the ibus RPM), so a system db
-#     entry is the ONE way to preconfigure IBus non-interactively as root; the
-#     user's own ~/.config/dconf/user still has priority for later changes.
-#   * ~/.config/ibus/rime/{default.custom.yaml,ibus_rime.yaml} — Rime frontend
-#     behaviour (the rime data itself is deployed by install_rime_ice).
-# IBUS_DCONF_KEYFILE / IBUS_IME_CONF are shared with stage_configs (env fallback).
-IBUS_DCONF_KEYFILE="/etc/dconf/db/ibus.d/00-eilniri-ime"
-IBUS_IME_CONF=""
-IBUS_CONFIG_DONE=0
-IBUS_ENGINE=""        # resolved by _ibus_pick_engine: "rime" | "libpinyin" | ""
-IBUS_DICT_READY=0     # 1 once rime-ice landed in ~/.config/ibus/rime
-IBUS_RIME_FAILED=0    # 1 after rime was proven unavailable (skips pointless retries)
+# --- Fcitx5 IME stack (all RHEL family) ---
+# The IME is Fcitx5 + Rime on every lane, matching the Arch/Debian builders and
+# the repo's own configs/.config/fcitx5 snapshot (deployed verbatim by
+# stage_configs: 左Shift 切换中英文, page size 5, rime engine). Two lanes:
+#   Fedora -> official RPMs: fcitx5 fcitx5-gtk fcitx5-qt fcitx5-rime
+#            fcitx5-configtool. Nothing is compiled.
+#   EL     -> NO fcitx5 RPM exists in any repo (verified 2026-10: not in EPEL,
+#            no COPR epel chroot), so _fcitx5_source_build compiles
+#            xcb-imdkit -> fcitx5 -> fcitx5-gtk -> fcitx5-rime, using the
+#            librime RPM from EPEL 10 (on EPEL 9, which has no librime either,
+#            librime is built from source as well). fcitx5-qt and
+#            fcitx5-configtool are skipped on EL (heavy Qt6/KF5 deps); native
+#            Wayland Qt6 apps reach fcitx5 through niri's text-input-v3.
+# Called ONCE from install_rhel via the "fcitx5" entry; covers the whole [ime]
+# group. Runtime per-user config = ~/.config/fcitx5 (repo snapshot) + the rime
+# user dir; IME env vars are written by stage_configs (environment.d +
+# /etc/environment), and _fcitx5_strip_ibus_leftovers removes this script's
+# former IBus lane so the two can never fight.
+FCITX5_DONE=0          # 1 once this lane ran (idempotency across [ime] entries)
+FCITX5_RIME_READY=0    # 1 once a rime-capable engine is on disk
 
-install_ibus_ime() {
+# Source-build pins (same rationale as SOURCE_TAG/hypr_git_ref: master chases
+# new dependency floors, release tags build reliably on old distros). All are
+# versions widely shipped by distros in 2026, so the sources are well exercised.
+FCITX5_XCB_IMDKIT_TAG="1.0.9"
+FCITX5_CORE_TAG="5.1.19"
+FCITX5_GTK_TAG="5.1.6"
+FCITX5_RIME_TAG="5.1.13"
+FCITX5_LIBRIME_TAG="1.11.2"
+
+install_fcitx5_ime() {
+    [ "${FCITX5_DONE:-0}" -eq 1 ] && return 0
     if [ "$DRY_RUN" -eq 1 ]; then
-        DRY_PKGS+=("ibus ibus-panel ibus-gtk3 ibus-gtk4 ibus-wayland ibus-rime (RPM stack + dconf/engine config)")
+        if [ "${DISTRO_ID:-}" = fedora ]; then
+            DRY_PKGS+=("fcitx5 fcitx5-gtk fcitx5-qt fcitx5-rime fcitx5-configtool (official RPMs)")
+        else
+            DRY_PKGS+=("fcitx5 stack (source build: xcb-imdkit + fcitx5 + fcitx5-gtk + fcitx5-rime)")
+        fi
         return "$DRY_RUN_RC"
     fi
+    FCITX5_DONE=1
 
-    # 1) Install the IBus base stack. These are all in the BASE repositories on
-    #    every supported release (AppStream, plus ibus-panel from CRB on EL10), so
-    #    this part never depends on EPEL. Tolerant: a missing optional member
-    #    (ibus-qt on EL) must not abort the IME.
-    local pkgs=(ibus ibus-panel ibus-gtk3 ibus-gtk4 ibus-wayland)
-    [ "$DISTRO_ID" != fedora ] || pkgs+=(ibus-qt)
-    log "$(_t "Installing the IBus framework (RPM packages from the base repo, nothing is compiled)..." "Installing the IBus framework (RPM packages from the base repo, nothing is compiled)...")"
-    dnf_install_tolerant "${pkgs[@]}" || true
-    if pkg_installed ibus; then
-        INSTALLED_PKGS+=("ibus (RPM)")
-        RESOLVED_PKG_NAME["ibus"]="ibus"
-    else
-        FAILED_PKGS+=("dnf:ibus (IBus 输入法框架未安装成功，中文输入不可用；见 $LOG_DIR/dnf-errors.log)")
-        return 1
-    fi
-    # The panel is what reads preload-engines and activates the first engine, and
-    # ibus-daemon refuses to start without it — check it explicitly.
-    if pkg_installed ibus-panel || [ -x /usr/libexec/ibus-ui-gtk3 ]; then
-        INSTALLED_PKGS+=("ibus-panel (RPM)")
-    else
-        MANUAL_ITEMS+=("ibus-panel — 未安装（EL10 在 CRB 仓库）。缺它时 ibus-daemon 会报 \"Can not execute default panel program\" 而退出，中文输入无法激活；手动: sudo dnf install --enablerepo=crb ibus-panel")
-    fi
-
-    # 2) Engine chain. rime is PREFERRED (it carries the rime-ice dictionary), but
-    #    it is packaged only on Fedora and EPEL 10 / EPEL 8 — EPEL 9 never built
-    #    it, so on EL9 no amount of EPEL tuning can install it. Hence the fallback:
-    #    ibus-libpinyin, which sits in the base AppStream repo of EL9/EL10/Fedora.
-    #    Net effect: every supported release ends up with a working Chinese IME.
-    log "$(_t "Installing the Rime engine (ibus-rime — EPEL on EL, official on Fedora)..." "Installing the Rime engine (ibus-rime)...")"
-    dnf_install_tolerant ibus-rime librime librime-lua brise || true
-    if [ "$DISTRO_ID" != fedora ] && ! pkg_installed ibus-rime; then
-        log "$(_t "Retrying ibus-rime with EPEL enabled explicitly..." "Retrying ibus-rime with EPEL enabled explicitly...")"
-        exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' ibus-rime librime librime-lua brise \
-            2>>"$LOG_DIR/dnf-errors.log" || true
-    fi
-    if pkg_installed ibus-rime || _ibus_pick_engine 2>/dev/null | grep -qx rime; then
-        INSTALLED_PKGS+=("ibus-rime (RPM)")
-        log "$(_t "Rime engine ready — the 雾凇拼音 dictionary will be deployed next." "Rime engine ready — the rime-ice dictionary will be deployed next.")"
-    else
-        # Remember the failure so install_rime_ice / ibus_write_ime_config do not
-        # repeat the identical dnf attempts (they would all fail the same way).
-        IBUS_RIME_FAILED=1
-        # Diagnose WHY before falling back, so the message is actionable.
-        local _el_major="" _epel_ok=0
-        _el_major=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1)
-        if dnf repolist 2>/dev/null | grep -qiE '(^|/)epel'; then _epel_ok=1; fi
-        if [ "$DISTRO_ID" != fedora ] && [ "$_el_major" = "9" ]; then
-            warn "$(_t "ibus-rime is not available on EL9 at all (EPEL 9 has no librime/ibus-rime — verified 2026-10). Falling back to ibus-libpinyin (base repo)." "ibus-rime is not available on EL9 at all. Falling back to ibus-libpinyin.")"
-        elif [ "$DISTRO_ID" != fedora ] && [ "$_epel_ok" -eq 0 ]; then
-            warn "$(_t "ibus-rime needs EPEL, and EPEL is NOT active on this system — falling back to ibus-libpinyin (base repo). Run 'sudo dnf install -y epel-release && sudo dnf clean all && sudo dnf makecache', then rerun restore to get rime + the rime-ice dictionary." "ibus-rime needs EPEL and EPEL is not active — falling back to ibus-libpinyin. Install epel-release and rerun restore for rime.")"
-            MANUAL_ITEMS+=("EPEL 未启用，因此没装上 ibus-rime（已自动降级 ibus-libpinyin）。修复: 'sudo dnf install -y epel-release && sudo dnf clean all && sudo dnf makecache' 后重跑 restore → 自动换成 rime + 雾凇拼音")
+    if [ "${DISTRO_ID:-}" = fedora ]; then
+        log "$(_t "Installing the Fcitx5 IME framework (official RPMs)..." "Installing the Fcitx5 IME framework (official RPMs)...")"
+        dnf_install_tolerant fcitx5 fcitx5-gtk fcitx5-qt fcitx5-rime fcitx5-configtool || true
+        if ! pkg_installed fcitx5; then
+            FAILED_PKGS+=("dnf:fcitx5 (IBus 之后的输入法框架未安装成功，中文输入不可用；见 $LOG_DIR/dnf-errors.log)")
+            return 1
+        fi
+        INSTALLED_PKGS+=("fcitx5 (RPM)")
+        if pkg_installed fcitx5-rime; then
+            INSTALLED_PKGS+=("fcitx5-rime (RPM)")
         else
-            warn "$(_t "ibus-rime could not be installed from the enabled repos — falling back to ibus-libpinyin (base repo). Cause is in $LOG_DIR/dnf-errors.log." "ibus-rime could not be installed from the enabled repos — falling back to ibus-libpinyin.")"
+            warn "$(_t "fcitx5-rime did not install — the rime-ice dictionary will not be usable. See $LOG_DIR/dnf-errors.log" "fcitx5-rime did not install — the rime-ice dictionary will not be usable.")"
         fi
-        log "$(_t "Installing the fallback pinyin engine (ibus-libpinyin, base AppStream repo)..." "Installing the fallback pinyin engine (ibus-libpinyin)...")"
-        dnf_install_tolerant ibus-libpinyin || true
-        if pkg_installed ibus-libpinyin || _ibus_pick_engine 2>/dev/null | grep -qx libpinyin; then
-            INSTALLED_PKGS+=("ibus-libpinyin (RPM, rime fallback)")
-            success "$(_t "ibus-libpinyin installed — Chinese input works, but with the libpinyin engine (no rime-ice dictionary)." "ibus-libpinyin installed — Chinese input works (libpinyin engine, no rime-ice dictionary).")"
-            MANUAL_ITEMS+=("rime-ice 词典未部署 — 当前用 ibus-libpinyin 整句拼音。若想要雾凇拼音：在 EPEL 10+/Fedora 上安装 ibus-rime 后重跑 restore（EL9 官方无 ibus-rime，需自行编译）")
-        else
-            FAILED_PKGS+=("ibus engine (rime 与 libpinyin 均未装成 — 中文输入不可用；见 $LOG_DIR/dnf-errors.log)")
-        fi
+    else
+        _fcitx5_source_build || return 1
     fi
-
-    # 3) Non-interactive configuration. Runs LAST so it writes the engine that
-    #    actually got installed (rime, or libpinyin on EL9). A working engine list
-    #    is the difference between "IBus runs" and "the user must run ibus-setup".
-    ibus_write_ime_config
-    success "$(_t "IBus ready (engine: ${IBUS_ENGINE:-none})" "IBus ready (engine: ${IBUS_ENGINE:-none})")"
+    if [ "$FCITX5_RIME_READY" -eq 0 ] && _fcitx5_engine_ready; then
+        FCITX5_RIME_READY=1
+    fi
+    success "$(_t "Fcitx5 ready (rime engine: ${FCITX5_RIME_READY})" "Fcitx5 ready")"
     return 0
 }
 
-# Write every non-package piece of the IBus setup. Idempotent, so it is safe to
-# call from more than one place: install_ibus_ime (the [ime] group) and
-# install_rime_ice (when only the dictionary entry was selected — without this the
-# engine would be installed but never configured).
-ibus_write_ime_config() {
-    [ "$DRY_RUN" -eq 1 ] && return 0
-    # Called from both the [ime] group and the dictionary entry, and rpm/dconf work
-    # is not free — do it once per run.
-    [ "${IBUS_CONFIG_DONE:-0}" -eq 1 ] && return 0
-    IBUS_CONFIG_DONE=1
-    _ibus_write_dconf_profile || true
-    # Rime is the preferred engine (it carries the rime-ice dictionary). Make one
-    # last attempt here when it is still missing — this function is the end of the
-    # IME setup, so it is the right place to try before falling back. Skipped when
-    # an earlier step already proved rime unavailable on this release.
-    if [ "${IBUS_RIME_FAILED:-0}" -eq 0 ] \
-        && ! _ibus_pick_engine 2>/dev/null | grep -qx rime && ! pkg_installed ibus-rime; then
-        dnf_install_tolerant ibus-rime librime librime-lua brise || true
-        if [ "$DISTRO_ID" != fedora ] && ! pkg_installed ibus-rime; then
-            exe dnf install -y --enablerepo='epel*' --enablerepo='*epel*' ibus-rime librime brise \
-                2>>"$LOG_DIR/dnf-errors.log" || true
-        fi
-        if ! pkg_installed ibus-rime && ! _ibus_pick_engine 2>/dev/null | grep -qx rime; then
-            IBUS_RIME_FAILED=1
-        fi
-    fi
-    # Decide the engine from what actually landed on disk, NOT from what we tried
-    # to install: on EL9 ibus-rime does not exist at all, so hard-coding "rime"
-    # here would leave the desktop with no working Chinese input.
-    local _eng _tmp
-    _eng=$(_ibus_pick_engine || true)
-    if [ -z "$_eng" ]; then
-        # No engine at all: last-ditch fallback, the base repo always has libpinyin.
-        log "$(_t "No engine yet — installing the ibus-libpinyin fallback..." "No engine yet — installing the ibus-libpinyin fallback...")"
-        dnf_install_tolerant ibus-libpinyin || true
-        _eng=$(_ibus_pick_engine || true)
-    fi
-    if [ -z "$_eng" ]; then
-        warn "$(_t "No usable IBus engine found (neither ibus-rime nor ibus-libpinyin) — Chinese input will not work." "No usable IBus engine found (neither ibus-rime nor ibus-libpinyin) — Chinese input will not work.")"
-        MANUAL_ITEMS+=("IBus 引擎缺失 — 装 rime（EL10 需 EPEL: sudo dnf install ibus-rime）或后备引擎（任意版本官方源: sudo dnf install ibus-libpinyin）后重跑 restore")
-        return 0
-    fi
-    log "$(_t "IBus engine in use: " "IBus engine in use: ")$_eng"
-    IBUS_ENGINE="$_eng"
-    # dconf keyfile is rendered to a temp file first so a partial write can never
-    # corrupt the system db input.
-    _tmp="$IBUS_IME_CONF"
-    if [ -z "$_tmp" ] || [ ! -f "$_tmp" ]; then
-        _tmp="$(mktemp)"; register_temp_path "$_tmp"
-        IBUS_IME_CONF="$_tmp"
-    fi
-    if _ibus_render_config "$_eng" > "$_tmp" 2>/dev/null; then
-        _ibus_install_system_dconf "$_tmp" || true
-    fi
-    _ibus_deploy_user_config || true
-    _ibus_ensure_engine_component || true
-    return 0
-}
-
-# Copy the repo's IBus snapshot into the user's ~/.config/ibus.
-_ibus_deploy_user_config() {
-    [ -n "${HOME_DIR:-}" ] || return 0
-    local snap="${BASE_DIR:-}/configs/.config/ibus"
-    [ -d "$snap" ] || return 0
-    local _ibd="$HOME_DIR/.config/ibus" _own
-    _own="$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
-    mkdir -p "$_ibd"
-
-    # ~/.config/ibus/config — a human-readable snapshot of the dconf values
-    # (IBus itself ignores it). Refreshed when it differs, with a backup.
-    if [ -f "$snap/config" ]; then
-        if [ -f "$_ibd/config" ] && ! cmp -s "$snap/config" "$_ibd/config"; then
-            cp -f "$_ibd/config" "$_ibd/config.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
-        fi
-        cp -f "$snap/config" "$_ibd/config" 2>/dev/null || true
-        chmod 0644 "$_ibd/config" 2>/dev/null || true
-        chown "$_own" "$_ibd/config" 2>/dev/null || true
-    fi
-
-    # Rime user config (default.custom.yaml / ibus_rime.yaml) is written by
-    # install_rime_ice when absent, so a user's own tuning is never overwritten.
-    log "$(_t "Deployed ~/.config/ibus config snapshot" "Deployed ~/.config/ibus config snapshot")"
-    return 0
-}
-
-# Register the Rime engine if (and only if) the RPM did not. The engine name MUST
-# stay "rime" — it is what the dconf preload-engines value refers to.
-_ibus_ensure_engine_component() {
-    [ -n "${HOME_DIR:-}" ] || return 0
-    [ -f /usr/share/ibus/component/rime.xml ] && return 0
-    local _bin=""
-    if command -v rpm >/dev/null 2>&1 && pkg_installed ibus-rime; then
-        _bin=$(rpm -ql ibus-rime 2>/dev/null | grep -m1 '/ibus-engine-rime$')
-    fi
-    [ -n "$_bin" ] || _bin=$(find /usr/libexec /usr/lib /usr/lib64 -maxdepth 3 -name 'ibus-engine-rime' -type f 2>/dev/null | head -n 1)
-    local _icon=""
-    _icon=$(find /usr/share/ibus-rime /usr/share/ibus -maxdepth 3 -name 'rime.png' 2>/dev/null | head -n 1)
-    if [ -z "$_bin" ]; then
-        # No rime engine: on the libpinyin fallback path there is nothing to
-        # register (ibus-libpinyin ships its own component XML), so this is only
-        # worth a quiet note — not a warning that looks like a broken install.
-        log "$(_t "No ibus-rime binary found — skipping the Rime engine registration (fallback engine path)." "No ibus-rime binary found — skipping the Rime engine registration.")"
-        return 0
-    fi
-    [ -n "$_icon" ] || _icon="/usr/share/ibus-rime/icons/rime.png"
-    local _cdir="$HOME_DIR/.config/ibus/component"
-    mkdir -p "$_cdir"
-    cat > "$_cdir/rime.xml" <<EOF
-<?xml version="1.0" encoding="utf-8"?>
-<!-- eilNiri: fallback engine registration for ibus-rime (the RPM normally ships
-     this as /usr/share/ibus/component/rime.xml). Generated from the detected
-     binary path $_bin -->
-<component>
-	<name>im.rime.Rime</name>
-	<description>Rime Component</description>
-	<exec>$_bin --ibus</exec>
-	<version>1.0</version>
-	<author>GONG Chen &lt;chen.sst@gmail.com&gt;</author>
-	<license>GPL</license>
-	<homepage>https://rime.im</homepage>
-	<textdomain>ibus-rime</textdomain>
-	<engines>
-		<engine>
-			<name>rime</name>
-			<language>zh</language>
-			<license>GPL</license>
-			<author>GONG Chen &lt;chen.sst@gmail.com&gt;</author>
-			<icon>$_icon</icon>
-			<layout>default</layout>
-			<longname>Rime</longname>
-			<description>Rime Input Method Engine</description>
-			<rank>0</rank>
-			<symbol>&#x37A2;</symbol>
-		</engine>
-	</engines>
-</component>
-EOF
-    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$_cdir" 2>/dev/null || true
-    log "$(_t "Wrote the fallback IBus engine registration (~/.config/ibus/component/rime.xml)" "Wrote the fallback IBus engine registration")"
-    return 0
-}
-
-# dconf profile for IBus: "user-db:user + system-db:ibus". Shipped by the ibus RPM;
-# recreated here only if a minimal/derived image lost it (dconf aborts on an
-# unresolvable DCONF_PROFILE=ibus, which would break IBus configuration entirely).
-_ibus_write_dconf_profile() {
-    local p="/etc/dconf/profile/ibus"
-    [ -f "$p" ] && return 0
-    mkdir -p /etc/dconf/profile
-    printf 'user-db:user\nsystem-db:ibus\n' > "$p"
-    log "$(_t "Recreated /etc/dconf/profile/ibus" "Recreated /etc/dconf/profile/ibus")"
-}
-
-# Render the IBus settings as a dconf keyfile on stdout. Mirrors the values the
-# fcitx5 config used to carry (see configs/.config/ibus/README.md for the mapping).
-# $1 = engine name: "rime" (preferred, needs ibus-rime) or "libpinyin" (fallback
-#      engine, shipped by the base AppStream repo on EL9/EL10/Fedora).
-_ibus_render_config() { # $1 = engine name
-    local _eng="${1:-rime}"
-    cat <<DCONFEOF
-# eilNiri: IBus IME defaults (managed file — rerun restore to regenerate)
-# Group names are dconf paths; /desktop/ibus/... is what gsettings calls
-# org.freedesktop.ibus.*
-[general]
-# Input sources: the engine this script could actually install.
-#   rime      = ibus-rime (EPEL 10 / Fedora); dictionary = rime-ice 雾凇拼音
-#   libpinyin = ibus-libpinyin (AppStream on EL9/EL10/Fedora); no rime dictionary
-# The engine owns the US/ASCII state internally, which is why no separate
-# keyboard-us entry is needed.
-preload-engines=['${_eng}']
-engines-order=['${_eng}']
-# Mirrors fcitx5 'ActiveByDefault=False' + Shift toggling inside the engine.
-enable-by-default=false
-# Share the IME state between windows (fcitx5 ShareInputState=No -> false).
-use-global-engine=false
-# fcitx5 PreeditEnabledByDefault=False kept the composition OUT of the app's
-# entry field; false here does the same for engines that honour it (Rime is
-# configured separately in ~/.config/ibus/rime/ibus_rime.yaml).
-embed-preedit-text=false
-# fcitx5 OverrideXkbOption=False — use the compositor's XKB layout as-is.
-use-system-keyboard-layout=true
-
-[general/hotkey]
-# fcitx5 TriggerKeys=Shift+Shift_L / AltTriggerKeys=Shift_L are Rime-level
-# (ascii_mode) and stay inside the engine; these are the IBus-level switches.
-trigger=['Control+space']
-# fcitx5 EnumerateGroupForwardKeys=Super+space
-triggers=['<Super>space']
-next-engine=['Alt+Shift_L']
-prev-engine=['Control+Shift_L']
-
-[panel]
-# fcitx5 conf/classicui.conf "Vertical Candidate List=False" -> horizontal.
-lookup-table-orientation=0
-# Do not pop the language property panel on every focus change.
-show=0
-DCONFEOF
-}
-
-# Which engine did this machine actually end up with? Echoes "rime",
-# "libpinyin" or "" (neither). This is the single place that decides the engine,
-# so ibus-rime being unavailable never leaves the desktop without Chinese input:
-#   rime      -> EPEL 10 / Fedora (EPEL 9 has NO ibus-rime: never built there)
-#   libpinyin -> AppStream on EL9/EL10/Fedora — the always-available fallback
-#   ""        -> nothing usable, the caller reports it
-_ibus_pick_engine() {
-    # 1) Rime: the preferred engine (carries the rime-ice dictionary).
-    if pkg_installed ibus-rime || pkg_installed librime \
-        || [ -f /usr/libexec/ibus-rime/ibus-engine-rime ] \
-        || find /usr/lib64 /usr/lib -maxdepth 1 -name 'libRime*' -print -quit 2>/dev/null | grep -q .; then
-        printf 'rime\n'
-        return 0
-    fi
-    # 2) libpinyin: in the base repo on every supported release.
-    if pkg_installed ibus-libpinyin || [ -f /usr/share/ibus/component/libpinyin.xml ] \
-        || find /usr/lib/ibus /usr/lib64/ibus -maxdepth 1 -iname '*libpinyin*' -print -quit 2>/dev/null | grep -q .; then
-        printf 'libpinyin\n'
-        return 0
-    fi
-    printf '\n'
+# Is a rime-capable engine on disk? (RPM name, or the addon .so from a build.)
+_fcitx5_engine_ready() {
+    pkg_installed fcitx5-rime && return 0
+    [ -n "$(find /usr/lib64/fcitx5 /usr/lib/fcitx5 -name 'fcitx5-rime.so' -print -quit 2>/dev/null)" ] && return 0
     return 1
 }
 
-# Install the rendered keyfile into the system dconf db of the ibus profile and
-# compile it. dconf ships system databases as compiled blobs built from the
-# <db>.d/* text keyfiles by `dconf update`.
-_ibus_install_system_dconf() { # $1 = rendered keyfile
-    local src="$1"
-    [ -s "$src" ] || return 0
-    mkdir -p /etc/dconf/db/ibus.d
-    install -m 0644 "$src" "$IBUS_DCONF_KEYFILE" || return 1
-    if command -v dconf >/dev/null 2>&1; then
-        if exe dconf update; then
-            log "$(_t "IBus defaults written to the system dconf db (/etc/dconf/db/ibus.d)" "IBus defaults written to the system dconf db")"
-        else
-            warn "$(_t "dconf update failed — IBus defaults are on disk but not compiled; run 'sudo dconf update' manually." "dconf update failed — run 'sudo dconf update' manually.")"
-        fi
-    else
-        warn "$(_t "dconf tool not found — run 'sudo dconf update' once the dconf package is available." "dconf tool not found — run 'sudo dconf update'.")"
+# Generic clone + cmake build + install. Tag forms with and without a leading
+# "v" are both tried (fcitx repos are inconsistent about it).
+_fcitx5_cmake_build() { # $1=name $2=url $3=tag $4=workdir [extra cmake args...]
+    local _name="$1" _url="$2" _tag="$3" _dir="$4"; shift 4
+    local _log="$LOG_DIR/fcitx5-build.log"
+    log "$(_t "Building " "Building ")$_name (${_tag})$(_t " from source..." " from source...")"
+    if ! exe git clone --depth 1 --branch "$_tag" "$_url" "$_dir/$_name" >>"$_log" 2>&1; then
+        exe git clone --depth 1 --branch "v$_tag" "$_url" "$_dir/$_name" >>"$_log" 2>&1 || return 1
     fi
+    exe cmake -S "$_dir/$_name" -B "$_dir/$_name/build" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib64 "$@" >>"$_log" 2>&1 || return 1
+    exe cmake --build "$_dir/$_name/build" -j"$(nproc)" >>"$_log" 2>&1 || return 1
+    exe cmake --install "$_dir/$_name/build" >>"$_log" 2>&1 || return 1
+    return 0
+}
+
+# EL lane: no fcitx5 RPM exists anywhere on this family — build the stack.
+# Order matters: xcb-imdkit (XIM protocol impl) -> fcitx5 core -> fcitx5-gtk
+# (GTK3/4 IM modules) -> fcitx5-rime (engine). librime comes from EPEL 10 when
+# available (built here on EPEL 9). Every failure degrades gracefully: a broken
+# component lands in MANUAL_ITEMS instead of aborting the whole restore.
+_fcitx5_source_build() {
+    log "$(_t "No fcitx5 RPM on EL — building xcb-imdkit + fcitx5 + fcitx5-gtk + fcitx5-rime from source..." "No fcitx5 RPM on EL — building the fcitx5 stack from source...")"
+    local _bdeps=(git gcc-c++ cmake extra-cmake-modules gettext \
+        glib2-devel libxkbcommon-devel libxkbcommon-x11-devel \
+        wayland-devel wayland-protocols-devel \
+        libX11-devel libXext-devel libxcb-devel xcb-util-devel \
+        xcb-util-keysyms-devel xcb-util-wm-devel xcb-util-errors-devel \
+        libuuid-devel fmt-devel libevent-devel \
+        gtk3-devel gtk4-devel)
+    dnf_install_tolerant "${_bdeps[@]}" || true
+    if [ ${#BDEPS_MISSING[@]} -gt 0 ]; then
+        warn "$(_t "Some fcitx5 build deps unavailable (continuing; a failed build will be reported):" "Some fcitx5 build deps unavailable (continuing):") ${BDEPS_MISSING[*]}"
+    fi
+
+    # librime (+headers for fcitx5-rime): EPEL 10 RPM when possible.
+    if ! pkg_installed librime; then
+        dnf_install_tolerant librime librime-devel || true
+    fi
+    if ! pkg_installed librime-devel; then
+        dnf_install_tolerant librime-devel || true
+    fi
+
+    local work
+    work=$(mktemp -d) || return 1
+    register_temp_path "$work"
+
+    if ! pkg_installed librime; then
+        log "$(_t "librime not in EPEL — building it from source too..." "librime not in EPEL — building it from source too...")"
+        local _lb=(leveldb-devel yaml-cpp-devel opencc-devel)
+        dnf_install_tolerant "${_lb[@]}" || true
+        _fcitx5_cmake_build "librime" "https://github.com/rime/librime" "$FCITX5_LIBRIME_TAG" "$work" \
+            -DBUILD_TEST=OFF -DENABLE_GLOG=OFF -DENABLE_TEST=OFF || {
+            MANUAL_ITEMS+=("fcitx5 — librime 构建失败（leveldb/yaml-cpp/opencc devel 缺失?）；装好后重跑 restore")
+            return 1
+        }
+        if ! pkg_installed librime-devel; then
+            dnf_install_tolerant librime-devel || true
+        fi
+    fi
+
+    _fcitx5_cmake_build "xcb-imdkit" "https://github.com/fcitx/xcb-imdkit" "$FCITX5_XCB_IMDKIT_TAG" "$work" \
+        || { MANUAL_ITEMS+=("fcitx5 — xcb-imdkit 构建失败；见 $LOG_DIR/fcitx5-build.log，修复后重跑 restore"); return 1; }
+    _fcitx5_cmake_build "fcitx5" "https://github.com/fcitx/fcitx5" "$FCITX5_CORE_TAG" "$work" \
+        || { MANUAL_ITEMS+=("fcitx5 — core 构建失败；见 $LOG_DIR/fcitx5-build.log"); return 1; }
+    if ! _fcitx5_cmake_build "fcitx5-gtk" "https://github.com/fcitx/fcitx5-gtk" "$FCITX5_GTK_TAG" "$work" \
+        -DENABLE_GTK2_IM_MODULE=OFF; then
+        MANUAL_ITEMS+=("fcitx5-gtk 构建失败 — GTK 应用退回 text-input-v3 协议（niri 支持），预编辑体验略降")
+    fi
+    if _fcitx5_cmake_build "fcitx5-rime" "https://github.com/fcitx/fcitx5-rime" "$FCITX5_RIME_TAG" "$work"; then
+        _fcitx5_engine_ready && FCITX5_RIME_READY=1
+    else
+        MANUAL_ITEMS+=("fcitx5-rime 构建失败 — rime-ice 词典不可用；键盘输入不受影响。见 $LOG_DIR/fcitx5-build.log")
+    fi
+
+    if command -v fcitx5 >/dev/null 2>&1; then
+        INSTALLED_PKGS+=("fcitx5 (source build)")
+        return 0
+    fi
+    MANUAL_ITEMS+=("fcitx5 — source build failed; see $LOG_DIR/fcitx5-build.log")
+    return 1
+}
+
+# Remove the artifacts this script's FORMER IBus lane wrote (pre-fcitx5 versions
+# of this file). A lingering system dconf default or an old session launcher
+# would fight the fcitx5 setup, so they must go. Idempotent; the /etc/dconf/
+# profile/ibus file itself belongs to the ibus RPM and is left alone.
+_fcitx5_strip_ibus_leftovers() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    if [ -f /etc/dconf/db/ibus.d/00-eilniri-ime ]; then
+        rm -f /etc/dconf/db/ibus.d/00-eilniri-ime
+        command -v dconf >/dev/null 2>&1 && exe dconf update || true
+        log "$(_t "Removed the old IBus system dconf defaults (00-eilniri-ime)" "Removed the old IBus system dconf defaults")"
+    fi
+    if [ -n "${HOME_DIR:-}" ] && [ -f "$HOME_DIR/.config/ibus/eilniri-ime-session" ]; then
+        rm -f "$HOME_DIR/.config/ibus/eilniri-ime-session"
+        log "$(_t "Removed the old IBus session launcher" "Removed the old IBus session launcher")"
+    fi
+    return 0
 }
 
 install_rime_ice() {
